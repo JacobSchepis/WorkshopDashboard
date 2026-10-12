@@ -1,0 +1,24 @@
+/* The three columns fill the screen under the header, and each list scrolls itself (via
+   .kiosk-scroll, picked up by KioskLayout.razor's auto-scroll script) rather than the page.
+   Every ancestor in the flex chain down to .kiosk-scroll needs min-height: 0 — flex items
+   default to a content-based min-height, which would otherwise let a long list push its
+   card (and the page) taller than the screen instead of scrolling inside it. */
+.kiosk-page,
+.kiosk-columns {
+    min-height: 0;
+}
+
+.kiosk-columns ::deep .card,
+.kiosk-columns ::deep .card-body {
+    min-height: 0;
+}
+
+/* Nobody can use a scrollbar on a wall-mounted TV — the lists auto-scroll instead. */
+.kiosk-columns ::deep .kiosk-scroll {
+    scrollbar-width: none;
+}
+
+/* The first column's two cards (rule alerts, on hold) share its height equally. */
+.kiosk-columns ::deep .kiosk-half {
+    flex: 1 1 0;
+}

@@ -1,0 +1,72 @@
+﻿@using WorkshopDashboard.Components.Layout
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <base href="/" />
+    <script>
+        // Applies the saved theme (see Blazor.Bootstrap's blazor.bootstrap.theme-switcher.js,
+        // same "blazorbootstrap-theme" localStorage key) before first paint on every real
+        // document load. Exposed on window so the enhancedload listener below (registered
+        // once blazor.web.js has loaded) can reuse the exact same logic.
+        window.__applyBbTheme = function () {
+            var theme = localStorage.getItem("blazorbootstrap-theme") || "system";
+            var applied = theme === "system"
+                ? (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")
+                : theme;
+            document.documentElement.setAttribute("data-bs-theme", applied);
+        };
+        window.__applyBbTheme();
+
+        // Hideable sidebar (the ☰ in NavMenu's top bar, and MainLayout's ☰ while it's hidden): a data-nav-hidden attribute
+        // on <html>, saved under "nav-hidden" — applied here before first paint and reapplied
+        // on enhancedload below for the same reason as the theme.
+        window.__applyNavHidden = function () {
+            var hidden = false;
+            try { hidden = localStorage.getItem("nav-hidden") === "1"; } catch (e) { }
+            document.documentElement.toggleAttribute("data-nav-hidden", hidden);
+        };
+        window.__toggleNav = function () {
+            var hidden = !document.documentElement.hasAttribute("data-nav-hidden");
+            try { localStorage.setItem("nav-hidden", hidden ? "1" : "0"); } catch (e) { }
+            document.documentElement.toggleAttribute("data-nav-hidden", hidden);
+        };
+        window.__applyNavHidden();
+    </script>
+    <link rel="stylesheet" href="bootstrap/bootstrap.min.css" />
+    <link rel="stylesheet" href="bootstrap-icons/bootstrap-icons.min.css" />
+    <link rel="stylesheet" href="_content/Blazor.Bootstrap/blazor.bootstrap.css" />
+    @* ?v= changes every build, so browsers fetch our own CSS fresh after a deploy instead of
+       keeping a stale cached copy (these two aren't fingerprinted). *@
+    <link rel="stylesheet" href="app.css?v=@CssVersion" />
+    <link rel="stylesheet" href="WorkshopDashboard.styles.css?v=@CssVersion" />
+    <link rel="icon" type="image/png" href="favicon.png" />
+    <HeadOutlet @rendermode="InteractiveServer" />
+</head>
+
+<body>
+    <Routes />
+    <script src="_framework/blazor.web.js"></script>
+    <script>
+        // Blazor's "enhanced navigation" (client-side link clicks) reconciles <html>'s
+        // attributes against the server's freshly-rendered output — which never includes
+        // data-bs-theme (that's only ever set client-side) — so it silently strips the
+        // attribute on every in-app navigation without re-running the <head> script above.
+        // This is the official hook to reapply client-only DOM state after that happens;
+        // without it the theme looked like it reset to default on every page change.
+        Blazor.addEventListener('enhancedload', window.__applyBbTheme);
+        Blazor.addEventListener('enhancedload', window.__applyNavHidden);
+    </script>
+    <script src="bootstrap/bootstrap.bundle.min.js"></script>
+    <script src="chartjs/chart.umd.min.js"></script>
+    <script src="_content/Blazor.Bootstrap/blazor.bootstrap.js"></script>
+</body>
+
+</html>
+
+@code {
+    private static readonly string CssVersion = typeof(App).Assembly.ManifestModule.ModuleVersionId.ToString("N")[..8];
+}

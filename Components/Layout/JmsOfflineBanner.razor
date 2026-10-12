@@ -1,0 +1,43 @@
+@using BlazorBootstrap
+@using WorkshopDashboard.Services.External.Jms
+@rendermode InteractiveServer
+@implements IDisposable
+
+@inject JmsStatus JmsStatus
+@inject ILogger<JmsOfflineBanner> Logger
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    JmsOfflineBanner — shown above every page while JmsUptimeMonitorService
+    reports JMS down. During an outage, reads come from CachedJmsReader's
+    last good results and writes can't go through, so this says both.
+    Subscribes to JmsStatus.Changed, so it appears and disappears without a
+    reload.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+@if (JmsStatus.IsUp == false)
+{
+    <Callout Color="CalloutColor.Warning" Class="mb-3">
+        <strong>JMS has been offline since @JmsStatus.DownSince?.ToString("h:mm tt").</strong>
+        Pages are showing the last data loaded while it was up, and changes can't be sent to JMS until it's back.
+    </Callout>
+}
+
+@code {
+    protected override void OnInitialized() => JmsStatus.Changed += OnChanged;
+
+    private async void OnChanged()
+    {
+        try
+        {
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Offline banner update failed");
+        }
+    }
+
+    public void Dispose() => JmsStatus.Changed -= OnChanged;
+}

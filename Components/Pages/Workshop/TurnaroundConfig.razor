@@ -1,0 +1,221 @@
+@page "/turnaround-config"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject TurnaroundStatStore Stats
+
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    TurnaroundConfig — CRUD for the hand-entered stats shown on the
+    workshop status monitor's "Average turnaround" panel. No live
+    job_status_history query backs these yet — Days is just typed in.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      Stats — TurnaroundStatStore: LoadAsync/AddAsync/UpdateAsync/RemoveAsync
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      One form doubles as add/edit (StartEdit populates it, _editingId tracks
+      which). SaveAsync branches on _editingId, then ReloadAsync refreshes
+      the table. Delete requires a second click (RequestDelete arms
+      _pendingDeleteId, the row's button becomes "Confirm?").
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Turnaround Config</h1>
+    <p class="text-muted">
+        The "Average turnaround" panel on the <a href="/workshop-dashboard">workshop status monitor</a>.
+        Days are entered by hand for now — there's no live job_status_history query behind these yet.
+    </p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else
+{
+    <Card Class="mb-4">
+        <CardHeader>@(_editingId is null ? "Add Stat" : "Edit Stat")</CardHeader>
+        <CardBody>
+            @if (!string.IsNullOrEmpty(_formError))
+            {
+                <Callout Color="CalloutColor.Danger" Class="mb-3">@_formError</Callout>
+            }
+
+            <div class="row g-3 mb-3">
+                <div class="col-md-7">
+                    <label class="form-label">Label</label>
+                    <input class="form-control" placeholder="e.g. Quote response"
+                           value="@_formLabel" @oninput="@(e => _formLabel = e.Value?.ToString() ?? "")" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">Days</label>
+                    <input type="number" step="0.1" min="0" class="form-control"
+                           value="@_formDays" @oninput="@(e => _formDays = double.TryParse(e.Value?.ToString(), out var v) ? v : 0)" />
+                </div>
+            </div>
+
+            <div class="d-flex gap-2">
+                <Button Color="ButtonColor.Primary" Disabled="_saving" @onclick="SaveAsync">
+                    @(_saving ? "Saving..." : _editingId is null ? "Add Stat" : "Save Changes")
+                </Button>
+                @if (_editingId is not null)
+                {
+                    <Button Color="ButtonColor.Secondary" Outline="true" Disabled="_saving" @onclick="CancelEdit">
+                        Cancel
+                    </Button>
+                }
+            </div>
+        </CardBody>
+    </Card>
+
+    <Card>
+        <CardHeader>Stats (@_stats.Count)</CardHeader>
+        <CardBody>
+            @if (_stats.Count == 0)
+            {
+                <p class="text-muted small mb-0">No stats yet — add one above.</p>
+            }
+            else
+            {
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead>
+                            <tr>
+                                <th>Label</th>
+                                <th>Days</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var s in _stats)
+                            {
+                                <tr>
+                                    <td>@s.Label</td>
+                                    <td>@s.Days.ToString("0.0")</td>
+                                    <td class="text-end" style="white-space: nowrap;">
+                                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="me-2" @onclick="() => StartEdit(s)">
+                                            Edit
+                                        </Button>
+                                        @if (_pendingDeleteId == s.Id)
+                                        {
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" @onclick="() => DeleteAsync(s.Id)">
+                                                Confirm?
+                                            </Button>
+                                        }
+                                        else
+                                        {
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" @onclick="() => RequestDelete(s.Id)">
+                                                Delete
+                                            </Button>
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </CardBody>
+    </Card>
+}
+
+@code {
+    private bool _loading = true;
+    private List<TurnaroundStat> _stats = new();
+
+    private Guid? _editingId;
+    private string _formLabel = "";
+    private double _formDays;
+    private string? _formError;
+    private bool _saving;
+
+    private Guid? _pendingDeleteId;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        await ReloadAsync();
+    }
+
+    private async Task ReloadAsync()
+    {
+        _stats = await Stats.LoadAsync();
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private void StartEdit(TurnaroundStat s)
+    {
+        _editingId = s.Id;
+        _formLabel = s.Label;
+        _formDays = s.Days;
+        _formError = null;
+    }
+
+    private void CancelEdit()
+    {
+        _editingId = null;
+        _formLabel = "";
+        _formDays = 0;
+        _formError = null;
+    }
+
+    private async Task SaveAsync()
+    {
+        _formError = null;
+
+        var label = _formLabel.Trim();
+        if (string.IsNullOrWhiteSpace(label))
+        {
+            _formError = "Enter a label.";
+            return;
+        }
+
+        _saving = true;
+        StateHasChanged();
+
+        try
+        {
+            if (_editingId is null)
+            {
+                await Stats.AddAsync(new TurnaroundStat { Label = label, Days = _formDays });
+            }
+            else
+            {
+                await Stats.UpdateAsync(new TurnaroundStat { Id = _editingId.Value, Label = label, Days = _formDays });
+            }
+
+            CancelEdit();
+            await ReloadAsync();
+        }
+        finally
+        {
+            _saving = false;
+            StateHasChanged();
+        }
+    }
+
+    private void RequestDelete(Guid id) => _pendingDeleteId = id;
+
+    private async Task DeleteAsync(Guid id)
+    {
+        _pendingDeleteId = null;
+        await Stats.RemoveAsync(id);
+        if (_editingId == id) CancelEdit();
+        await ReloadAsync();
+    }
+}

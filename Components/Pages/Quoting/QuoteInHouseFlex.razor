@@ -1,0 +1,771 @@
+@page "/quote-inhouse-flex"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+
+@using WorkshopDashboard.Services.Quoting.Apex
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Quoting
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Analytics
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+@using WorkshopDashboard.Components.Pages.Quoting.Cards
+@using WorkshopDashboard.Components.Forms
+@using WorkshopDashboard.Data
+
+@inject CompanyGroupStore CompanyGroups
+@inject QuoteNoticeStore Notices
+@inject JobLookupService JobLookup
+@inject JobEquipmentLookup EquipmentLookup
+@inject InspectionReportLookup InspectionLookup
+@inject QuoteSubmissionService QuoteSubmission
+@inject AnalyticsService Analytics
+@inject ApexPriceSheetStore PriceSheet
+@inject ApexRepairSuggester Suggester
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    QuoteInHouseFlex — quotes for flex scope repairs we do ourselves. No repairer PDF: the
+    operator reads the latest inspection's notes, types the observations
+    and repairs, and prices each repair from Apex's price list (USD). The
+    USD total then goes through ApexPricingConfig exactly as an Apex quote
+    does, and everything Apex-scoped is shared on purpose: pricing groups,
+    notices (QuoteNoticeTarget.Apex) and the service text
+    (ApexServiceDescriptions). No freight: the scope never leaves the workshop.
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      LoadJob -> company, pricing group, equipment, notices.
+      Picking equipment (or the only one) -> LoadInspectionAsync.
+      The inspection notes load into an editable box (_notesText) — edits steer
+      the suggestions and are never written back to JMS; "Reset to JMS notes"
+      restores them. Notes can be typed even with no inspection.
+      "Suggest repairs" -> SuggestRepairsAsync: ApexRepairSuggester (GPT-6.1
+      Sol) matches the inspection notes to the Apex price sheet (then combines lines into
+      caps / broader repairs where Apex would) and replaces
+      the repairs/observations (asking first if any work's been done), each
+      row showing the AI's reason + confidence. Rows can also be picked by
+      hand from the sheet (PriceLinePicker).
+      Editing a repair price -> Recalculate. SubmitServices posts the same
+      three lines as QuoteApex, then the ticked notices.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="container py-4" style="max-width: 860px;">
+    <div class="page-header">
+        <h1>In-house - Flex</h1>
+        <p class="text-muted">Quote a repair we're doing ourselves, priced from Apex's price list.</p>
+    </div>
+
+    @* ── Job ── *@
+    <Card Class="mb-3">
+        <CardBody Class="d-flex gap-4 flex-wrap align-items-end">
+            <div>
+                <div class="text-muted small mb-1">Job Number</div>
+                <div class="d-flex gap-2 align-items-center">
+                    <input type="text" class="form-control form-control-sm" style="width: 120px;"
+                           @bind="_jobNumber" @bind:event="oninput"
+                           @onkeydown="@(e => e.Key == "Enter" ? LoadJob() : Task.CompletedTask)" />
+                    <Button Size="ButtonSize.Small" Color="ButtonColor.Primary"
+                            Disabled="@(_jobLoading || string.IsNullOrWhiteSpace(_jobNumber))"
+                            Loading="_jobLoading" @onclick="LoadJob">
+                        Load
+                    </Button>
+                </div>
+            </div>
+            @if (_jobId != null)
+            {
+                <div>
+                    <div class="text-muted small">Repairs (USD)</div>
+                    <div class="fw-semibold">@TotalUsd.ToString("C")</div>
+                </div>
+                <div>
+                    <div class="text-muted small">Total</div>
+                    <div class="fw-semibold text-success">@(_calc != null ? EditedTotal.ToString("C0") : "—")</div>
+                </div>
+            }
+        </CardBody>
+    </Card>
+
+    @if (_error != null)
+    {
+        <Callout Color="CalloutColor.Danger" Class="mb-3">@_error</Callout>
+    }
+
+    @if (_jobId != null)
+    {
+        @* ── Equipment selector ── *@
+        <EquipmentSelectorCard Equipment="_jobEquipment" Loading="_equipmentLoading"
+                               SelectedEquipmentId="@_selectedEquipmentId"
+                               SelectedEquipmentIdChanged="SelectEquipment" />
+
+        @* ── Latest inspection (reference only) ── *@
+        @if (_selectedEquipmentId != null)
+        {
+            <Card Class="mb-3">
+                <CardHeader>
+                    Latest Inspection
+                    @if (_inspection?.Date != null)
+                    {
+                        <span class="text-muted small ms-2">@_inspection.Date.Value.ToString("d MMM yyyy")</span>
+                    }
+                    @if (!string.IsNullOrWhiteSpace(_inspection?.ScopeModel))
+                    {
+                        <span class="text-muted small ms-2">&middot; @_inspection.ScopeModel</span>
+                    }
+                </CardHeader>
+                <CardBody>
+                    @if (_inspectionLoading)
+                    {
+                        <div class="d-flex align-items-center gap-2">
+                            <Spinner Color="SpinnerColor.Primary" Size="SpinnerSize.Small" />
+                            <span class="text-muted">Loading inspection...</span>
+                        </div>
+                    }
+                    else
+                    {
+                        @if (_inspection == null)
+                        {
+                            <p class="text-muted small mb-2">This equipment hasn't been inspected on this job — you can type the findings below instead.</p>
+                        }
+                        else if (string.IsNullOrWhiteSpace(_inspection.Comments))
+                        {
+                            <p class="text-muted small mb-2">The latest inspection has no notes — you can type the findings below instead.</p>
+                        }
+                        @* Starts as the inspection's notes; edit freely (e.g. "Insertion tube replacement")
+                           to steer the suggestions. Only used here — never written back to JMS. *@
+                        <textarea class="form-control form-control-sm mb-1" rows="5" style="font-size:0.85rem; resize:vertical;"
+                                  placeholder="Inspection findings"
+                                  value="@_notesText"
+                                  @oninput="e => _notesText = e.Value?.ToString() ?? string.Empty"></textarea>
+                        <div class="d-flex justify-content-between gap-2 small text-muted mb-2">
+                            <span>Edit to steer the suggestions — this doesn't change the inspection in JMS.</span>
+                            @if (NotesEdited)
+                            {
+                                <a href="" class="text-nowrap" @onclick="ResetNotes" @onclick:preventDefault>Reset to JMS notes</a>
+                            }
+                        </div>
+                        <div class="d-flex gap-2 flex-wrap align-items-center">
+                            @if (_priceLines.Count > 0)
+                            {
+                                @if (_confirmReplace)
+                                {
+                                    <span class="small">This replaces your current repairs and observations.</span>
+                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Primary" @onclick="SuggestRepairsAsync">Replace</Button>
+                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" @onclick="() => _confirmReplace = false">Cancel</Button>
+                                }
+                                else
+                                {
+                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Primary" Loading="_suggesting" LoadingText="Matching to the price sheet..."
+                                            Disabled="@(_suggesting || string.IsNullOrWhiteSpace(_notesText))" @onclick="SuggestOrConfirm">
+                                        ✨ Suggest repairs
+                                    </Button>
+                                }
+                            }
+                            <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Disabled="@(_suggesting || string.IsNullOrWhiteSpace(_notesText))" @onclick="CopyInspectionToObservations">
+                                Copy into observations
+                            </Button>
+                        </div>
+                        @if (_suggestError != null)
+                        {
+                            <Callout Color="CalloutColor.Danger" Class="mt-3 mb-0">@_suggestError</Callout>
+                        }
+                        @if (_combined.Count > 0)
+                        {
+                            <Callout Color="CalloutColor.Success" Class="mt-3 mb-0">
+                                <div class="fw-semibold mb-1">Combined to price it the way Apex would:</div>
+                                <ul class="mb-0">
+                                    @foreach (var c in _combined)
+                                    {
+                                        <li>
+                                            <strong>@c.Line.Code</strong> @(c.IsSwap ? "in place of" : "already includes")
+                                            @string.Join(", ", c.Replaced.Select(r => r.Code)) — saves US@(c.SavingUsd.ToString("C"))
+                                            <div class="small text-muted">@c.Explanation</div>
+                                        </li>
+                                    }
+                                </ul>
+                            </Callout>
+                        }
+                        @if (_unmatchedFindings.Count > 0)
+                        {
+                            <Callout Color="CalloutColor.Warning" Class="mt-3 mb-0">
+                                <div class="fw-semibold mb-1">Findings with no matching price sheet line — check these yourself:</div>
+                                <ul class="mb-0">
+                                    @foreach (var f in _unmatchedFindings)
+                                    {
+                                        <li>@f</li>
+                                    }
+                                </ul>
+                            </Callout>
+                        }
+                    }
+                </CardBody>
+            </Card>
+        }
+
+        @* ── Pricing ── *@
+        @if (_selectedPricingGroup == null)
+        {
+            <Card Class="mb-3 border-warning">
+                <CardHeader Class="bg-warning bg-opacity-25">Unknown Pricing — Company ID @_companyId</CardHeader>
+                <CardBody>
+                    <p class="text-muted small mb-3">This company isn't in the pricing config yet. Select a pricing group to continue. The selection will be saved for next time (shared with Apex quotes).</p>
+                    <div class="d-flex gap-2">
+                        @foreach (var (group, name, detail) in PricingGroupOptions)
+                        {
+                            <div class="card flex-fill" style="cursor:pointer" @onclick="() => SelectPricingGroup(group)">
+                                <div class="card-body p-3">
+                                    <span class="fw-semibold">@name</span>
+                                    <div class="small text-muted mt-1">@detail</div>
+                                </div>
+                            </div>
+                        }
+                    </div>
+                </CardBody>
+            </Card>
+        }
+        else if (_calc != null)
+        {
+            <Card Class="mb-3">
+                <CardHeader>
+                    Calculated Pricing
+                    <span class="text-muted small ms-2">Group @_selectedPricingGroup</span>
+                </CardHeader>
+                <CardBody>
+                    <table class="table table-sm mb-0">
+                        <tbody>
+                            <tr>
+                                <td>Repairs (USD) → AUD</td>
+                                <td class="text-end">@_calc.CostUsd.ToString("C") → @_calc.CostAud.ToString("C")</td>
+                            </tr>
+                            <tr>
+                                <td>Base Charge</td>
+                                <td class="text-end">@_calc.BaseCharge.ToString("C")</td>
+                            </tr>
+                            @if (_calc.Discount1 != 0)
+                            {
+                                <tr class="text-danger"><td>Volume Discount (D16)</td><td class="text-end">@_calc.Discount1.ToString("C")</td></tr>
+                            }
+                            @if (_calc.Discount2 != 0)
+                            {
+                                <tr class="text-danger"><td>Volume Discount (D17)</td><td class="text-end">@_calc.Discount2.ToString("C")</td></tr>
+                            }
+                            @if (_calc.Discount3 != 0)
+                            {
+                                <tr class="text-danger"><td>Volume Discount (D18)</td><td class="text-end">@_calc.Discount3.ToString("C")</td></tr>
+                            }
+                            @if (_calc.GroupDiscount != 0)
+                            {
+                                <tr class="text-danger"><td>Group 2 Discount (10%)</td><td class="text-end">@_calc.GroupDiscount.ToString("C")</td></tr>
+                            }
+                            <tr class="fw-semibold table-light">
+                                <td>Total</td>
+                                <td class="text-end">@_calc.Total.ToString("C")</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </CardBody>
+            </Card>
+        }
+
+        @* ── Service 1: Technical Observations ── *@
+        <Card Class="mb-3">
+            <CardHeader>Service 1 — Technical Observations</CardHeader>
+            <CardBody>
+                @for (int i = 0; i < _observations.Count; i++)
+                {
+                    var idx = i;
+                    <div class="d-flex gap-2 mb-2">
+                        <textarea class="form-control form-control-sm" rows="2" style="font-size:0.85rem; resize:vertical;"
+                                  value="@_observations[idx]"
+                                  @oninput="e => _observations[idx] = e.Value?.ToString() ?? string.Empty"></textarea>
+                        <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" Class="align-self-start"
+                                @onclick="() => _observations.RemoveAt(idx)">✕</Button>
+                    </div>
+                }
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="mt-1"
+                        @onclick="() => _observations.Add(string.Empty)">+ Add</Button>
+            </CardBody>
+        </Card>
+
+        @* ── Service 2: Repairs Required (priced from Apex's list, USD) ── *@
+        <Card Class="mb-3">
+            <CardHeader>Service 2 — Repairs Required</CardHeader>
+            <CardBody>
+                @for (int i = 0; i < _repairs.Count; i++)
+                {
+                    var repair = _repairs[i];
+                    <div class="d-flex gap-2 mb-3">
+                        <div class="flex-grow-1 d-flex flex-column gap-1">
+                            @if (_priceLines.Count > 0)
+                            {
+                                <PriceLinePicker Lines="_priceLines" OnSelect="line => PickPriceLine(repair, line)"
+                                                 Placeholder="@(repair.Code == null ? "Search price sheet — code or words, e.g. bending GIF" : $"{repair.Code} — search to change")" />
+                            }
+                            <textarea class="form-control form-control-sm" rows="2" style="font-size:0.85rem; resize:vertical;"
+                                      placeholder="Repair"
+                                      value="@repair.Description"
+                                      @oninput="e => repair.Description = e.Value?.ToString() ?? string.Empty"></textarea>
+                            @if (repair.Suggestion is { } s)
+                            {
+                                @* Why the AI picked this line — shown here only, never posted to JMS. *@
+                                <div class="small text-muted">
+                                    <Badge Color="@(s.Confidence switch { SuggestionConfidence.High => BadgeColor.Success, SuggestionConfidence.Medium => BadgeColor.Warning, _ => BadgeColor.Danger })">
+                                        @s.Confidence
+                                    </Badge>
+                                    ✨ @s.Reason
+                                </div>
+                            }
+                        </div>
+                        <div class="input-group input-group-sm align-self-start" style="width: 170px; flex-shrink: 0;">
+                            <span class="input-group-text">US$</span>
+                            <input type="number" class="form-control text-end" min="0" step="1"
+                                   value="@repair.PriceUsd"
+                                   @oninput="e => SetRepairPrice(repair, e.Value?.ToString())" />
+                        </div>
+                        <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" Class="align-self-start"
+                                @onclick="() => RemoveRepair(repair)">✕</Button>
+                    </div>
+                }
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="mb-3"
+                        @onclick="() => _repairs.Add(new RepairRow())">+ Add</Button>
+
+                @if (_calc != null)
+                {
+                    <table class="table table-sm mb-0">
+                        <tbody>
+                            <tr>
+                                <td>Sub Total</td>
+                                <td class="text-end" style="width:160px">
+                                    <div class="input-group input-group-sm justify-content-end">
+                                        <span class="input-group-text">$</span>
+                                        <input type="number" class="form-control text-end" style="width:90px"
+                                               step="10" value="@_editSubTotal"
+                                               @oninput="e => { if (decimal.TryParse(e.Value?.ToString(), out var v)) _editSubTotal = v; }" />
+                                    </div>
+                                </td>
+                            </tr>
+                            @if (_editLabourRemoved != 0)
+                            {
+                                <tr class="text-danger">
+                                    <td>Labour Component Removed</td>
+                                    <td class="text-end">
+                                        <div class="input-group input-group-sm justify-content-end">
+                                            <span class="input-group-text">-$</span>
+                                            <input type="number" class="form-control text-end" style="width:90px"
+                                                   step="10" value="@Math.Abs(_editLabourRemoved)"
+                                                   @oninput="e => { if (decimal.TryParse(e.Value?.ToString(), out var v)) _editLabourRemoved = -v; }" />
+                                        </div>
+                                    </td>
+                                </tr>
+                            }
+                            @if (_editDiscount != 0)
+                            {
+                                <tr class="text-danger">
+                                    <td>Discount</td>
+                                    <td class="text-end">
+                                        <div class="input-group input-group-sm justify-content-end">
+                                            <span class="input-group-text">-$</span>
+                                            <input type="number" class="form-control text-end" style="width:90px"
+                                                   step="10" value="@Math.Abs(_editDiscount)"
+                                                   @oninput="e => { if (decimal.TryParse(e.Value?.ToString(), out var v)) _editDiscount = -v; }" />
+                                        </div>
+                                    </td>
+                                </tr>
+                            }
+                            <tr class="fw-semibold table-light">
+                                <td>Total Cost</td>
+                                <td class="text-end">@EditedTotal.ToString("C0")</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                }
+            </CardBody>
+        </Card>
+
+        @* ── Service 3: Work Order Notes ── *@
+        <Card Class="mb-3">
+            <CardHeader>Service 3 — Work Order Notes</CardHeader>
+            <CardBody>
+                <div class="d-flex align-items-center gap-2 small">
+                    <span>Estimated completion:</span>
+                    <input type="number" class="form-control form-control-sm" style="width: 80px;" min="1" step="1"
+                           value="@_completionDays"
+                           @oninput="e => _completionDays = int.TryParse(e.Value?.ToString(), out var v) && v > 0 ? v : null" />
+                    <span>working days</span>
+                </div>
+            </CardBody>
+        </Card>
+
+        @* ── Notices ── *@
+        <QuoteNoticesCard Notices="_applicableNotices" SelectedIds="_selectedNoticeIds" />
+
+        @* ── Submit ── *@
+        <Card Class="mb-3">
+            <CardBody>
+                @if (_submitSuccess)
+                {
+                    <Callout Color="CalloutColor.Success" Class="mb-3">Services created on job @_jobId.</Callout>
+                }
+                @if (MissingForSubmit is { } missing)
+                {
+                    <p class="text-muted small mb-2">Still needed: @missing</p>
+                }
+                <Button Color="ButtonColor.Success" Disabled="@(_submitting || MissingForSubmit != null)"
+                        Loading="_submitting" @onclick="SubmitServices">
+                    Create Services
+                </Button>
+            </CardBody>
+        </Card>
+    }
+</div>
+
+@code {
+    private sealed class RepairRow
+    {
+        /// <summary>The price sheet line this row was picked from, if any.</summary>
+        public string? Code { get; set; }
+        public string Description { get; set; } = string.Empty;
+        public decimal? PriceUsd { get; set; }
+
+        /// <summary>Set when the row came from "Suggest repairs" — the AI's reason and confidence,
+        /// shown under the row. Cleared if someone picks a different line.</summary>
+        public SuggestedRepair? Suggestion { get; set; }
+    }
+
+    private static readonly (int Group, string Name, string Detail)[] PricingGroupOptions =
+    {
+        (1, "Group 1 — Standard", "Standard pricing formula"),
+        (2, "Group 2 — Discounted", "Standard pricing + 10% off base charge"),
+    };
+
+    // Shared with QuoteApex on purpose — a company's Apex groups apply to in-house quotes too.
+    private const string CompanyPricingGroupsScope = "apex_company_pricing_groups";
+
+    private string _jobNumber = string.Empty;
+    private int? _jobId;
+    private int _companyId;
+    private bool _jobLoading;
+    private string? _error;
+
+    private List<JobEquipmentInfo> _jobEquipment = new();
+    private string? _selectedEquipmentId;
+    private bool _equipmentLoading;
+
+    private LatestInspection? _inspection;
+    private bool _inspectionLoading;
+
+    private List<string> _observations = new();
+    private List<RepairRow> _repairs = new();
+    private List<ApexPriceLine> _priceLines = new();
+    private bool _suggesting;
+    private bool _confirmReplace;
+    private string? _suggestError;
+    private List<string> _unmatchedFindings = new();
+    private List<RepairConsolidation> _combined = new();
+    private string _notesText = "";
+    private int? _completionDays;
+
+    private int? _selectedPricingGroup;
+    private ApexPricingResult? _calc;
+    private decimal _editSubTotal;
+    private decimal _editLabourRemoved;
+    private decimal _editDiscount;
+
+    private List<QuoteNotice> _applicableNotices = new();
+    private HashSet<Guid> _selectedNoticeIds = new();
+
+    private bool _submitting;
+    private bool _submitSuccess;
+
+    private decimal TotalUsd => _repairs.Sum(r => r.PriceUsd ?? 0m);
+    private decimal EditedTotal => _editSubTotal + _editLabourRemoved + _editDiscount;
+
+    private string? MissingForSubmit
+    {
+        get
+        {
+            var missing = new List<string>();
+            if (string.IsNullOrEmpty(_selectedEquipmentId)) missing.Add("equipment");
+            if (!_repairs.Any(r => !string.IsNullOrWhiteSpace(r.Description))) missing.Add("a repair");
+            if (_calc == null) missing.Add(_selectedPricingGroup == null ? "pricing group" : "repair prices");
+            if (_completionDays == null) missing.Add("completion days");
+            return missing.Count == 0 ? null : string.Join(", ", missing);
+        }
+    }
+
+    private static decimal R10(decimal v) => Math.Round(v, MidpointRounding.AwayFromZero);
+
+    private async Task LoadJob()
+    {
+        if (!int.TryParse(_jobNumber.Trim(), out var jobId))
+        {
+            _error = "Enter a job number.";
+            return;
+        }
+
+        ResetQuote();
+        _jobLoading = true;
+        StateHasChanged();
+
+        try
+        {
+            var companyId = await JobLookup.GetOwnerCompanyIdAsync(jobId);
+            if (companyId is null)
+            {
+                _error = "Could not retrieve company ID for job " + jobId;
+                return;
+            }
+
+            _jobId = jobId;
+            _companyId = companyId.Value;
+            _selectedPricingGroup = LookUpPricingGroup(_companyId);
+
+            _applicableNotices = await Notices.GetApplicableAsync(QuoteNoticeTarget.Apex);
+            _selectedNoticeIds = _applicableNotices.Select(n => n.Id).ToHashSet();
+
+            _equipmentLoading = true;
+            StateHasChanged();
+            _jobEquipment = await EquipmentLookup.LoadAsync(jobId);
+            _equipmentLoading = false;
+
+            if (_jobEquipment.Count == 1)
+                await SelectEquipment(_jobEquipment[0].EquipmentId);
+        }
+        catch (Exception ex)
+        {
+            _error = "Job lookup failed: " + ex.Message;
+        }
+        finally
+        {
+            _jobLoading = false;
+            _equipmentLoading = false;
+        }
+    }
+
+    private void ResetQuote()
+    {
+        _error = null;
+        _jobId = null;
+        _jobEquipment = new();
+        _selectedEquipmentId = null;
+        _inspection = null;
+        _observations = new();
+        ClearSuggestionState();
+        _repairs = new() { new RepairRow() };
+        _completionDays = null;
+        _selectedPricingGroup = null;
+        _calc = null;
+        _applicableNotices = new();
+        _selectedNoticeIds = new();
+        _submitSuccess = false;
+    }
+
+    /// <summary>Same order as QuoteApex: the hardcoded config first, then a saved choice.</summary>
+    private int? LookUpPricingGroup(int companyId)
+    {
+        if (ApexPricingConfig.CompanyGroups.ContainsKey(companyId))
+            return ApexPricingConfig.GetGroupForCompany(companyId);
+        return CompanyGroups.LoadSaved(CompanyPricingGroupsScope).TryGetValue(companyId, out var saved) ? saved : null;
+    }
+
+    private async Task SelectEquipment(string? equipmentId)
+    {
+        _selectedEquipmentId = equipmentId;
+        _inspection = null;
+        ClearSuggestionState();
+        if (_jobId == null || !int.TryParse(equipmentId, out var eqId)) return;
+
+        _inspectionLoading = true;
+        StateHasChanged();
+        try
+        {
+            _inspection = await InspectionLookup.GetLatestInspectionAsync(_jobId.Value, eqId);
+            _notesText = JmsNotes;
+        }
+        catch (Exception ex)
+        {
+            _error = "Failed to load the inspection: " + ex.Message;
+        }
+        finally
+        {
+            _inspectionLoading = false;
+        }
+    }
+
+    private bool HasWork =>
+        _observations.Any(o => !string.IsNullOrWhiteSpace(o))
+        || _repairs.Any(r => !string.IsNullOrWhiteSpace(r.Description) || r.PriceUsd != null);
+
+    /// <summary>Suggests straight away on a blank quote; asks before replacing work already done.</summary>
+    private async Task SuggestOrConfirm()
+    {
+        if (HasWork) _confirmReplace = true;
+        else await SuggestRepairsAsync();
+    }
+
+    /// <summary>Matches the latest inspection's notes to the Apex price sheet (ApexRepairSuggester)
+    /// and replaces the repairs and observations with the result, for the user to review.</summary>
+    private async Task SuggestRepairsAsync()
+    {
+        var notes = _notesText.Trim();
+        if (notes.Length == 0) return;
+
+        _confirmReplace = false;
+        _suggestError = null;
+        _suggesting = true;
+        StateHasChanged();
+
+        try
+        {
+            // The inspected unit's manufacturer + model, so model-specific price lines can be picked.
+            // No inspection (notes typed by hand) → fall back to the equipment's generic name.
+            var scopeModel = _inspection?.ScopeModel ?? _jobEquipment.FirstOrDefault(e => e.EquipmentId == _selectedEquipmentId)?.GenericName;
+            var result = await Suggester.SuggestAsync(notes, scopeModel, ApexRepairSuggester.DefaultModel);
+
+            _observations = result.TechnicalObservations.ToList();
+            _repairs = result.Repairs
+                .Select(r => new RepairRow { Code = r.Line.Code, Description = r.Line.Description, PriceUsd = r.Line.PriceUsd, Suggestion = r })
+                .ToList();
+            if (_repairs.Count == 0) _repairs.Add(new RepairRow());
+            _unmatchedFindings = result.UnmatchedFindings;
+            _combined = result.Consolidations.Where(c => c.Accepted).ToList();
+            Recalculate();
+
+            await Analytics.TrackEventAsync("Repairs suggested — In-house Flex");
+        }
+        catch (Exception ex)
+        {
+            _suggestError = "Couldn't get suggestions: " + ex.Message;
+        }
+        finally
+        {
+            _suggesting = false;
+        }
+    }
+
+    private void ClearSuggestionState()
+    {
+        _confirmReplace = false;
+        _suggestError = null;
+        _unmatchedFindings = new();
+        _combined = new();
+        _notesText = "";
+    }
+
+    // The inspection notes box: starts as what's in JMS, editable to steer the suggestions.
+    private string JmsNotes => (_inspection?.Comments ?? "").Trim();
+    private bool NotesEdited => _notesText.Trim() != JmsNotes;
+    private void ResetNotes() => _notesText = JmsNotes;
+
+    private void CopyInspectionToObservations()
+    {
+        var lines = _notesText
+            .Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        _observations.RemoveAll(string.IsNullOrWhiteSpace);
+        _observations.AddRange(lines);
+    }
+
+    private void SelectPricingGroup(int group)
+    {
+        _selectedPricingGroup = group;
+        try
+        {
+            CompanyGroups.Save(CompanyPricingGroupsScope, _companyId, group);
+        }
+        catch (Exception ex) { _error = "Failed to save pricing group: " + ex.Message; }
+        Recalculate();
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        _priceLines = await PriceSheet.LoadAsync();
+    }
+
+    /// <summary>Fills the row from a price sheet line: its description as-is and its USD price.</summary>
+    private void PickPriceLine(RepairRow repair, ApexPriceLine line)
+    {
+        repair.Code = line.Code;
+        repair.Suggestion = null;
+        repair.Description = line.Description;
+        repair.PriceUsd = line.PriceUsd;
+        Recalculate();
+    }
+
+    private void SetRepairPrice(RepairRow repair, string? value)
+    {
+        repair.PriceUsd = decimal.TryParse(value, out var v) && v >= 0 ? v : null;
+        Recalculate();
+    }
+
+    private void RemoveRepair(RepairRow repair)
+    {
+        _repairs.Remove(repair);
+        Recalculate();
+    }
+
+    /// <summary>Re-prices from the USD total. Any hand edits to Sub Total/Discount are replaced,
+    /// since they were edits to the old price.</summary>
+    private void Recalculate()
+    {
+        _submitSuccess = false;
+        if (_selectedPricingGroup == null || TotalUsd <= 0)
+        {
+            _calc = null;
+            return;
+        }
+
+        try
+        {
+            var calc = ApexPricingConfig.Calculate(TotalUsd, _selectedPricingGroup.Value);
+            _calc = calc;
+            _editSubTotal = R10(calc.BaseCharge);
+            _editLabourRemoved = R10(calc.GroupDiscount); // negative value, group 2 only
+            _editDiscount = R10(calc.Total) - _editSubTotal - _editLabourRemoved;
+        }
+        catch (Exception ex)
+        {
+            _calc = null;
+            _error = "Pricing failed: " + ex.Message;
+        }
+    }
+
+    private async Task SubmitServices()
+    {
+        if (_jobId == null || MissingForSubmit != null) return;
+
+        _submitting = true;
+        _error = null;
+        _submitSuccess = false;
+        StateHasChanged();
+
+        try
+        {
+            var lineItems = new List<(string, decimal)>
+            {
+                (ApexServiceDescriptions.GetTechnicalObservationsDescription(_observations), 0m),
+                (ApexServiceDescriptions.GetRepairsDescription(_repairs.Select(r => r.Description), _editSubTotal, _editLabourRemoved, _editDiscount, EditedTotal), EditedTotal),
+                (ApexServiceDescriptions.GetWorkOrderNotesDescription(_completionDays!.Value), 0m),
+            };
+
+            var selectedNotices = _applicableNotices.Where(n => _selectedNoticeIds.Contains(n.Id));
+
+            await QuoteSubmission.SubmitAsync(
+                _jobId.Value, _selectedEquipmentId!,
+                lineItems, selectedNotices);
+
+            _submitSuccess = true;
+            await Analytics.TrackEventAsync("Quote services created — In-house Flex");
+        }
+        catch (Exception ex)
+        {
+            _error = "Submission failed: " + ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+}

@@ -1,0 +1,279 @@
+@page "/scope-jobs"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject ScopeJobStore ScopeJobs
+@inject ScopeLookupService ScopeLookup
+
+@using CsvHelper
+@using CsvHelper.Configuration
+@using System.Globalization
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Components.Forms
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using static WorkshopDashboard.Services.Admin.ScopeLabelFormatter
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    ScopeJobManager — edits ScopeJobExclusions, the one exclusion list every
+    "scope job" page in the app (Overview, Waiting Workshop Processing/
+    Assignment, Waiting Quote Confirmation, Stale Scope Jobs, Waiting Quote
+    report) filters against.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      ScopeJobs   — ScopeJobStore: the exclusion list itself (jobs/companies/
+                    models) — Add*/Remove* per category
+      ScopeLookup — ScopeLookupService: name/label resolution for display
+                    (company names, model labels) and the job-number lookup
+                    (owner company + active equipment models for one job)
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      ReloadAsync loads the exclusion lists then resolves display labels for
+      whatever's already excluded. "Add From Job Number" is a shortcut that
+      looks up one job's owner/equipment via ScopeLookup so a company or
+      model can be excluded without knowing its raw id. Each
+      ExclusionSection also does its own live search (SearchAsync) for
+      adding by name directly.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Scope Job Manager</h1>
+    <p class="text-muted">
+        Defines what counts as a "scope" (workshop) job everywhere in this app — Dashboard, Waiting
+        Workshop Processing/Assignment, Waiting Quote Confirmation, Stale Scope Jobs, and the Waiting
+        Quote report. A job is in scope when its history includes status 34 or 16, minus anything
+        excluded below.
+    </p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else
+{
+    <Card Class="mb-4">
+        <CardHeader>Add From Job Number</CardHeader>
+        <CardBody>
+            <p class="text-muted small">
+                Look up a job to exclude its owner company or the models on its currently-active
+                equipment, without needing to know their ids.
+            </p>
+            <div class="input-group mb-3" style="max-width: 320px;">
+                <input class="form-control" type="number" placeholder="Job number"
+                       value="@_jobLookupInput" @oninput="OnJobLookupInput" />
+                <Button Color="ButtonColor.Primary" Outline="true" Disabled="_jobLookupBusy" @onclick="LookUpJobAsync">
+                    @(_jobLookupBusy ? "..." : "Look Up")
+                </Button>
+            </div>
+
+            @if (!string.IsNullOrEmpty(_jobLookupError))
+            {
+                <Callout Color="CalloutColor.Danger" Class="mb-2">@_jobLookupError</Callout>
+            }
+
+            @if (_jobLookup is not null)
+            {
+                <ul class="list-group" style="max-width: 480px;">
+                    @if (_jobLookup.OwnerCompanyId is int companyId)
+                    {
+                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                            <span>Owner: @FormatCompanyLabel(companyId, _jobLookup.OwnerCompanyName)</span>
+                            @if (_exclusions.CompanyIds.Contains(companyId))
+                            {
+                                <span class="text-muted small">Already excluded</span>
+                            }
+                            else
+                            {
+                                <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" @onclick="() => AddCompanyAsync(companyId)">
+                                    Exclude
+                                </Button>
+                            }
+                        </li>
+                    }
+                    @foreach (var m in _jobLookup.Models)
+                    {
+                        <li class="list-group-item d-flex justify-content-between align-items-center">
+                            <span>Equipment: @m.Label</span>
+                            @if (_exclusions.ModelIds.Contains(m.ModelId))
+                            {
+                                <span class="text-muted small">Already excluded</span>
+                            }
+                            else
+                            {
+                                <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" @onclick="() => AddModelAsync(m.ModelId)">
+                                    Exclude
+                                </Button>
+                            }
+                        </li>
+                    }
+                    @if (_jobLookup.OwnerCompanyId is null && _jobLookup.Models.Count == 0)
+                    {
+                        <li class="list-group-item text-muted">No owner company or active equipment found for this job.</li>
+                    }
+                </ul>
+            }
+        </CardBody>
+    </Card>
+
+    <div class="row g-4">
+        <div class="col-md-4">
+            <ExclusionSection Title="Excluded Job IDs"
+                               Placeholder="Job ID"
+                               Ids="_exclusions.JobIds.OrderBy(id => id).ToList()"
+                               OnAdd="AddJobAsync"
+                               OnRemove="RemoveJobAsync" />
+        </div>
+        <div class="col-md-4">
+            <ExclusionSection Title="Excluded Company IDs"
+                               Placeholder="Search company name..."
+                               Ids="_exclusions.CompanyIds.OrderBy(id => id).ToList()"
+                               Labels="_companyNames"
+                               SearchAsync="SearchCompaniesAsync"
+                               OnAdd="AddCompanyAsync"
+                               OnRemove="RemoveCompanyAsync" />
+        </div>
+        <div class="col-md-4">
+            <ExclusionSection Title="Excluded Model IDs"
+                               Placeholder="Search model name..."
+                               Ids="_exclusions.ModelIds.OrderBy(id => id).ToList()"
+                               Labels="_modelLabels"
+                               SearchAsync="SearchModelsAsync"
+                               OnAdd="AddModelAsync"
+                               OnRemove="RemoveModelAsync" />
+        </div>
+    </div>
+}
+
+@code {
+    private bool _loading = true;
+    private ScopeJobExclusions _exclusions = new();
+    private Dictionary<int, string> _companyNames = new();
+    private Dictionary<int, string> _modelLabels = new();
+
+    private string _jobLookupInput = "";
+    private bool _jobLookupBusy;
+    private string? _jobLookupError;
+    private JobLookupDisplay? _jobLookup;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        await ReloadAsync();
+    }
+
+    private async Task ReloadAsync()
+    {
+        _exclusions = await ScopeJobs.LoadAsync();
+
+        var namesTask = LoadCompanyNamesAsync(_exclusions.CompanyIds);
+        var labelsTask = LoadModelLabelsAsync(_exclusions.ModelIds);
+        await Task.WhenAll(namesTask, labelsTask);
+        _companyNames = namesTask.Result;
+        _modelLabels = labelsTask.Result;
+
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private async Task<Dictionary<int, string>> LoadCompanyNamesAsync(IReadOnlyCollection<int> companyIds)
+    {
+        var rows = await ScopeLookup.GetCompanyNamesAsync(companyIds);
+        return rows.ToDictionary(r => r.CompanyId, r => FormatCompanyLabel(r.CompanyId, r.CompanyName));
+    }
+
+    private async Task<Dictionary<int, string>> LoadModelLabelsAsync(IReadOnlyCollection<int> modelIds)
+    {
+        var rows = await ScopeLookup.GetModelLabelsAsync(modelIds);
+        return rows.ToDictionary(r => r.ModelId, r => FormatModelLabel(r.ModelId, r.Label));
+    }
+
+    private async Task<List<(int Id, string Label)>> SearchCompaniesAsync(string term)
+    {
+        var rows = await ScopeLookup.SearchCompaniesAsync(term);
+        return rows.Select(r => (r.CompanyId, FormatCompanyLabel(r.CompanyId, r.CompanyName))).ToList();
+    }
+
+    private async Task<List<(int Id, string Label)>> SearchModelsAsync(string term)
+    {
+        var rows = await ScopeLookup.SearchModelsAsync(term);
+        return rows.Select(r => (r.ModelId, FormatModelLabel(r.ModelId, r.Label))).ToList();
+    }
+
+    private void OnJobLookupInput(ChangeEventArgs e) => _jobLookupInput = e.Value?.ToString() ?? "";
+
+    private async Task LookUpJobAsync()
+    {
+        _jobLookupError = null;
+        _jobLookup = null;
+
+        if (!int.TryParse(_jobLookupInput, out var jobId))
+        {
+            _jobLookupError = "Enter a whole job number.";
+            return;
+        }
+
+        _jobLookupBusy = true;
+        StateHasChanged();
+
+        try
+        {
+            JobScopeLookup? result;
+            try
+            {
+                result = await ScopeLookup.GetJobScopeLookupAsync(jobId);
+            }
+            catch (Exception ex)
+            {
+                _jobLookupError = ex.Message;
+                return;
+            }
+
+            if (result is null)
+            {
+                _jobLookupError = $"No job {jobId} found.";
+                return;
+            }
+
+            _jobLookup = new JobLookupDisplay
+            {
+                OwnerCompanyId = result.OwnerCompanyId,
+                OwnerCompanyName = result.OwnerCompanyName,
+                Models = result.Models
+                    .Select(m => (m.ModelId, FormatModelLabel(m.ModelId, m.Label)))
+                    .ToList()
+            };
+        }
+        finally
+        {
+            _jobLookupBusy = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task AddJobAsync(int id) { await ScopeJobs.AddJobAsync(id); await ReloadAsync(); }
+    private async Task RemoveJobAsync(int id) { await ScopeJobs.RemoveJobAsync(id); await ReloadAsync(); }
+
+    private async Task AddCompanyAsync(int id) { await ScopeJobs.AddCompanyAsync(id); await ReloadAsync(); }
+    private async Task RemoveCompanyAsync(int id) { await ScopeJobs.RemoveCompanyAsync(id); await ReloadAsync(); }
+
+    private async Task AddModelAsync(int id) { await ScopeJobs.AddModelAsync(id); await ReloadAsync(); }
+    private async Task RemoveModelAsync(int id) { await ScopeJobs.RemoveModelAsync(id); await ReloadAsync(); }
+
+
+    private class JobLookupDisplay
+    {
+        public int? OwnerCompanyId { get; set; }
+        public string? OwnerCompanyName { get; set; }
+        public List<(int ModelId, string Label)> Models { get; set; } = new();
+    }
+}

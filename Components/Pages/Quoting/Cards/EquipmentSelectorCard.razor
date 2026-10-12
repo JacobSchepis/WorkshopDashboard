@@ -1,0 +1,74 @@
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    EquipmentSelectorCard — shared "which piece of equipment on this job"
+    picker used by the USD-quote repairer pages (Bayside/Cobalt/Ember).
+    Auto-resolves silently when there's exactly one match; only shows radio
+    buttons when the job has multiple pieces of equipment to disambiguate.
+
+    ── Parameters ───────────────────────────────────────────────────────────
+      Equipment/Loading — the job's equipment options and load state
+      SelectedEquipmentId/SelectedEquipmentIdChanged — the picked equipment
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<Card Class="mb-3">
+    <CardHeader>Job Equipment</CardHeader>
+    <CardBody>
+        @if (Loading)
+        {
+            <div class="d-flex align-items-center gap-2">
+                <Spinner Color="SpinnerColor.Primary" Size="SpinnerSize.Small" />
+                <span class="text-muted">Loading equipment...</span>
+            </div>
+        }
+        else if (!Equipment.Any())
+        {
+            <p class="text-muted mb-0">No equipment found for this job.</p>
+        }
+        else if (Equipment.Count == 1)
+        {
+            var eq = Equipment[0];
+            <div class="d-flex align-items-center gap-2">
+                <i class="bi bi-check-circle-fill text-success"></i>
+                <span class="fw-semibold">@eq.GenericName</span>
+                <span class="text-muted small">S/N: @eq.SerialNo</span>
+            </div>
+        }
+        else
+        {
+            <p class="text-muted small mb-2">Multiple pieces of equipment found — select which one to add the service(s) to:</p>
+            @foreach (var eq in Equipment)
+            {
+                <div class="form-check mb-1">
+                    <input class="form-check-input"
+                           type="radio"
+                           name="equipmentSelect"
+                           id="eq_@eq.EquipmentId"
+                           value="@eq.EquipmentId"
+                           checked="@(SelectedEquipmentId == eq.EquipmentId)"
+                           @onchange="() => Select(eq.EquipmentId)" />
+                    <label class="form-check-label" for="eq_@eq.EquipmentId">
+                        <span class="fw-semibold">@eq.GenericName</span>
+                        <span class="text-muted small ms-2">S/N: @eq.SerialNo</span>
+                    </label>
+                </div>
+            }
+        }
+    </CardBody>
+</Card>
+
+@code {
+    [Parameter] public List<JobEquipmentInfo> Equipment { get; set; } = new();
+    [Parameter] public bool Loading { get; set; }
+    [Parameter] public string? SelectedEquipmentId { get; set; }
+    [Parameter] public EventCallback<string?> SelectedEquipmentIdChanged { get; set; }
+
+    private Task Select(string id) => SelectedEquipmentIdChanged.InvokeAsync(id);
+}

@@ -1,0 +1,113 @@
+@page "/stale-jobs"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject WorkshopQueueLookup Jobs
+
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    StaleJobs — open jobs with no status change in over a month, unfiltered.
+    See also StaleJobsFiltered (same table, Scope-exclusions applied).
+
+    ── Services ─────────────────────────────────────────────────────────────
+      Jobs — WorkshopQueueLookup: GetStaleJobsAsync()
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      OnInitializedAsync loads the list once; StatusAgeClass colors the
+      "last status change" cell amber/red the older it gets.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Stale Jobs</h1>
+    <p class="text-muted">Open jobs with no status change in over a month.</p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else if (_loaded && _jobs.Count == 0)
+{
+    <Callout Color="CalloutColor.Info">No stale jobs found.</Callout>
+}
+else if (_jobs.Count > 0)
+{
+    <table class="table table-striped align-middle">
+        <thead>
+            <tr>
+                <th>Job ID</th>
+                <th>Owner</th>
+                <th>Equipment</th>
+                <th>Fault</th>
+                <th>Status</th>
+                <th>Last Status Change</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var job in _jobs)
+            {
+                <tr>
+                    <td>
+                        <a href="@JmsLinks.JobSummary(job.JobId)"
+                           target="_blank"
+                           rel="noopener noreferrer">
+                            @job.JobId
+                        </a>
+                    </td>
+                    <td>@job.Owner</td>
+                    <td>@job.Equipment</td>
+                    <td>@job.Fault</td>
+                    <td>@job.Status</td>
+                    <td class="@StatusAgeClass(job.LastStatusChange)">
+                        @job.LastStatusChange.ToString("dd MMM yyyy")
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private bool _loading = false;
+    private bool _loaded = false;
+    private List<StaleJobRecord> _jobs = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+
+        await LoadJobsAsync();
+    }
+
+    private async Task LoadJobsAsync()
+    {
+        _loading = true;
+        StateHasChanged();
+
+        _jobs = await Jobs.GetStaleJobsAsync();
+
+        _loading = false;
+        _loaded = true;
+        StateHasChanged();
+    }
+
+    private string StatusAgeClass(DateTime date)
+    {
+        var months = ((DateTime.Today.Year - date.Year) * 12) + DateTime.Today.Month - date.Month;
+        if (months >= 3) return "text-stale-danger";
+        if (months >= 1) return "text-stale-warn";
+        return "";
+    }
+}

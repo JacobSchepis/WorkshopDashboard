@@ -1,0 +1,121 @@
+@page "/"
+@rendermode InteractiveServer
+
+@using WorkshopDashboard.Components.Layout
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    Home — the launcher: every tool in the app as a card per section, each
+    with a one-line description, plus a search box that filters by name or
+    description. The live workload dashboard that used to live here is now
+    Overview.razor (/overview).
+
+    Sections, links and descriptions all come from NavCatalog, the same list
+    the sidebar renders — add new pages there, not here.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<AuthorizeView>
+    <div class="page-header d-flex flex-wrap align-items-end justify-content-between gap-3">
+        <div>
+            <h1>@Greeting()@(FirstName(context.User.Identity?.Name) is string name ? $", {name}" : "")</h1>
+            <p class="text-muted">Everything in Workshop Dashboard, and what it does.</p>
+        </div>
+        <input type="search" class="form-control home-search" placeholder="Search tools..."
+               value="@_search" @oninput="e => _search = e.Value?.ToString() ?? string.Empty" />
+    </div>
+
+    @if (string.IsNullOrWhiteSpace(_search))
+    {
+        <a href="overview" class="card mb-4 text-decoration-none home-tool">
+            <div class="card-body d-flex align-items-center gap-3">
+                <span class="home-hero-icon">📈</span>
+                <div>
+                    <div class="fw-semibold">Overview</div>
+                    <div class="text-muted small">Job counts by status with overdue numbers, plus your highlighted jobs and their notes.</div>
+                </div>
+                <i class="bi bi-arrow-right ms-auto text-muted"></i>
+            </div>
+        </a>
+    }
+
+    @{
+        var sections = FilteredSections(context.User);
+    }
+
+    @if (sections.Count == 0)
+    {
+        <Callout Color="CalloutColor.Info">No tools match "@_search".</Callout>
+    }
+    else
+    {
+        <div class="row row-cols-1 row-cols-lg-2 row-cols-xxl-3 g-3">
+            @foreach (var (group, tools) in sections)
+            {
+                <div class="col">
+                    <Card Class="h-100">
+                        <CardHeader>
+                            <div class="fw-semibold">@group.Icon @group.Title</div>
+                            <div class="text-muted small">@group.Blurb</div>
+                        </CardHeader>
+                        <CardBody Class="p-2">
+                            @foreach (var tool in tools)
+                            {
+                                <a href="@tool.Href" class="d-block rounded px-2 py-2 text-decoration-none home-tool">
+                                    <div class="fw-semibold">@tool.Title</div>
+                                    <div class="text-muted small">@tool.Description</div>
+                                </a>
+                            }
+                        </CardBody>
+                    </Card>
+                </div>
+            }
+        </div>
+    }
+</AuthorizeView>
+
+@code {
+    private string _search = string.Empty;
+
+    // A section stays visible if its own title matches (showing all its tools),
+    // otherwise only the tools whose title/description match.
+    private List<(NavSection Section, IReadOnlyList<NavTool> Tools)> FilteredSections(System.Security.Claims.ClaimsPrincipal user)
+    {
+        var term = _search.Trim();
+        var result = new List<(NavSection, IReadOnlyList<NavTool>)>();
+
+        foreach (var section in NavCatalog.VisibleTo(user))
+        {
+            if (term.Length == 0 || section.Title.Contains(term, StringComparison.OrdinalIgnoreCase))
+            {
+                result.Add((section, section.Tools));
+                continue;
+            }
+
+            var tools = section.Tools
+                .Where(t => t.Title.Contains(term, StringComparison.OrdinalIgnoreCase) ||
+                            t.Description.Contains(term, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (tools.Count > 0)
+                result.Add((section, tools));
+        }
+
+        return result;
+    }
+
+    private static string Greeting()
+    {
+        var hour = DateTime.Now.Hour;
+        if (hour < 12) return "Good morning";
+        if (hour < 17) return "Good afternoon";
+        return "Good evening";
+    }
+
+    // JMS usernames are "first.last" — show "First".
+    private static string? FirstName(string? username)
+    {
+        var first = username?.Split('.')[0];
+        return string.IsNullOrEmpty(first) ? null : char.ToUpper(first[0]) + first[1..];
+    }
+}

@@ -1,0 +1,197 @@
+@page "/scope-reporting/customer/{CompanyName}/{CompanyIds}"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+
+@inherits JmsComponentBase
+
+@using Microsoft.AspNetCore.Components
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Reporting
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@inject ScopeCustomerStore ScopeCustomers
+@inject ScopeJobStore ScopeJobs
+@inject ScopeReportLookup ReportLookup
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    ScopeReportingCustomer — Customer page of the Scope Reporting drill-down.
+    See ScopeReportingOverview for where the numbers come from and what's
+    still a placeholder (Paid / Outstanding).
+
+    Route carries CompanyName + CompanyIds the same way WaitingQuoteDetail
+    does, so this page works even if the customer's entry in
+    ScopeCustomerStore is later renamed/removed — the ids in the URL are
+    what the query actually scopes to. The matching ScopeCustomer record
+    (if still present) is only used to show State/Tags and to make the Back
+    button return to the right state page.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="d-flex align-items-center gap-3 mb-3">
+    <Button Color="ButtonColor.Secondary" Outline="true" @onclick="GoBack">← Back</Button>
+    <h3 class="mb-0">@CompanyName — Scope Reporting</h3>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else
+{
+    <div class="d-flex align-items-center gap-2 mb-4">
+        <label class="form-label mb-0">Period</label>
+        <select class="form-select" style="max-width:220px;" value="@_period.Key" @onchange="OnPeriodChanged">
+            @foreach (var p in ScopeReportingPeriod.All())
+            {
+                <option value="@p.Key">@p.Label</option>
+            }
+        </select>
+        <span class="text-muted small">@_period.Start.ToString("d MMM yyyy") – @_period.End.ToString("d MMM yyyy")</span>
+    </div>
+
+    @if (_customer is not null && (_customer.Tags.Count > 0 || !string.IsNullOrWhiteSpace(_customer.State)))
+    {
+        <div class="d-flex flex-wrap gap-2 mb-3">
+            @if (!string.IsNullOrWhiteSpace(_customer.State))
+            {
+                <span class="badge text-bg-secondary">@_customer.State</span>
+            }
+            @foreach (var tag in _customer.Tags)
+            {
+                <span class="badge text-bg-secondary">@tag</span>
+            }
+        </div>
+    }
+
+    <div class="row row-cols-1 row-cols-md-3 row-cols-xl-6 g-3">
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Repairs</p>
+                    <p class="fs-3 mb-0">@_stats.JobCount</p>
+                    <p class="text-muted small mb-0">@_stats.CompletedCount completed &middot; @_stats.OpenCount open</p>
+                    @if (_stats.ClosedWithoutInvoiceCount > 0)
+                    {
+                        <p class="text-danger small mb-0">@_stats.ClosedWithoutInvoiceCount closed w/o invoice</p>
+                    }
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Invoiced</p>
+                    <p class="fs-3 mb-0">@FormatMoney(_stats.InvoicedTotal)</p>
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Paid</p>
+                    <p class="fs-3 mb-0">@FormatMoney(_stats.PaidTotal)</p>
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Outstanding</p>
+                    <p class="fs-3 mb-0">@FormatMoney(_stats.OutstandingTotal)</p>
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Avg Turnaround</p>
+                    <p class="fs-3 mb-0">@FormatDays(_stats.AvgTurnaroundDays)</p>
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Response Time</p>
+                    <p class="fs-3 mb-0">@FormatDays(_stats.AvgResponseDays)</p>
+                </CardBody>
+            </Card>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public string CompanyName { get; set; } = "";
+    [Parameter] public string CompanyIds { get; set; } = "";
+    [SupplyParameterFromQuery(Name = "period")] public string? PeriodKey { get; set; }
+
+    private bool _loading = true;
+    private ScopeCustomer? _customer;
+    private ScopeReportStats _stats = new();
+    private ScopeReportingPeriod _period;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _period = ScopeReportingPeriod.Resolve(PeriodKey);
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        _loading = true;
+        StateHasChanged();
+
+        var all = await ScopeCustomers.LoadAsync();
+        _customer = all.FirstOrDefault(c => string.Equals(c.DisplayName, CompanyName, StringComparison.OrdinalIgnoreCase));
+
+        var ids = ParseCompanyIds();
+        if (ids.Count == 0)
+        {
+            _stats = new();
+            _loading = false;
+            StateHasChanged();
+            return;
+        }
+
+        var exclusions = await ScopeJobs.LoadAsync();
+        var byCompany = await ReportLookup.GetStatsByCompanyAsync(ids, exclusions, _period.Start, _period.End);
+        _stats = ScopeReportStatsParser.Aggregate(byCompany, ids);
+
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private List<int> ParseCompanyIds() =>
+        CompanyIds
+            .Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Select(s => int.TryParse(s.Trim(), out var id) ? id : -1)
+            .Where(id => id > 0)
+            .ToList();
+
+    private void OnPeriodChanged(ChangeEventArgs e) =>
+        Nav.NavigateTo(Nav.GetUriWithQueryParameter("period", e.Value?.ToString()));
+
+    private void GoBack()
+    {
+        var state = string.IsNullOrWhiteSpace(_customer?.State) ? "Unassigned" : _customer!.State;
+        Nav.NavigateTo($"/scope-reporting/state/{Uri.EscapeDataString(state!)}?period={Uri.EscapeDataString(_period.Key)}");
+    }
+
+    private static string FormatMoney(decimal amount) => $"${amount:N0}";
+
+    private static string FormatDays(double? days) => days.HasValue ? $"{days.Value:0.#}d" : "—";
+}

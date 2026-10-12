@@ -1,0 +1,646 @@
+@page "/bulk-create-recall"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject RecallLookup RecallLookup
+@inject ILogger<BulkCreateRecall> Logger
+
+@using System.Globalization
+@using System.IO
+@using System.Text
+@using ClosedXML.Excel
+@using CsvHelper
+@using CsvHelper.Configuration
+@using Microsoft.AspNetCore.Components.Forms
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    BulkCreateRecall — batch-imports a TGA (Therapeutic Goods Administration)
+    recall export (.xlsx or .csv) and submits each row to JMS's
+    CreateRecall form, one POST per row, mirroring its real field names
+    (see BuildMultipart). Dry run is on by default — it builds and logs the
+    same multipart payload without POSTing.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      RecallLookup — GetExistingReferencesCsvAsync (duplicate check against
+                     already-imported tga_recall_reference values) and
+                     SubmitRecallAsync (the real CreateRecall POST)
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      OnFileSelected parses the upload (LoadFromXlsx/LoadFromCsv) into
+      RecallRow list -> LoadExistingReferencesAsync flags rows already in JMS
+      as Exists -> user reviews rows in the table/preview, then
+      SubmitCurrent/SubmitRow/SubmitBatch build a multipart form per row via
+      BuildMultipart and POST (or just log, if Dry run is on).
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Bulk Create TGA Recalls</h1>
+</div>
+
+<div style="max-width: 1100px;">
+
+    <!-- ── Upload + controls ─────────────────────────────────────────── -->
+    <div style="display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem;">
+        <InputFile OnChange="OnFileSelected" accept=".xlsx,.csv" class="form-control" style="max-width: 360px;" />
+
+        <label style="display: flex; align-items: center; gap: 0.4rem; font-weight: 600;">
+            <input type="checkbox" @bind="_dryRun" />
+            Dry run (log only, no POST)
+        </label>
+
+        @if (_rows.Count > 0)
+        {
+            <span class="badge bg-secondary">@_rows.Count row(s) loaded</span>
+
+            <label style="display:flex; align-items:center; gap:0.4rem; font-weight:600;">
+                How many:
+                <input type="number" min="1" @bind="_batchCount" placeholder="all"
+                       class="form-control" style="width: 90px;" />
+            </label>
+
+            <button class="btn btn-primary" @onclick="SubmitBatch" disabled="@_submitting">
+                @_batchButtonLabel
+            </button>
+        }
+    </div>
+
+    @if (!string.IsNullOrEmpty(_loadError))
+    {
+        <div class="alert alert-danger">@_loadError</div>
+    }
+
+    @if (_rows.Count > 0)
+    {
+        <!-- ── Queue table ───────────────────────────────────────────── -->
+        <div style="max-height: 460px; overflow-y: auto;">
+            <table class="table table-sm table-hover" style="font-size: 0.85rem;">
+                <thead style="position: sticky; top: 0; background: #fff; z-index: 1;">
+                    <tr>
+                        <th style="width: 40px;">#</th>
+                        <th>TGA Action ID</th>
+                        <th>Product</th>
+                        <th>Action Type</th>
+                        <th style="width: 110px;">Status</th>
+                        <th style="width: 90px;"></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <Virtualize Items="_indexed" Context="item" ItemSize="41" SpacerElement="tr">
+                        @{
+                            var r = item.Row;
+                            var idx = item.Index;
+                            var rowStyle = idx == _currentIndex ? "cursor:pointer;background:#e7f1ff;" : "cursor:pointer;";
+                            var badgeCss = StatusCss(r.Status);
+                        }
+                        <tr @key="r" @onclick="() => SelectRow(idx)" style="@rowStyle">
+                            <td>@(idx + 1)</td>
+                            <td>@r.TgaActionId</td>
+                            <td>@Truncate(r.ProductName, 60)</td>
+                            <td>@r.ActionType</td>
+                            <td><span class="badge @badgeCss">@r.Status</span></td>
+                            <td>
+                                <button class="btn btn-sm btn-outline-primary"
+                                        @onclick="() => SubmitRow(idx)"
+                                        @onclick:stopPropagation="true"
+                                        disabled="@(_submitting || r.Status != RowStatus.Waiting)">
+                                    @(_dryRun ? "Test" : "Send")
+                                </button>
+                            </td>
+                        </tr>
+                    </Virtualize>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- ── Selected row preview ──────────────────────────────────── -->
+        @if (_current is not null)
+        {
+            var r = _current!;
+            <div style="border: 1px solid #dee2e6; border-radius: 6px; padding: 1rem; margin-top: 0.5rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.75rem;">
+                    <strong>Row @(_currentIndex + 1) of @_rows.Count</strong>
+                    <div style="display: flex; gap: 0.5rem;">
+                        <button class="btn btn-sm btn-outline-secondary" @onclick="Prev" disabled="@(_currentIndex == 0)">← Prev</button>
+                        <button class="btn btn-sm btn-outline-secondary" @onclick="Next" disabled="@(_currentIndex >= _rows.Count - 1)">Next →</button>
+                        <button class="btn btn-sm btn-outline-warning" @onclick="SkipCurrent" disabled="@_submitting">Skip</button>
+                        <button class="btn btn-sm btn-primary" @onclick="SubmitCurrent" disabled="@_submitting">
+                            @(_dryRun ? "✓ Dry-run this row" : "✓ Submit this recall")
+                        </button>
+                    </div>
+                </div>
+
+                <div style="display: grid; grid-template-columns: 220px 1fr; gap: 0.4rem 1rem; font-size: 0.85rem;">
+                    @Field("tga_recall_reference", r.TgaActionId)
+                    @Field("recall_title *", FirstLine(r.ProductName))
+                    @Field("product_type", r.ProductType)
+                    @Field("tga_artg_no", r.ArtgNumber)
+                    @Field("unique_device_identifier", r.UniqueDeviceIdentifier)
+                    @Field("action_type", r.ActionType)
+                    @Field("action_level", r.ActionLevel)
+                    @Field("hazard_classification", r.HazardClassification)
+                    @Field("recall_notice_date", NormalizeDate(r.ActionCommencementDate))
+                    @Field("recall_received_date", _todayIso)
+                    @Field("recall_description *", r.ProductName)
+                    @Field("reason_for_action", r.ReasonForAction)
+                    @Field("instructions_for_users", r.InstructionsForCustomers)
+                    @Field("contact_information", r.ContactInformation)
+                    @Field("responsible_entity_display", r.ResponsibleEntity)
+                </div>
+
+                @if (!string.IsNullOrEmpty(r.LastError))
+                {
+                    <div class="alert alert-danger" style="margin-top: 0.75rem;">@r.LastError</div>
+                }
+            </div>
+        }
+    }
+
+    <!-- ── Log ───────────────────────────────────────────────────────── -->
+    @if (_log.Count > 0)
+    {
+        <div style="margin-top: 1rem; background: #1e1e1e; color: #ddd; border-radius: 6px; padding: 0.75rem;
+                    font-family: monospace; font-size: 0.8rem; max-height: 260px; overflow-y: auto;">
+            @foreach (var line in _log)
+            {
+                <div class="@line.Css">@line.Text</div>
+            }
+        </div>
+    }
+</div>
+
+@code {
+    // ── State ──────────────────────────────────────────────────────────
+    private readonly List<RecallRow> _rows = new();
+    private readonly List<LogLine> _log = new();
+
+    // Row + its position, materialised once so <Virtualize> has a stable indexed list.
+    private List<(RecallRow Row, int Index)> _indexed = new();
+
+    private int _currentIndex;
+    private bool _submitting;
+    private bool _dryRun = true;                       // safe default
+    private string? _loadError;
+    private int? _batchCount;                          // null/blank = all waiting
+
+    private string _batchButtonLabel
+    {
+        get
+        {
+            if (_submitting) return "Working…";
+            var verb = _dryRun ? "Dry-run" : "Submit";
+            var scope = _batchCount is > 0 ? _batchCount.Value.ToString() : "all";
+            return $"{verb} {scope} waiting";
+        }
+    }
+
+    private readonly string _todayIso = DateTime.Today.ToString("yyyy-MM-dd");
+
+    private RecallRow? _current =>
+        _rows.Count > 0 && _currentIndex >= 0 && _currentIndex < _rows.Count ? _rows[_currentIndex] : null;
+
+    // ── File load ──────────────────────────────────────────────────────
+    private async Task OnFileSelected(InputFileChangeEventArgs e)
+    {
+        _rows.Clear();
+        _indexed.Clear();
+        _log.Clear();
+        _loadError = null;
+        _currentIndex = 0;
+
+        try
+        {
+            // Buffer the upload once; both readers need a seekable stream.
+            using var stream = e.File.OpenReadStream(maxAllowedSize: 20 * 1024 * 1024);
+            using var ms = new MemoryStream();
+            await stream.CopyToAsync(ms);
+
+            var ext = Path.GetExtension(e.File.Name).ToLowerInvariant();
+            string source;
+
+            if (ext == ".xlsx")
+            {
+                ms.Position = 0;
+                LoadFromXlsx(ms);
+                source = "xlsx";
+            }
+            else
+            {
+                ms.Position = 0;
+                using var reader = new StreamReader(ms, Encoding.UTF8, true, 1024, leaveOpen: true);
+                var text = await reader.ReadToEndAsync();
+                var delimiter = LoadFromCsv(text);
+                source = delimiter == "\t" ? "CSV/TAB" : "CSV/comma";
+            }
+
+            // Build the stable indexed list <Virtualize> iterates over.
+            _indexed = _rows.Select((row, i) => (row, i)).ToList();
+            AddLog($"Loaded {_rows.Count} row(s) from {e.File.Name} ({source}).", "ll-ok");
+
+            // Belt-and-suspenders: catch any UDI that slipped through as scientific notation.
+            var suspect = _rows.Count(r => !string.IsNullOrEmpty(r.UniqueDeviceIdentifier)
+                                           && r.UniqueDeviceIdentifier!.Contains("E+", StringComparison.OrdinalIgnoreCase));
+            if (suspect > 0)
+                AddLog($"⚠ {suspect} UDI value(s) look like scientific notation — likely a corrupted export. Check before submitting.", "ll-err");
+
+            // Flag any recalls that are already in the database.
+            await LoadExistingReferencesAsync();
+        }
+        catch (Exception ex)
+        {
+            _loadError = $"Failed to read {e.File.Name}: {ex.Message}";
+            AddLog($"✗ {_loadError}", "ll-err");
+        }
+    }
+
+    private string LoadFromCsv(string text)
+    {
+        // TGA exports are usually comma-separated, but occasionally tab. Sniff the header.
+        var firstLine = text.Split('\n').FirstOrDefault() ?? "";
+        var delimiter = firstLine.Contains('\t') ? "\t" : ",";
+
+        var config = new CsvConfiguration(CultureInfo.InvariantCulture)
+            {
+                Delimiter = delimiter,
+                PrepareHeaderForMatch = args => args.Header.ToLower().Trim(),
+                MissingFieldFound = null,
+                HeaderValidated = null,
+                BadDataFound = null,
+            };
+
+        using var csv = new CsvReader(new StringReader(text), config);
+        csv.Context.RegisterClassMap<RecallRowMap>();
+        _rows.AddRange(csv.GetRecords<RecallRow>());
+        return delimiter;
+    }
+
+    private void LoadFromXlsx(Stream stream)
+    {
+        using var workbook = new XLWorkbook(stream);
+        var ws = workbook.Worksheets.First();
+
+        var rows = ws.RowsUsed().ToList();
+        if (rows.Count == 0) return;
+
+        // Map header text -> absolute worksheet column number (case-insensitive, trimmed).
+        var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in rows[0].CellsUsed())
+        {
+            var key = c.GetString().Trim();
+            if (!string.IsNullOrEmpty(key) && !map.ContainsKey(key))
+                map[key] = c.Address.ColumnNumber;
+        }
+
+        string Col(IXLRow row, string name)
+            => map.TryGetValue(name.Trim(), out var col) ? CellText(row.Cell(col)) : string.Empty;
+
+        for (var i = 1; i < rows.Count; i++)
+        {
+            var row = rows[i];
+            var rec = new RecallRow
+                {
+                    TgaActionId = Col(row, "TGA Action ID"),
+                    ProductType = Col(row, "Type of Product"),
+                    ProductName = Col(row, "Product Name/Description"),
+                    ArtgNumber = Col(row, "ARTG Number"),
+                    UniqueDeviceIdentifier = Col(row, "Unique Device Identifier (UDI)"),
+                    ActionType = Col(row, "Action Type"),
+                    ActionLevel = Col(row, "Action Level"),
+                    HazardClassification = Col(row, "Hazard Classification"),
+                    ReasonForAction = Col(row, "Reason for the Action"),
+                    InstructionsForCustomers = Col(row, "Instructions for Customers/Users"),
+                    ActionCommencementDate = Col(row, "Action Commencement Date"),
+                    ResponsibleEntity = Col(row, "Responsible Entity"),
+                    ContactInformation = Col(row, "Contact Information"),
+                };
+
+            // Skip fully blank rows.
+            if (string.IsNullOrWhiteSpace(rec.TgaActionId) && string.IsNullOrWhiteSpace(rec.ProductName))
+                continue;
+
+            _rows.Add(rec);
+        }
+    }
+
+    // Reads a cell as text without Excel's scientific-notation formatting on long numbers (UDIs).
+    private static string CellText(IXLCell cell)
+    {
+        if (cell is null || cell.IsEmpty()) return string.Empty;
+
+        switch (cell.DataType)
+        {
+            case XLDataType.Number:
+                var d = cell.GetValue<double>();
+                return d == Math.Floor(d)
+                    ? ((decimal)d).ToString("0", CultureInfo.InvariantCulture)   // full digits, no 3.7E+12
+                    : d.ToString(CultureInfo.InvariantCulture);
+            case XLDataType.DateTime:
+                return cell.GetDateTime().ToString("dd/MM/yyyy", CultureInfo.InvariantCulture);
+            case XLDataType.Boolean:
+                return cell.GetValue<bool>().ToString();
+            default:
+                return cell.GetString().Trim();
+        }
+    }
+
+
+    // ── Duplicate check ────────────────────────────────────────────────
+    private async Task LoadExistingReferencesAsync()
+    {
+        var refs = _rows.Select(r => r.TgaActionId?.Trim())
+                        .Where(x => !string.IsNullOrWhiteSpace(x))
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+        if (refs.Count == 0) return;
+
+        try
+        {
+            var csvContent = await RecallLookup.GetExistingReferencesCsvAsync(refs!);
+            var existing = ParseExistingRefs(csvContent ?? "");
+
+            var count = 0;
+            foreach (var r in _rows)
+            {
+                if (!string.IsNullOrWhiteSpace(r.TgaActionId) && existing.Contains(r.TgaActionId.Trim()))
+                {
+                    r.Status = RowStatus.Exists;
+                    count++;
+                }
+            }
+
+            if (count > 0)
+                AddLog($"{count} row(s) already exist in the database — marked Exists and will be skipped.", "ll-skip");
+            else
+                AddLog("No duplicates found — all rows are new.", "ll-ok");
+
+            // Land the selection on the first row that still needs submitting.
+            var firstWaiting = _rows.FindIndex(r => r.Status == RowStatus.Waiting);
+            if (firstWaiting >= 0) _currentIndex = firstWaiting;
+        }
+        catch (Exception ex)
+        {
+            AddLog($"⚠ Duplicate check failed ({ex.Message}). Proceeding without it — verify manually before submitting.", "ll-err");
+        }
+    }
+
+    private static HashSet<string> ParseExistingRefs(string? csvText)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(csvText)) return set;
+
+        var config = new CsvConfiguration(CultureInfo.InvariantCulture)
+            {
+                PrepareHeaderForMatch = args => args.Header.ToLower().Trim(),
+                MissingFieldFound = null,
+                HeaderValidated = null,
+                BadDataFound = null,
+            };
+
+        using var csv = new CsvReader(new StringReader(csvText), config);
+        foreach (var rec in csv.GetRecords<RefRow>())
+        {
+            if (!string.IsNullOrWhiteSpace(rec.tga_recall_reference))
+                set.Add(rec.tga_recall_reference.Trim());
+        }
+        return set;
+    }
+
+    // ── Navigation ─────────────────────────────────────────────────────
+    private void SelectRow(int i) => _currentIndex = i;
+    private void Prev() { if (_currentIndex > 0) _currentIndex--; }
+    private void Next() { if (_currentIndex < _rows.Count - 1) _currentIndex++; }
+
+    private void AdvanceToNextWaiting()
+    {
+        for (var i = _currentIndex + 1; i < _rows.Count; i++)
+        {
+            if (_rows[i].Status == RowStatus.Waiting) { _currentIndex = i; return; }
+        }
+    }
+
+    // ── Submit ─────────────────────────────────────────────────────────
+    private async Task SubmitRow(int idx)
+    {
+        _currentIndex = idx;
+        await SubmitCurrent();
+    }
+
+    private async Task SubmitBatch()
+    {
+        var limit = _batchCount is > 0 ? _batchCount.Value : int.MaxValue;
+        var processed = 0;
+
+        for (var i = 0; i < _rows.Count; i++)
+        {
+            if (processed >= limit) break;
+            if (_rows[i].Status != RowStatus.Waiting) continue;
+
+            _currentIndex = i;
+            await SubmitCurrent();
+            processed++;
+        }
+    }
+
+    private void SkipCurrent()
+    {
+        if (_current is null) return;
+        _current.Status = RowStatus.Skipped;
+        AddLog($"– [{_currentIndex + 1}] {_current.TgaActionId} skipped.", "ll-skip");
+        AdvanceToNextWaiting();
+    }
+
+    private async Task SubmitCurrent()
+    {
+        if (_current is null) return;
+        var r = _current;
+
+        if (r.Status == RowStatus.Exists)
+        {
+            AddLog($"– [{_currentIndex + 1}] {r.TgaActionId} already exists — not submitting.", "ll-skip");
+            return;
+        }
+
+        _submitting = true;
+        StateHasChanged();
+
+        try
+        {
+            using var mp = BuildMultipart(r);
+
+            if (_dryRun)
+            {
+                Logger.LogInformation("Dry run for recall {ActionId} ({Product}):", r.TgaActionId, r.ProductName);
+                foreach (var part in mp)
+                {
+                    var name = part.Headers.ContentDisposition?.Name?.Trim('"');
+                    var val = part is StringContent sc ? await sc.ReadAsStringAsync() : "<content>";
+                    Logger.LogInformation("  {Field} = {Value}", name, Truncate(val, 100));
+                }
+                await Task.Delay(250);
+            }
+            else
+            {
+                var resp = await RecallLookup.SubmitRecallAsync(mp);
+            }
+
+            var mode = _dryRun ? "dry run OK" : "submitted";
+            r.Status = RowStatus.Submitted;
+            AddLog($"✓ [{_currentIndex + 1}] {r.TgaActionId} — {r.ProductName} ({mode}).", "ll-ok");
+            AdvanceToNextWaiting();
+        }
+        catch (Exception ex)
+        {
+            r.Status = RowStatus.Error;
+            r.LastError = ex.Message;
+            AddLog($"✗ [{_currentIndex + 1}] {r.TgaActionId} — {ex.Message}", "ll-err");
+        }
+        finally
+        {
+            _submitting = false;
+            StateHasChanged();
+        }
+    }
+
+    // ── Build multipart (mirrors the CreateRecall form fields) ─────
+    private MultipartFormDataContent BuildMultipart(RecallRow r)
+    {
+        var mp = new MultipartFormDataContent();
+        void Add(string name, string? value) => mp.Add(new StringContent(value ?? string.Empty, Encoding.UTF8), name);
+
+        Add("tga_recall_reference", r.TgaActionId);
+        Add("action_type", r.ActionType);
+        Add("action_level", r.ActionLevel);
+        Add("hazard_classification", r.HazardClassification);
+        Add("recall_notice_date", NormalizeDate(r.ActionCommencementDate));
+        Add("recall_title", FirstLine(r.ProductName)); // required — first line of the TGA name/description
+        Add("product_type", r.ProductType);
+        Add("tga_artg_no", r.ArtgNumber);
+        Add("unique_device_identifier", r.UniqueDeviceIdentifier);
+        Add("recall_description", r.ProductName);            // required — full name/description block
+        Add("reason_for_action", r.ReasonForAction);
+        Add("instructions_for_users", r.InstructionsForCustomers);
+        Add("responsible_entity_display", r.ResponsibleEntity);      // ignored server-side per your note
+        Add("responsible_entity_company_id", string.Empty);            // ignored
+        Add("contact_information", r.ContactInformation);
+        Add("recall_received_date", _todayIso);
+        Add("notes", string.Empty);
+        Add("selected_resource_id", "0");
+        Add("create_recall", "Create Recall");
+        // recall_notice (file) and model_ids[] intentionally omitted — no source in the TGA CSV.
+
+        return mp;
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────
+    private static string NormalizeDate(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+
+        string[] formats =
+        {
+            "dd/MM/yyyy", "d/M/yyyy", "dd-MM-yyyy", "yyyy-MM-dd",
+            "d MMM yyyy", "dd MMM yyyy", "d MMMM yyyy", "dd MMMM yyyy"
+    };
+
+        if (DateTime.TryParseExact(raw.Trim(), formats, CultureInfo.InvariantCulture,
+                                   DateTimeStyles.None, out var dt))
+        {
+            return dt.ToString("yyyy-MM-dd");
+        }
+
+        // Fall back to the raw value if we can't confidently parse it.
+        return raw.Trim();
+    }
+
+    private static string FirstLine(string? s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return string.Empty;
+        var idx = s.IndexOfAny(new[] { '\r', '\n' });
+        return idx >= 0 ? s[..idx].Trim() : s.Trim();
+    }
+
+    private static string Truncate(string? s, int max)
+        => string.IsNullOrEmpty(s) ? string.Empty : (s.Length <= max ? s : s[..max] + "…");
+
+    private void AddLog(string text, string css) => _log.Insert(0, new LogLine(text, css));
+
+    private RenderFragment Field(string label, string? value) => builder =>
+    {
+        builder.OpenElement(0, "div");
+        builder.AddAttribute(1, "style", "font-weight:600; color:#555;");
+        builder.AddContent(2, label);
+        builder.CloseElement();
+
+        builder.OpenElement(3, "div");
+        builder.AddAttribute(4, "style", "white-space:pre-wrap;");
+        builder.AddContent(5, string.IsNullOrWhiteSpace(value) ? "—" : value);
+        builder.CloseElement();
+    };
+
+    private static string StatusCss(RowStatus s) => s switch
+    {
+        RowStatus.Submitted => "bg-success",
+        RowStatus.Skipped => "bg-warning text-dark",
+        RowStatus.Error => "bg-danger",
+        RowStatus.Exists => "bg-info text-dark",
+        _ => "bg-secondary",
+    };
+
+    // ── Types ──────────────────────────────────────────────────────────
+    private enum RowStatus { Waiting, Submitted, Skipped, Error, Exists }
+
+    private sealed class RecallRow
+    {
+        public string? TgaActionId { get; set; }
+        public string? ProductType { get; set; }
+        public string? ProductName { get; set; }
+        public string? ArtgNumber { get; set; }
+        public string? UniqueDeviceIdentifier { get; set; }
+        public string? ActionType { get; set; }
+        public string? ActionLevel { get; set; }
+        public string? HazardClassification { get; set; }
+        public string? ReasonForAction { get; set; }
+        public string? InstructionsForCustomers { get; set; }
+        public string? ActionCommencementDate { get; set; }
+        public string? ResponsibleEntity { get; set; }
+        public string? ContactInformation { get; set; }
+
+        // runtime
+        public RowStatus Status { get; set; } = RowStatus.Waiting;
+        public string? LastError { get; set; }
+    }
+
+    private sealed class RecallRowMap : ClassMap<RecallRow>
+    {
+        public RecallRowMap()
+        {
+            Map(m => m.TgaActionId).Name("TGA Action ID");
+            Map(m => m.ProductType).Name("Type of Product");
+            Map(m => m.ProductName).Name("Product Name/Description");
+            Map(m => m.ArtgNumber).Name("ARTG Number");
+            Map(m => m.UniqueDeviceIdentifier).Name("Unique Device Identifier (UDI)");
+            Map(m => m.ActionType).Name("Action Type");
+            Map(m => m.ActionLevel).Name("Action Level");
+            Map(m => m.HazardClassification).Name("Hazard Classification");
+            Map(m => m.ReasonForAction).Name("Reason for the Action");
+            Map(m => m.InstructionsForCustomers).Name("Instructions for Customers/Users");
+            Map(m => m.ActionCommencementDate).Name("Action Commencement Date");
+            Map(m => m.ResponsibleEntity).Name("Responsible Entity");
+            Map(m => m.ContactInformation).Name("Contact Information");
+        }
+    }
+
+    private sealed class RefRow
+    {
+        public string? tga_recall_reference { get; set; }
+    }
+
+    private record LogLine(string Text, string Css);
+}

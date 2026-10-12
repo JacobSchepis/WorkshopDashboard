@@ -1,0 +1,9 @@
+/* Fixed to the screen, not min-height — a wall-mounted kiosk has nobody to scroll it, so
+   content can never be allowed to run off the bottom edge. Overflow is handled by the
+   auto-scroll script in KioskLayout.razor instead of a scrollbar nobody can reach. */
+.kiosk-main {
+    padding: 2rem 2.5rem;
+    height: 100vh;
+    overflow-y: hidden;
+    box-sizing: border-box;
+}

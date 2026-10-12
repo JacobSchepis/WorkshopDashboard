@@ -1,0 +1,135 @@
+﻿.page {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+}
+
+main {
+    flex: 1;
+}
+
+.sidebar {
+    background-image: linear-gradient(180deg, rgb(5, 39, 103) 0%, #3a0647 70%);
+    display: flex;
+    flex-direction: column;
+}
+
+.top-row {
+    background-color: var(--bs-tertiary-bg);
+    border-bottom: 1px solid var(--bs-border-color);
+    justify-content: flex-end;
+    height: 3.5rem;
+    display: flex;
+    align-items: center;
+}
+
+    .top-row ::deep a, .top-row ::deep .btn-link {
+        white-space: nowrap;
+        margin-left: 1.5rem;
+        text-decoration: none;
+    }
+
+    .top-row ::deep a:hover, .top-row ::deep .btn-link:hover {
+        text-decoration: underline;
+    }
+
+    .top-row ::deep a:first-child {
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+@media (max-width: 640.98px) {
+    .top-row {
+        justify-content: space-between;
+    }
+
+    .top-row ::deep a, .top-row ::deep .btn-link {
+        margin-left: 0;
+    }
+}
+
+@media (min-width: 641px) {
+    .page {
+        flex-direction: row;
+    }
+
+    /* Window-height and sticky, so it scrolls on its own when expanded nav sections run
+       past the bottom of the screen, instead of spilling out over the page below. */
+    .sidebar {
+        width: 250px;
+        height: 100vh;
+        position: sticky;
+        top: 0;
+        overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(255, 255, 255, 0.3) transparent;
+    }
+
+    .top-row {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+    }
+
+    .top-row.auth ::deep a:first-child {
+        flex: 1;
+        text-align: right;
+        width: 0;
+    }
+
+    .top-row, article {
+        padding-left: 2rem !important;
+        padding-right: 1.5rem !important;
+    }
+}
+
+#blazor-error-ui {
+    background: lightyellow;
+    bottom: 0;
+    box-shadow: 0 -1px 2px rgba(0, 0, 0, 0.2);
+    display: none;
+    left: 0;
+    padding: 0.6rem 1.25rem 0.7rem 1.25rem;
+    position: fixed;
+    width: 100%;
+    z-index: 1000;
+}
+
+    #blazor-error-ui .dismiss {
+        cursor: pointer;
+        position: absolute;
+        right: 0.75rem;
+        top: 0.5rem;
+    }
+
+/* Hideable sidebar (desktop only — on a phone the nav already stacks above the page).
+   App.razor's __toggleNav sets data-nav-hidden on <html>; NavMenu's ☰ hides the sidebar
+   and this one brings it back. It floats at the top-left of the page content, so the
+   page's .page-header h1 (1.5rem, line-height 1.2 — matched here) flows in beside it. */
+.nav-show-btn {
+    display: none;
+}
+
+@media (min-width: 641px) {
+    :root[data-nav-hidden] .sidebar {
+        display: none;
+    }
+
+    :root[data-nav-hidden] .nav-show-btn {
+        display: block;
+        float: left;
+        margin: 0 0.5rem 0 -0.4rem;
+        padding: 0 0.4rem;
+        border: 0;
+        border-radius: 0.375rem;
+        background: none;
+        color: var(--bs-secondary-color);
+        font-size: 1.5rem;
+        line-height: 1.2;
+    }
+
+    :root[data-nav-hidden] .nav-show-btn:hover {
+        color: var(--bs-body-color);
+        background-color: var(--bs-tertiary-bg);
+    }
+}

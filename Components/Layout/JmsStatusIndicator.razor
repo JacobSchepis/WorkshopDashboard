@@ -1,0 +1,156 @@
+@using BlazorBootstrap
+@using WorkshopDashboard.Services.External.Jms
+@implements IDisposable
+
+@inject JmsUserSession JmsSession
+@inject JmsStatus JmsStatus
+@inject JmsWriteQueue WriteQueue
+@inject AuthenticationStateProvider AuthStateProvider
+@inject ILogger<JmsStatusIndicator> Logger
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    JmsStatusIndicator — nav bar badges for JMS's state:
+      1. Is JMS itself up — from JmsStatus, which JmsUptimeMonitorService
+         updates every minute. Subscribes to its Changed event, so an
+         outage shows up straight away.
+      2. Is the logged-in user's own JMS session (the one writes go
+         through) still valid — checked after first render (not during
+         prerender, so it isn't done twice), every couple of minutes, and
+         again as soon as JMS comes back up. Hidden while JMS is down,
+         since there's nothing to log into. An expired session is
+         re-established automatically from the saved password; when that
+         password stops working it links to /jms-reconnect.
+      3. How many of this user's changes are waiting in JmsWriteQueue (or
+         failed there) — links to /jms-pending. Updates on the queue's
+         Changed event.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="d-flex flex-wrap align-items-center gap-2 small">
+    @switch (JmsStatus.IsUp)
+    {
+        case null:
+            <Badge Color="BadgeColor.Secondary">Checking JMS…</Badge>
+            break;
+        case false:
+            <Badge Color="BadgeColor.Danger">JMS down since @JmsStatus.DownSince?.ToString("h:mm tt")</Badge>
+            break;
+        case true:
+            <Badge Color="BadgeColor.Success">JMS online</Badge>
+            break;
+    }
+
+    @if (JmsStatus.IsUp != false)
+    {
+        @switch (_session)
+        {
+            case null:
+                <Badge Color="BadgeColor.Secondary">Checking login…</Badge>
+                break;
+            case JmsUserSessionState.Connected:
+                <Badge Color="BadgeColor.Success">Logged in</Badge>
+                break;
+            case JmsUserSessionState.PasswordNeeded:
+                <Badge Color="BadgeColor.Danger">JMS login needed</Badge>
+                <a href="jms-reconnect" class="link-light">Re-enter password</a>
+                break;
+            case JmsUserSessionState.JmsUnavailable:
+                <Badge Color="BadgeColor.Warning">Can't reach JMS</Badge>
+                break;
+        }
+    }
+
+    @* Writes queued by JmsWriteQueue while JMS couldn't take them. *@
+    @if (_failed > 0)
+    {
+        <a href="jms-pending"><Badge Color="BadgeColor.Danger">@_failed change@(_failed == 1 ? "" : "s") failed</Badge></a>
+    }
+    @if (_pending > 0)
+    {
+        <a href="jms-pending"><Badge Color="BadgeColor.Warning">@_pending change@(_pending == 1 ? "" : "s") waiting</Badge></a>
+    }
+</div>
+
+@code {
+    private static readonly TimeSpan RecheckInterval = TimeSpan.FromMinutes(2);
+
+    private JmsUserSessionState? _session;
+    private Timer? _timer;
+    private string? _username;
+    private int _pending;
+    private int _failed;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        JmsStatus.Changed += OnJmsStatusChanged;
+        _timer = new Timer(async _ => await CheckLoginAsync(), null, TimeSpan.Zero, RecheckInterval);
+
+        _username = (await AuthStateProvider.GetAuthenticationStateAsync()).User.Identity?.Name;
+        WriteQueue.Changed += OnQueueChanged;
+        await RefreshQueueCountsAsync();
+    }
+
+    private async void OnQueueChanged(string username)
+    {
+        if (!string.Equals(username, _username, StringComparison.OrdinalIgnoreCase)) return;
+        await RefreshQueueCountsAsync();
+    }
+
+    // Called from an event handler (async void), so nothing may escape it.
+    private async Task RefreshQueueCountsAsync()
+    {
+        try
+        {
+            if (_username is null) return;
+            (_pending, _failed) = await WriteQueue.CountAsync(_username);
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Pending write count failed");
+        }
+    }
+
+    private async void OnJmsStatusChanged()
+    {
+        try
+        {
+            await InvokeAsync(StateHasChanged);
+
+            // Coming back up: re-check the session now rather than waiting for the timer.
+            if (JmsStatus.IsUp == true) await CheckLoginAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Status update failed");
+        }
+    }
+
+    // Runs from a timer callback / event handler (async void), so nothing may escape it or
+    // it takes the whole app down.
+    private async Task CheckLoginAsync()
+    {
+        try
+        {
+            var session = await JmsSession.CheckAsync();
+            if (session == _session) return;
+
+            _session = session;
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Login check failed");
+        }
+    }
+
+    public void Dispose()
+    {
+        JmsStatus.Changed -= OnJmsStatusChanged;
+        WriteQueue.Changed -= OnQueueChanged;
+        _timer?.Dispose();
+    }
+}

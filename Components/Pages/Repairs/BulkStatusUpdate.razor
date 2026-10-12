@@ -1,0 +1,180 @@
+@page "/bulk-status-update"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject JobEquipmentLookup EquipmentLookup
+@inject JobStatusActionService StatusAction
+
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Components.Forms
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.External.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    BulkStatusUpdate — apply one status change (with an optional note) to a
+    pasted list of job ids in one go.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      EquipmentLookup — JobEquipmentLookup: owner/model/serial summary for
+                        the pasted job ids
+      StatusAction    — JobStatusActionService: ChangeJobStatusAsync per job
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      LookupJobsAsync resolves the JobIdsSection's ids to summary rows for
+      review -> ApplyStatusAsync loops the distinct job ids, calling
+      StatusAction once per job and tallying successes.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Bulk Status Update</h1>
+</div>
+
+<Card Class="mb-3">
+    <CardBody>
+        <JobIdsSection @ref="_jobIdsSection" />
+        <Button Color="ButtonColor.Primary" @onclick="LookupJobsAsync">Look Up Jobs</Button>
+    </CardBody>
+</Card>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else if (_jobs.Count > 0)
+{
+    <Card Class="mb-3">
+        <CardBody>
+            <table class="table table-striped align-middle mb-0">
+                <thead>
+                    <tr>
+                        <th>Job ID</th>
+                        <th>Company</th>
+                        <th>Model</th>
+                        <th>Serial Number</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var job in _jobs)
+                    {
+                        <tr>
+                            <td>@job.JobId</td>
+                            <td>@job.OwnerCompanyName</td>
+                            <td>@($"{job.ManufacturerName} {job.ModelName}")</td>
+                            <td>@job.SerialNo</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </CardBody>
+    </Card>
+
+    <Card>
+        <CardBody>
+            <label class="form-label fw-semibold">Apply Status to All Jobs</label>
+            <InputSelect TValue="JobStatus?"
+                         class="form-select"
+                         @bind-Value="_selectedStatus">
+                <option value="">-- Select Status --</option>
+                @foreach (var s in Enum.GetValues<JobStatus>())
+                {
+                    <option value="@s">@s</option>
+                }
+            </InputSelect>
+
+            <div class="mt-2">
+                <label class="form-label">Note (optional)</label>
+                <input class="form-control" type="text" @bind="_statusNote" placeholder="Optional note..." />
+            </div>
+
+            @if (!string.IsNullOrEmpty(_statusMessage))
+            {
+                <Callout Color="@(_statusSuccess ? CalloutColor.Success : CalloutColor.Danger)" Class="mt-3">
+                    @_statusMessage
+                </Callout>
+            }
+
+            <Button Color="ButtonColor.Success" Class="mt-3"
+                    @onclick="ApplyStatusAsync"
+                    Disabled="@(_selectedStatus == null)">
+                Apply to @_jobs.Select(j => j.JobId).Distinct().Count() Job@(_jobs.Select(j => j.JobId).Distinct().Count() == 1 ? "" : "s")
+            </Button>
+        </CardBody>
+    </Card>
+}
+else if (_searched)
+{
+    <Callout Color="CalloutColor.Warning">No jobs found for the provided IDs.</Callout>
+}
+
+
+@code {
+    private JobIdsSection? _jobIdsSection;
+
+    private List<JobOwnerEquipmentSummary> _jobs = [];
+    private JobStatus? _selectedStatus;
+    private string _statusNote = "";
+    private string? _statusMessage;
+    private bool _statusSuccess = false;
+    private bool _loading = false;
+    private bool _searched = false;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+    }
+
+    private async Task LookupJobsAsync()
+    {
+        var jobIds = _jobIdsSection?.JobIds ?? [];
+        if (jobIds.Count == 0) { _jobIdsSection?.SetError(true); return; }
+
+        _jobIdsSection?.SetError(false);
+        _loading = true;
+        _searched = false;
+        _jobs = [];
+        _statusMessage = null;
+
+        var rows = await EquipmentLookup.LoadOwnerEquipmentSummaryAsync(jobIds);
+
+        _jobs = rows
+            .OrderBy(j => jobIds.IndexOf(j.JobId))
+            .ToList();
+
+        _loading = false;
+        _searched = true;
+    }
+
+    private async Task ApplyStatusAsync()
+    {
+        if (_selectedStatus == null || _jobs.Count == 0) return;
+
+        _statusMessage = null;
+        int successCount = 0;
+
+        var uniqueJobIds = _jobs.Select(j => j.JobId).Distinct().ToList();
+
+        foreach (var jobId in uniqueJobIds)
+        {
+            var ok = await StatusAction.ChangeJobStatusAsync(jobId, _selectedStatus.Value, _statusNote);
+            if (ok) successCount++;
+        }
+
+        var total = uniqueJobIds.Count;
+        _statusSuccess = successCount == total;
+        _statusMessage = _statusSuccess
+            ? $"Successfully applied status to all {successCount} jobs."
+            : $"Applied to {successCount} of {total} jobs. Some may have failed.";
+    }
+}

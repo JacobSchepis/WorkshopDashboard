@@ -1,0 +1,52 @@
+@using WorkshopDashboard.Models
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    QuoteNoticesCard — shared tick/untick card for admin-configured notices
+    (QuoteNoticeStore) that apply to this quote flow — e.g. a small-
+    diameter flex-scope advisory that shouldn't go out on a large-diameter
+    quote from the same page. Ticked by default; the page only posts the
+    ones still ticked. Renders nothing when no notices apply.
+
+    ── Parameters ───────────────────────────────────────────────────────────
+      Notices     — the candidate notices for this quote (caller filters to
+                    "applicable" before passing them in)
+      SelectedIds — which notice ids are currently ticked; mutated in place
+                    by Toggle, so the caller reads it back at submit time
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+@if (Notices.Count > 0)
+{
+    <Card Class="mb-3">
+        <CardHeader>Notices</CardHeader>
+        <CardBody>
+            <p class="text-muted small mb-3">Included on this quote by default — untick any that don't apply.</p>
+            @foreach (var notice in Notices)
+            {
+                var checkboxId = "notice_" + notice.Id;
+                <div class="form-check mb-2">
+                    <input class="form-check-input" type="checkbox" id="@checkboxId"
+                           checked="@SelectedIds.Contains(notice.Id)"
+                           @onchange="e => Toggle(notice.Id, (bool)(e.Value ?? false))" />
+                    <label class="form-check-label" for="@checkboxId">
+                        <span class="fw-semibold">@notice.Title</span>
+                        <div class="text-muted small">@notice.Text</div>
+                    </label>
+                </div>
+            }
+        </CardBody>
+    </Card>
+}
+
+@code {
+    [Parameter] public List<QuoteNotice> Notices { get; set; } = new();
+    [Parameter] public HashSet<Guid> SelectedIds { get; set; } = new();
+
+    private void Toggle(Guid id, bool isChecked)
+    {
+        if (isChecked) SelectedIds.Add(id);
+        else SelectedIds.Remove(id);
+    }
+}

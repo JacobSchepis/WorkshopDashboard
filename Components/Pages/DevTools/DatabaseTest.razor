@@ -1,0 +1,188 @@
+@page "/database-test"
+@rendermode InteractiveServer
+
+@inherits DevOnlyComponentBase
+
+@using System.Diagnostics
+@using System.Security.Claims
+@using Microsoft.AspNetCore.Components.Authorization
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Components.Forms
+
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.External.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@inject IJSRuntime JS
+@inject ILogger<DatabaseTest> Logger
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    DatabaseTest — raw SQL scratchpad against JMS. Posts the typed query
+    straight through the logged-in user's own JMS session and renders
+    whatever CSV comes back as a table. Locked to the DevTools:AllowedUsername login
+    via DevOnlyComponentBase (redirects everyone else to /logout) since it
+    has no query restrictions of its own.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      JmsSession — JmsUserSession: GetClientAsync().PostQueryForCsvAsync
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      RunQuery posts the textarea content, then ParseCsvIntoTable turns the
+      returned CSV into _headers/_tableData for the grid. enableTabIndent
+      (inline JS, wired up in OnAfterRenderAsync) makes Tab insert a literal
+      tab in the textarea instead of moving focus.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Database Test</h1>
+</div>
+
+<div style="display:flex; flex-direction:column; gap:8px; max-width:720px;">
+    <textarea @ref="_queryTextarea" class="form-control code-textbox" rows="5"
+              spellcheck="false"
+              placeholder="Enter SQL query..."
+              @bind="_query" @bind:event="oninput" />
+    <Button Color="ButtonColor.Primary" @onclick="() => RunQuery(_query ?? string.Empty)">
+        Run Query
+    </Button>
+</div>
+
+<script>
+    window.enableTabIndent = (textarea) => {
+        textarea.addEventListener('keydown', (e) => {
+            if (e.key !== 'Tab') return;
+            e.preventDefault();
+
+            const start = textarea.selectionStart;
+            const end = textarea.selectionEnd;
+            const value = textarea.value;
+
+            textarea.value = value.substring(0, start) + '\t' + value.substring(end);
+            textarea.selectionStart = textarea.selectionEnd = start + 1;
+            textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+    };
+</script>
+
+@if (!string.IsNullOrWhiteSpace(_status))
+{
+    <Callout Color="CalloutColor.Danger" Class="mt-2">@_status</Callout>
+}
+
+@if (_tableData is { Count: > 0 })
+{
+    <div class="table-responsive mt-3">
+        <table class="table table-striped table-hover table-bordered table-sm">
+            <thead class="table-dark">
+                <tr>
+                    @foreach (var col in _headers)
+                    {
+                        <th>@col</th>
+                    }
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var row in _tableData)
+                {
+                    <tr>
+                        @foreach (var cell in row)
+                        {
+                            <td>@cell</td>
+                        }
+                    </tr>
+                }
+            </tbody>
+        </table>
+        @if (!string.IsNullOrWhiteSpace(_csvResult))
+        {
+            <pre style="white-space: pre-wrap; font-size: 0.85rem; margin-top: 16px;">@_csvResult</pre>
+        }
+    </div>
+}
+
+@code {
+    private string? _csvResult;
+    private string? _query;
+    private string? _status;
+
+    private List<string> _headers = [];
+    private List<List<string>> _tableData = [];
+
+    private ElementReference _queryTextarea;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+            await JS.InvokeVoidAsync("enableTabIndent", _queryTextarea);
+    }
+
+    private void ParseCsvIntoTable()
+    {
+        _headers.Clear();
+        _tableData.Clear();
+
+        if (string.IsNullOrWhiteSpace(_csvResult)) return;
+
+        using var reader = new StringReader(_csvResult);
+        using var csv = new CsvHelper.CsvReader(reader, System.Globalization.CultureInfo.InvariantCulture);
+
+        if (!csv.Read() || !csv.ReadHeader()) return;
+
+        _headers = csv.HeaderRecord!.ToList();
+
+        while (csv.Read())
+        {
+            var row = new List<string>();
+            foreach (var header in _headers)
+                row.Add(csv.GetField(header) ?? string.Empty);
+            _tableData.Add(row);
+        }
+    }
+
+    
+    
+
+    private async Task RunQuery(string query)
+    {
+        _csvResult = null;
+        _status = null;
+
+        if (string.IsNullOrWhiteSpace(query))
+        {
+            _status = "Please enter a query.";
+            return;
+        }
+
+        var jms = await JmsSession.GetClientAsync();
+        if (jms == null)
+        {
+            Logger.LogWarning("No JMS session for the query page");
+            return;
+        }
+
+        var res = await jms.PostQueryForCsvAsync(query);
+
+        if (res.Success)
+        {
+            _csvResult = res.Content;
+            try
+            {
+                ParseCsvIntoTable();
+            }
+            catch (Exception ex)
+            {
+                _status = $"Failed to parse result: {ex.Message}";
+            }
+        }
+        else
+            _status = $"Query failed: {res.StatusCode} {res.ReasonPhrase}";
+
+    }
+}

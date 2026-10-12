@@ -1,0 +1,135 @@
+@page "/monthly-report-sites"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+
+@using BlazorBootstrap
+@using WorkshopDashboard.Components.Forms
+@using WorkshopDashboard.Data
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Reporting
+
+@inject MonthlyReportService Reports
+@inject ScopeLookupService ScopeLookup
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    MonthlyReportSites — which hospitals get the monthly site report pack
+    (MonthlyReportService). Disabled sites stay in the list but are skipped
+    when a month is queued. Changes apply from the next month queued; runs
+    already queued aren't touched.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Monthly Report Sites</h1>
+    <p class="text-muted">
+        Hospitals that get the monthly report pack on the 1st.
+        <a href="monthly-reports">See this month's reports</a>
+    </p>
+</div>
+
+@if (_error != null)
+{
+    <Callout Color="CalloutColor.Danger" Class="mb-3">@_error</Callout>
+}
+
+<Card Class="mb-3">
+    <CardBody Class="d-flex align-items-center gap-2">
+        <span class="small text-muted">Add a site:</span>
+        <CompanyPicker Placeholder="Search client..." EmptyLabel="+ Add" ShowClear="false"
+                       SearchAsync="SearchClientsAsync" OnSelect="AddAsync" />
+    </CardBody>
+</Card>
+
+@if (_sites is null)
+{
+    <Spinner Color="SpinnerColor.Primary" />
+}
+else if (_sites.Count == 0)
+{
+    <p class="text-muted">No sites yet.</p>
+}
+else
+{
+    <table class="table table-sm align-middle">
+        <thead>
+            <tr>
+                <th>Site</th>
+                <th>Company ID</th>
+                <th style="width:110px">Enabled</th>
+                <th style="width:90px"></th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var site in _sites)
+            {
+                <tr class="@(site.Enabled ? "" : "text-muted")">
+                    <td>@site.CompanyName</td>
+                    <td>@site.CompanyId</td>
+                    <td>
+                        <div class="form-check form-switch mb-0">
+                            <input class="form-check-input" type="checkbox" role="switch" checked="@site.Enabled"
+                                   @onchange="e => SetEnabledAsync(site, e.Value is true)" />
+                        </div>
+                    </td>
+                    <td class="text-end">
+                        @if (_confirmRemoveId == site.CompanyId)
+                        {
+                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" @onclick="() => RemoveAsync(site)">Remove?</Button>
+                        }
+                        else
+                        {
+                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" @onclick="() => _confirmRemoveId = site.CompanyId">✕</Button>
+                        }
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+    <p class="text-muted small">@_sites.Count(s => s.Enabled) of @_sites.Count enabled.</p>
+}
+
+@code {
+    private List<MonthlyReportSite>? _sites;
+    private int? _confirmRemoveId;
+    private string? _error;
+
+    protected override Task OnInitializedAsync() => ReloadAsync();
+
+    private async Task ReloadAsync() => _sites = await Reports.ListSitesAsync();
+
+    private async Task<List<(int Id, string Label)>> SearchClientsAsync(string term)
+    {
+        var rows = await ScopeLookup.SearchClientsAsync(term);
+        return rows.Select(r => (r.CompanyId, r.CompanyName ?? $"Company {r.CompanyId}")).ToList();
+    }
+
+    private async Task AddAsync((int Id, string Label) company)
+    {
+        await RunAsync(() => Reports.AddSiteAsync(company.Id, company.Label));
+    }
+
+    private async Task SetEnabledAsync(MonthlyReportSite site, bool enabled)
+    {
+        await RunAsync(() => Reports.SetSiteEnabledAsync(site.CompanyId, enabled));
+    }
+
+    private async Task RemoveAsync(MonthlyReportSite site)
+    {
+        _confirmRemoveId = null;
+        await RunAsync(() => Reports.RemoveSiteAsync(site.CompanyId));
+    }
+
+    private async Task RunAsync(Func<Task> action)
+    {
+        _error = null;
+        try
+        {
+            await action();
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        await ReloadAsync();
+    }
+}

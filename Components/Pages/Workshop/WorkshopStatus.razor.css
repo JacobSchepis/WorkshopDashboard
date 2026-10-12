@@ -1,0 +1,19 @@
+/* Wall-mounted monitor is read from across the room — scale the tiles well past the
+   desktop-sized .stat-* defaults in app.css (on top of the kiosk-wide scale-up there). */
+.stat-icon {
+    font-size: 3.5rem;
+}
+
+.stat-value {
+    font-size: 4rem;
+}
+
+.stat-label {
+    font-size: 1.25rem;
+}
+
+.turnaround-value {
+    font-size: 2.25rem;
+    font-weight: 700;
+    line-height: 1.1;
+}

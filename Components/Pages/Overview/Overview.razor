@@ -1,0 +1,611 @@
+@page "/overview"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject ScopeJobStore ScopeJobs
+@inject HighlightedJobsStore HighlightedJobs
+@inject JobNotesService Notes
+@inject DashboardLookup Dashboard
+
+@using CsvHelper
+@using CsvHelper.Configuration
+@using System.Globalization
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.External.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    Overview — the workload dashboard: workshop job counts by status (with an
+    overdue/stale count per status) plus a pinned "Highlighted Jobs" list
+    with inline job-notes editing.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      Dashboard        — DashboardLookup: per-status counts/overdue counts,
+                         and job details for the highlighted-jobs table
+      ScopeJobs        — exclusion list (excluded models) applied to the counts
+      HighlightedJobs  — the pinned job-id list itself (just ids; persisted
+                         locally, not in JMS)
+      Notes            — JobNotesService: add/update/delete notes on a job
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      OnAfterRenderAsync (first render only) loads ScopeJobs exclusions, then
+      LoadCountsAsync (status counts) and LoadHighlightedJobsAsync (pinned
+      jobs) in sequence. Expanding a highlighted job's notes lazy-loads them
+      via LoadNotesAsync; add/edit/delete each reload just that job's notes.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Overview</h1>
+    <p class="text-muted">Current job workload at a glance. Excluded models are hidden.</p>
+</div>
+
+<!-- ── Highlighted Jobs ───────────────────────────────────────────── -->
+<Card Class="mb-4">
+    <CardHeader>⭐ Highlighted Jobs</CardHeader>
+    <CardBody>
+        <div class="d-flex gap-2 mb-3">
+            <input type="number" class="form-control" style="max-width: 160px;"
+                   placeholder="Job number"
+                   value="@_addJobInput"
+                   @oninput="e => _addJobInput = e.Value?.ToString() ?? string.Empty"
+                   @onkeydown="OnAddJobKeyDown" />
+            <Button Color="ButtonColor.Primary" Outline="true"
+                    Disabled="@(_addingJob || string.IsNullOrWhiteSpace(_addJobInput))"
+                    Loading="_addingJob" LoadingText="Adding..." @onclick="AddHighlightedJobAsync">
+                + Add
+            </Button>
+        </div>
+
+        @if (!string.IsNullOrWhiteSpace(_addJobError))
+        {
+            <Callout Color="CalloutColor.Danger" Class="mb-3">@_addJobError</Callout>
+        }
+
+        @if (_highlightedLoading)
+        {
+            <div class="d-flex align-items-center gap-2">
+                <Spinner Color="SpinnerColor.Primary" Size="SpinnerSize.Small" />
+                <span class="text-muted">Loading...</span>
+            </div>
+        }
+        else if (!_highlightedJobs.Any())
+        {
+            <p class="text-muted mb-0">No highlighted jobs yet — add a job number above.</p>
+        }
+        else
+        {
+            <div class="table-responsive">
+                <table class="table table-sm table-hover align-middle mb-0">
+                    <thead>
+                        <tr>
+                            <th>Job No</th>
+                            <th>Company</th>
+                            <th>Equipment</th>
+                            <th>Job Notes</th>
+                            <th>Status</th>
+                            <th></th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var job in _highlightedJobs)
+                        {
+                            <tr>
+                                <td class="fw-semibold">@job.JobId</td>
+                                <td>@job.Company</td>
+                                <td>@job.Equipment</td>
+                                <td>@job.JobNotes</td>
+                                <td>@job.Status</td>
+                                <td>
+                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                            @onclick="() => ToggleNotesAsync(job.JobId)">
+                                        📝 Notes@(job.JobId == _expandedNotesJobId ? " ▲" : " ▼")
+                                    </Button>
+                                </td>
+                                <td class="text-end">
+                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true"
+                                            @onclick="() => RemoveHighlightedJobAsync(job.JobId)">
+                                        Remove
+                                    </Button>
+                                </td>
+                            </tr>
+                            @if (_expandedNotesJobId == job.JobId)
+                            {
+                                <tr>
+                                    <td colspan="7">
+                                        <div class="p-2">
+                                            <div class="d-flex gap-2 mb-2 flex-wrap">
+                                                <input type="text" class="form-control form-control-sm" style="min-width: 220px; flex: 1;"
+                                                       placeholder="Note text"
+                                                       value="@_newNoteText"
+                                                       @oninput="e => _newNoteText = e.Value?.ToString() ?? string.Empty" />
+                                                <Button Size="ButtonSize.Small" Color="ButtonColor.Primary"
+                                                        Disabled="@(_addingNote || string.IsNullOrWhiteSpace(_newNoteText))"
+                                                        Loading="_addingNote" LoadingText="Adding..." @onclick="AddNoteAsync">
+                                                    Add Note
+                                                </Button>
+                                            </div>
+
+                                            @if (!string.IsNullOrWhiteSpace(_noteError))
+                                            {
+                                                <Callout Color="CalloutColor.Danger" Class="mb-2 py-1">@_noteError</Callout>
+                                            }
+
+                                            @if (!string.IsNullOrWhiteSpace(_updateNoteError))
+                                            {
+                                                <Callout Color="CalloutColor.Danger" Class="mb-2 py-1">@_updateNoteError</Callout>
+                                            }
+
+                                            @if (_notesLoading)
+                                            {
+                                                <Spinner Color="SpinnerColor.Primary" Size="SpinnerSize.Small" />
+                                            }
+                                            else if (!_expandedNotes.Any())
+                                            {
+                                                <p class="text-muted small mb-0">No notes yet.</p>
+                                            }
+                                            else
+                                            {
+                                                <ul class="list-unstyled small mb-0">
+                                                    @foreach (var note in _expandedNotes)
+                                                    {
+                                                        @if (_editingNoteId == note.ServiceId)
+                                                        {
+                                                            <li class="mb-2">
+                                                                <div class="d-flex gap-2 align-items-start flex-wrap">
+                                                                    <textarea class="form-control form-control-sm" style="min-width: 220px; flex: 1;" rows="2"
+                                                                              value="@_editNoteText"
+                                                                              @oninput="e => _editNoteText = e.Value?.ToString() ?? string.Empty"></textarea>
+                                                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Primary"
+                                                                            Disabled="@(_updatingNote || string.IsNullOrWhiteSpace(_editNoteText))"
+                                                                            Loading="_updatingNote" LoadingText="Saving..." @onclick="() => SaveNoteEditAsync(note)">
+                                                                        Save
+                                                                    </Button>
+                                                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                                                            @onclick="CancelNoteEdit">
+                                                                        Cancel
+                                                                    </Button>
+                                                                </div>
+                                                            </li>
+                                                        }
+                                                        else
+                                                        {
+                                                            <li class="mb-1 d-flex justify-content-between align-items-start gap-2">
+                                                                <div>
+                                                                    @note.Text
+                                                                    <span class="text-muted">
+                                                                        — @note.CreatedAt.ToString("d MMM, h:mm tt")@(note.AuthorName != null ? $" · {note.AuthorName}" : "")
+                                                                    </span>
+                                                                </div>
+                                                                <div class="d-flex gap-1 flex-shrink-0">
+                                                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                                                            @onclick="() => StartNoteEdit(note)">
+                                                                        Update
+                                                                    </Button>
+                                                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true"
+                                                                            Disabled="@(_deletingNoteId == note.ServiceId)"
+                                                                            Loading="@(_deletingNoteId == note.ServiceId)" LoadingText="..." @onclick="() => DeleteNoteAsync(note)">
+                                                                        Delete
+                                                                    </Button>
+                                                                </div>
+                                                            </li>
+                                                        }
+                                                    }
+                                                </ul>
+                                            }
+                                        </div>
+                                    </td>
+                                </tr>
+                            }
+                        }
+                    </tbody>
+                </table>
+            </div>
+        }
+    </CardBody>
+</Card>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading workshop data…</span>
+    </div>
+}
+else
+{
+    <!-- ── Headline stats ─────────────────────────────────────────────── -->
+    <div class="row row-cols-1 row-cols-sm-2 g-3 mb-4">
+        <div class="col">
+            <Card Class="h-100 stat-card">
+                <CardBody>
+                    <div class="d-flex align-items-center gap-3">
+                        <div class="stat-icon">🗂️</div>
+                        <div>
+                            <div class="stat-value">@_openCount</div>
+                            <div class="stat-label text-muted">Open Workshop Jobs</div>
+                        </div>
+                    </div>
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card Class="h-100 stat-card">
+                <CardBody>
+                    <div class="d-flex align-items-center justify-content-between">
+                        <div class="d-flex align-items-center gap-3">
+                            <div class="stat-icon">⚠️</div>
+                            <div>
+                                <div class="stat-value">@_staleCount</div>
+                                <div class="stat-label text-muted">Stale Scope Jobs</div>
+                            </div>
+                        </div>
+                        <CardLink To="/stale-jobs-filtered">View</CardLink>
+                    </div>
+                </CardBody>
+            </Card>
+        </div>
+    </div>
+
+    <h2 class="text-uppercase text-muted small fw-bold mb-3">Workshop Jobs by Status</h2>
+
+    <Card>
+        <CardBody Class="p-0">
+            <table class="table table-hover align-middle mb-0">
+                <tbody>
+                    @foreach (var status in _counts)
+                    {
+                        var route = RouteFor(status.StatusName);
+                        <tr class="@(route is not null ? "cursor-pointer" : "")"
+                            @onclick="() => GoTo(route)">
+                            <td>@status.StatusName</td>
+                            <td><span class="badge bg-info rounded-pill">@status.Total</span></td>
+                            <td>
+                                @if (status.Overdue > 0)
+                                {
+                                    <span class="badge bg-danger rounded-pill">@status.Overdue Overdue</span>
+                                }
+                            </td>
+                            <td class="text-end">
+                                @if (route is not null)
+                                {
+                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Primary" Outline="true"
+                                            @onclick="() => Nav.NavigateTo(route)">
+                                        View
+                                    </Button>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </CardBody>
+    </Card>
+}
+
+@code {
+    // ── Dashboard stats ──────────────────────────────────────────────────────
+
+    // A job "needs action" once it's sat this long with no status change.
+    // This is also the stale threshold — they were always meant to be the same number.
+    private const int OverdueAfterDays = 7;
+
+    private bool _loading = true;
+    private int _openCount;
+    private int _staleCount;
+    private List<StatusCount> _counts = new();
+
+    private readonly string[] ExcludedFromStaleCount =
+{
+    "Waiting Workshop Assignment",
+    "Waiting Workshop Processing",
+    "Waiting Quote Confirmation"
+};
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        var exclusions = await ScopeJobs.LoadAsync();
+
+        await LoadCountsAsync(exclusions);
+        await LoadHighlightedJobsAsync();
+
+        _loading = false;
+        StateHasChanged();
+    }
+
+    // Per-status totals + overdue counts. Inner query reduces to one row per job (excluded models
+    // stripped in the WHERE); outer query aggregates by status. Only status rows come back.
+    private async Task LoadCountsAsync(ScopeJobExclusions exclusions)
+    {
+        var counts = await Dashboard.GetStatusCountsAsync(OverdueAfterDays, exclusions);
+        _counts = counts
+            .Select(c => new StatusCount { StatusName = c.StatusName, Total = c.Total, Overdue = c.Overdue })
+            .ToList();
+
+        _openCount = _counts.Sum(c => c.Total);
+
+
+        _staleCount = _counts.Where(c => !ExcludedFromStaleCount.Contains(c.StatusName, StringComparer.OrdinalIgnoreCase)).Sum(c => c.Overdue);
+    }
+
+    // The only statuses with their own dedicated queue page — everything else in
+    // _counts is still shown in the table, just without a View button/click-through.
+    private static readonly Dictionary<string, string> QueueRoutes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Waiting Workshop Assignment"] = "/waiting-workshop-assignment",
+        ["Waiting Workshop Processing"] = "/waiting-workshop-processing",
+        ["Waiting Quote Confirmation"] = "/waiting-quote-confirmation",
+        ["Workshop Finalisation Complete"] = "/workshop-finalisation-complete"
+    };
+
+    private static string? RouteFor(string statusName) =>
+        QueueRoutes.TryGetValue(statusName, out var route) ? route : null;
+
+    private void GoTo(string? route)
+    {
+        if (route is not null) Nav.NavigateTo(route);
+    }
+
+    private class StatusCount
+    {
+        public string StatusName { get; set; } = "";
+        public int Total { get; set; }
+        public int Overdue { get; set; }
+    }
+
+    // ── Highlighted Jobs ─────────────────────────────────────────────────────
+
+    private bool _highlightedLoading = true;
+    private List<HighlightedJobRow> _highlightedJobs = new();
+    private string _addJobInput = string.Empty;
+    private bool _addingJob = false;
+    private string? _addJobError;
+
+    private int? _expandedNotesJobId;
+    private List<JobNote> _expandedNotes = new();
+    private bool _notesLoading = false;
+    private string _newNoteText = string.Empty;
+    private bool _addingNote = false;
+    private string? _noteError;
+
+    private int? _editingNoteId;
+    private string _editNoteText = string.Empty;
+    private bool _updatingNote = false;
+    private string? _updateNoteError;
+
+    private int? _deletingNoteId;
+
+    private async Task LoadHighlightedJobsAsync()
+    {
+        _highlightedLoading = true;
+        StateHasChanged();
+
+        var ids = await HighlightedJobs.LoadAsync();
+        if (ids.Count == 0)
+        {
+            _highlightedJobs = new();
+            _highlightedLoading = false;
+            StateHasChanged();
+            return;
+        }
+
+        var rows = await FetchHighlightedRowsAsync(ids);
+
+        // Preserve the order jobs were pinned in (rows come back with no guaranteed order),
+        // newest-pinned first.
+        _highlightedJobs = ids
+            .Select(id => rows.FirstOrDefault(r => r.JobId == id))
+            .Where(r => r != null)
+            .Select(r => new HighlightedJobRow
+            {
+                JobId = r!.JobId,
+                Company = r.Owner ?? "",
+                Equipment = r.Equipment ?? "",
+                JobNotes = r.JobNotes ?? "",
+                Status = string.IsNullOrWhiteSpace(r.JobStatus) ? "(no status)" : r.JobStatus!
+            })
+            .Reverse()
+            .ToList();
+
+        _highlightedLoading = false;
+        StateHasChanged();
+    }
+
+    private Task<List<HighlightedJobRowInfo>> FetchHighlightedRowsAsync(IEnumerable<int> ids) =>
+        Dashboard.GetHighlightedJobDetailsAsync(ids);
+
+    private void OnAddJobKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !_addingJob && !string.IsNullOrWhiteSpace(_addJobInput))
+            _ = AddHighlightedJobAsync();
+    }
+
+    private async Task AddHighlightedJobAsync()
+    {
+        _addJobError = null;
+
+        if (!int.TryParse(_addJobInput, out var jobId))
+        {
+            _addJobError = "Enter a valid job number.";
+            return;
+        }
+
+        _addingJob = true;
+        StateHasChanged();
+
+        try
+        {
+            var rows = await FetchHighlightedRowsAsync(new[] { jobId });
+            if (!rows.Any())
+            {
+                _addJobError = $"Job {jobId} was not found.";
+                return;
+            }
+
+            await HighlightedJobs.AddAsync(jobId);
+            _addJobInput = string.Empty;
+            await LoadHighlightedJobsAsync();
+        }
+        finally
+        {
+            _addingJob = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task RemoveHighlightedJobAsync(int jobId)
+    {
+        await HighlightedJobs.RemoveAsync(jobId);
+        if (_expandedNotesJobId == jobId)
+        {
+            _expandedNotesJobId = null;
+            CancelNoteEdit();
+        }
+        await LoadHighlightedJobsAsync();
+    }
+
+    private async Task ToggleNotesAsync(int jobId)
+    {
+        if (_expandedNotesJobId == jobId)
+        {
+            _expandedNotesJobId = null;
+            return;
+        }
+
+        _expandedNotesJobId = jobId;
+        _newNoteText = string.Empty;
+        _noteError = null;
+        CancelNoteEdit();
+        await LoadNotesAsync(jobId);
+    }
+
+    private async Task LoadNotesAsync(int jobId)
+    {
+        _notesLoading = true;
+        StateHasChanged();
+
+        _expandedNotes = await Notes.GetNotesAsync(jobId);
+
+        _notesLoading = false;
+        StateHasChanged();
+    }
+
+    private async Task AddNoteAsync()
+    {
+        if (_expandedNotesJobId == null) return;
+
+        _addingNote = true;
+        _noteError = null;
+        StateHasChanged();
+
+        try
+        {
+            var ok = await Notes.AddNoteAsync(_expandedNotesJobId.Value, _newNoteText);
+            if (!ok)
+            {
+                _noteError = "Failed to add note.";
+                return;
+            }
+
+            _newNoteText = string.Empty;
+            await LoadNotesAsync(_expandedNotesJobId.Value);
+        }
+        finally
+        {
+            _addingNote = false;
+            StateHasChanged();
+        }
+    }
+
+    private void StartNoteEdit(JobNote note)
+    {
+        _editingNoteId = note.ServiceId;
+        _editNoteText = note.Text;
+        _updateNoteError = null;
+    }
+
+    private void CancelNoteEdit()
+    {
+        _editingNoteId = null;
+        _editNoteText = string.Empty;
+        _updateNoteError = null;
+    }
+
+    private async Task SaveNoteEditAsync(JobNote note)
+    {
+        if (_expandedNotesJobId == null) return;
+
+        _updatingNote = true;
+        _updateNoteError = null;
+        StateHasChanged();
+
+        try
+        {
+            var ok = await Notes.UpdateNoteAsync(_expandedNotesJobId.Value, note, _editNoteText);
+            if (!ok)
+            {
+                _updateNoteError = "Failed to update note.";
+                return;
+            }
+
+            CancelNoteEdit();
+            await LoadNotesAsync(_expandedNotesJobId.Value);
+        }
+        finally
+        {
+            _updatingNote = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task DeleteNoteAsync(JobNote note)
+    {
+        if (_expandedNotesJobId == null) return;
+
+        _deletingNoteId = note.ServiceId;
+        _updateNoteError = null;
+        StateHasChanged();
+
+        try
+        {
+            var ok = await Notes.DeleteNoteAsync(_expandedNotesJobId.Value, note);
+            if (!ok)
+            {
+                _updateNoteError = "Failed to delete note.";
+                return;
+            }
+
+            if (_editingNoteId == note.ServiceId) CancelNoteEdit();
+            await LoadNotesAsync(_expandedNotesJobId.Value);
+        }
+        finally
+        {
+            _deletingNoteId = null;
+            StateHasChanged();
+        }
+    }
+
+    private class HighlightedJobRow
+    {
+        public int JobId { get; set; }
+        public string Company { get; set; } = "";
+        public string Equipment { get; set; } = "";
+        public string JobNotes { get; set; } = "";
+        public string Status { get; set; } = "";
+    }
+}

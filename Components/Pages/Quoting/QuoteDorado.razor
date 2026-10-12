@@ -1,0 +1,1044 @@
+@page "/quote-dorado"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+
+@using System.Globalization
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.External.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Quoting.Apex
+@using WorkshopDashboard.Services.Quoting.Dorado
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Quoting
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Analytics
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+@using WorkshopDashboard.Components.Pages.Quoting.Cards
+
+@inject IConfiguration Configuration
+@inject IJsonCompletionClient OpenAi
+@inject CompanyGroupStore CompanyGroups
+@inject QuoteNoticeStore Notices
+@inject JobLookupService JobLookup
+@inject JobEquipmentLookup EquipmentLookup
+@inject JobServiceLookup ServiceLookup
+@inject QuoteSubmissionService QuoteSubmission
+@inject AnalyticsService Analytics
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    QuoteDorado — repairer quote extraction + pricing for Dorado-scope jobs (Rigid /
+    Semi-Rigid / Specialty repairs). One of six near-identical per-repairer
+    quoting pages (Apex/Bayside/Cobalt/Dorado/Ember/Falcon) sharing the same shape.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      DoradoQuoteExtractor (src/Services/Quoting/Dorado)  — AI PDF extraction; built
+                                                       inline in RunQuery(),
+                                                       not injected
+      JobLookup            — job -> owner company id / name
+      EquipmentLookup      — equipment options for the equipment selector
+      ServiceLookup        — services already booked on the job, for "Apply Credit"
+      Notices              — repairer-scope notices shown/selected before submit
+      QuoteSubmission      — posts the priced line items + notices back to JMS
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      HandleFileSelected (upload) -> RunQuery (extract PDF -> RunJobLookupAsync
+      pulls owner/equipment/services/pricing-group for the extracted job) ->
+      user adjusts scope tab / rate / credit -> SubmitServices posts the final
+      priced line items via QuoteSubmissionService.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="container py-4" style="max-width: 860px;">
+    <div class="page-header">
+        <h1>Repairer Quote Extractor</h1>
+        <p class="text-muted">Upload a repairer's PDF quote to extract the key details.</p>
+    </div>
+
+    <QuoteUploadCard HasFile="_pdfBytes != null" HasResult="_result != null" Loading="_loading"
+                      Submitting="_submitting" SubmitSuccess="_submitSuccess" Error="@_error"
+                      CanSubmit="@(_result != null && _calc != null && !SubmitDisabled)"
+                      OnFileSelected="HandleFileSelected" OnExtract="RunQuery" OnSubmit="SubmitServices" />
+
+    @if (_result != null)
+    {
+        <QuoteSummaryBar JobNumber="@_result.JobNumber" JobNumberChanged="v => _result.JobNumber = v"
+                          RetryLoading="_jobLookupLoading" OnRetry="RetryJobLookup">
+            <ExtraFields>
+                <div>
+                    <div class="text-muted small mb-1">Owner</div>
+                    <div class="fw-semibold">@(_ownerName ?? "—")</div>
+                </div>
+            </ExtraFields>
+        </QuoteSummaryBar>
+
+        @* ── Scope type: Rigid / Semi-Rigid / Specialty ── *@
+        <Card Class="mb-3">
+            <CardHeader>
+                <Tabs NavStyle="NavStyle.Pills">
+                    <Tab Title="Rigid" Active="@(_activeTab == DoradoTab.Rigid)" OnClick="@(() => SelectTab(DoradoTab.Rigid))"><Content></Content></Tab>
+                    <Tab Title="Semi-Rigid" Active="@(_activeTab == DoradoTab.SemiRigid)" OnClick="@(() => SelectTab(DoradoTab.SemiRigid))"><Content></Content></Tab>
+                    <Tab Title="Specialty" Active="@(_activeTab == DoradoTab.Specialty)" OnClick="@(() => SelectTab(DoradoTab.Specialty))"><Content></Content></Tab>
+                </Tabs>
+            </CardHeader>
+            <CardBody>
+                @if (_activeTab == DoradoTab.Rigid)
+                {
+                    <div class="mb-3">
+                        <label class="text-muted small mb-1 d-block">Repair Level</label>
+                        <select class="form-select form-select-sm" style="width: 175px;"
+                                value="@_result.WorksRequired"
+                                @onchange="OnLevelSelectChanged">
+                            @foreach (var lvl in DoradoLevels.All)
+                            {
+                                <option value="@lvl">@lvl</option>
+                            }
+                        </select>
+                    </div>
+                    @if (ShowRodLensDetail)
+                    {
+                        <div class="d-flex gap-4 flex-wrap">
+                            @if (_result.AdditionalRodLenses > 0)
+                            {
+                                <div>
+                                    <div class="text-muted small">Additional Rod Lenses</div>
+                                    <div class="fw-semibold">@_result.AdditionalRodLenses x @(DoradoPricingCalculator.RodLensUnitPrice.ToString("C"))</div>
+                                </div>
+                            }
+                            @if (_result.AdditionalRodLenses4k > 0)
+                            {
+                                <div>
+                                    <div class="text-muted small">Additional 4K Rod Lenses</div>
+                                    <div class="fw-semibold">@_result.AdditionalRodLenses4k x @_result.RodLenses4kUnitPrice.ToString("C")</div>
+                                </div>
+                            }
+                        </div>
+                    }
+                }
+                else if (_activeTab == DoradoTab.SemiRigid)
+                {
+                    <p class="text-muted small mb-0">
+                        No repair level — the quote total is priced through Apex's pricing formula (below).
+                    </p>
+                }
+                else
+                {
+                    <div class="mb-3">
+                        <label class="text-muted small mb-1 d-block">Repair Level</label>
+                        <select class="form-select form-select-sm" style="width: 175px;"
+                                value="@_result.WorksRequired"
+                                @onchange="OnLevelSelectChanged">
+                            <option value="">No level (Apex pricing)</option>
+                            @foreach (var lvl in DoradoLevels.All)
+                            {
+                                <option value="@lvl">@lvl</option>
+                            }
+                        </select>
+                    </div>
+                    @if (ShowRodLensDetail)
+                    {
+                        <div class="d-flex gap-4 flex-wrap">
+                            @if (_result.AdditionalRodLenses > 0)
+                            {
+                                <div>
+                                    <div class="text-muted small">Additional Rod Lenses</div>
+                                    <div class="fw-semibold">@_result.AdditionalRodLenses x @(DoradoPricingCalculator.RodLensUnitPrice.ToString("C"))</div>
+                                </div>
+                            }
+                            @if (_result.AdditionalRodLenses4k > 0)
+                            {
+                                <div>
+                                    <div class="text-muted small">Additional 4K Rod Lenses</div>
+                                    <div class="fw-semibold">@_result.AdditionalRodLenses4k x @_result.RodLenses4kUnitPrice.ToString("C")</div>
+                                </div>
+                            }
+                        </div>
+                    }
+                }
+            </CardBody>
+        </Card>
+
+        <Card Class="mb-3">
+            <CardHeader>Services in Job</CardHeader>
+            <CardBody>
+                @if (_jobServicesLoading)
+                {
+                    <p class="text-muted mb-0">Loading...</p>
+                }
+                else if (_jobServices.Count == 0)
+                {
+                    <p class="text-muted mb-0">No services found.</p>
+                }
+                else
+                {
+                    <table class="table table-sm mb-0">
+                        <thead>
+                            <tr>
+                                <th>Type</th>
+                                <th>Description</th>
+                                <th class="text-end">Qty</th>
+                                <th class="text-end">Price</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var svc in _jobServices)
+                            {
+                                <tr>
+                                    <td>@svc.ServiceTypeName</td>
+                                    <td>@svc.Description</td>
+                                    <td class="text-end">@svc.Quantity</td>
+                                    <td class="text-end">@svc.CostPrice.ToString("C")</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                }
+            </CardBody>
+        </Card>
+
+        <Card Class="mb-3">
+            <CardHeader>Apply Credit</CardHeader>
+            <CardBody>
+                @if (!string.IsNullOrWhiteSpace(_creditError))
+                {
+                    <Callout Color="CalloutColor.Danger" Class="mb-3">@_creditError</Callout>
+                }
+
+                @if (_creditSuccess)
+                {
+                    <Callout Color="CalloutColor.Success" Class="mb-3">Credit applied.</Callout>
+                }
+
+                <div class="d-flex gap-2 align-items-end flex-wrap">
+                    <div>
+                        <label class="text-muted small mb-1 d-block">Credit Amount</label>
+                        <input type="number" step="0.01" min="0" class="form-control form-control-sm" style="width: 140px;"
+                               value="@_creditAmount" @oninput="OnCreditAmountChanged" />
+                    </div>
+                    <Button Color="ButtonColor.Danger" Disabled="@CreditDisabled"
+                            Loading="_creditSubmitting" LoadingText="Applying..." @onclick="ApplyCredit">
+                        Apply Credit
+                    </Button>
+                </div>
+
+                @if (string.IsNullOrEmpty(_selectedEquipmentId))
+                {
+                    <p class="text-muted small mb-0 mt-2">Select equipment below before applying a credit.</p>
+                }
+            </CardBody>
+        </Card>
+
+        <EquipmentSelectorCard Equipment="_jobEquipment" Loading="_equipmentLoading" @bind-SelectedEquipmentId="_selectedEquipmentId" />
+
+        @* ── Apex pricing (semi-rigid / no level) ── *@
+        @if (_calc != null && _calc.Mode == DoradoPricingMode.Apex && _calc.Apex != null)
+        {
+            var apex = _calc.Apex;
+            <Card Class="mb-3">
+                <CardHeader Class="d-flex justify-content-between align-items-center">
+                    <span>Apex Pricing — Semi-Rigid</span>
+                    <span class="text-muted fw-normal small">Group @_apexGroup</span>
+                </CardHeader>
+                <CardBody>
+                    <div class="d-flex gap-3 align-items-end mb-3 flex-wrap">
+                        <div>
+                            <label class="text-muted small mb-1 d-block" for="fxRate">AUD/USD Rate</label>
+                            <input id="fxRate" type="number" step="0.0001" min="0.0001"
+                                   class="form-control form-control-sm" style="width: 110px;"
+                                   value="@_audUsdRate.ToString(CultureInfo.InvariantCulture)"
+                                   @onchange="OnRateChanged" />
+                        </div>
+                        <div class="text-muted small pb-1">
+                            @apex.CostUsd.ToString("C") USD &rarr; @apex.CostAud.ToString("C") AUD
+                        </div>
+                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" @onclick="ResetRate">Reset</Button>
+                    </div>
+
+                    <table class="table table-sm mb-0">
+                        <tbody>
+                            <tr>
+                                <td>Quote Total (USD)</td>
+                                <td class="text-end">@apex.CostUsd.ToString("C")</td>
+                            </tr>
+                            <tr>
+                                <td class="text-muted">Converted @@ @apex.AudUsdRate.ToString("0.0000")</td>
+                                <td class="text-end text-muted">@apex.CostAud.ToString("C")</td>
+                            </tr>
+                            <tr>
+                                <td>Base Charge</td>
+                                <td class="text-end">@apex.BaseCharge.ToString("C")</td>
+                            </tr>
+                            @if (apex.Discount1 != 0)
+                            {
+                                <tr class="text-danger">
+                                    <td>Discount 1</td>
+                                    <td class="text-end">@apex.Discount1.ToString("C")</td>
+                                </tr>
+                            }
+                            @if (apex.Discount2 != 0)
+                            {
+                                <tr class="text-danger">
+                                    <td>Discount 2</td>
+                                    <td class="text-end">@apex.Discount2.ToString("C")</td>
+                                </tr>
+                            }
+                            @if (apex.Discount3 != 0)
+                            {
+                                <tr class="text-danger">
+                                    <td>Discount 3</td>
+                                    <td class="text-end">@apex.Discount3.ToString("C")</td>
+                                </tr>
+                            }
+                            @if (apex.GroupDiscount != 0)
+                            {
+                                <tr class="text-danger">
+                                    <td>Group Discount (10% off base)</td>
+                                    <td class="text-end">@apex.GroupDiscount.ToString("C")</td>
+                                </tr>
+                            }
+                            <tr>
+                                <td class="text-muted">Subtotal</td>
+                                <td class="text-end text-muted">@apex.UnroundedTotal.ToString("C")</td>
+                            </tr>
+                            @if (apex.RoundingAdjustment != 0)
+                            {
+                                <tr class="text-muted">
+                                    <td>Rounding</td>
+                                    <td class="text-end">@apex.RoundingAdjustment.ToString("C")</td>
+                                </tr>
+                            }
+                            <tr class="fw-semibold table-light">
+                                <td>Total (AUD)</td>
+                                <td class="text-end">@apex.Total.ToString("C")</td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <p class="text-muted small mb-0 mt-3">
+                        The quote total already covers rod lenses and any specialty line, so this is
+                        posted as a single service — no extras are added on top.
+                    </p>
+                </CardBody>
+            </Card>
+        }
+        else if (_calc != null)
+        {
+            @* ── Dorado level pricing ── *@
+            <Card Class="mb-3">
+                <CardHeader>Calculated Pricing</CardHeader>
+                <CardBody>
+                    <table class="table table-sm mb-0">
+                        <tbody>
+                            <tr>
+                                <td>Base Service Price (@_calc.LevelName)</td>
+                                <td class="text-end">@_calc.BaseServicePrice.ToString("C")</td>
+                            </tr>
+
+                            @if (_result.IsSpecialtyScope)
+                            {
+                                <tr>
+                                    <td>Specialty Scope Surcharge</td>
+                                    <td class="text-end">@_calc.SpecialtySurcharge.ToString("C")</td>
+                                </tr>
+                            }
+
+                            @if (_result.AdditionalRodLenses > 0)
+                            {
+                                <tr>
+                                    <td>Rod Lenses (@_result.AdditionalRodLenses x @(DoradoPricingCalculator.RodLensUnitPrice.ToString("C")))</td>
+                                    <td class="text-end">@_calc.RodLensesFullPrice.ToString("C")</td>
+                                </tr>
+                                @if (_calc.RodLensDiscount > 0)
+                                {
+                                    <tr class="text-danger">
+                                        <td>Agreed Pricing Discount</td>
+                                        <td class="text-end">-@_calc.RodLensDiscount.ToString("C")</td>
+                                    </tr>
+                                }
+                            }
+
+                            @if (_result.AdditionalRodLenses4k > 0)
+                            {
+                                <tr>
+                                    <td>4K Rod Lenses (@_result.AdditionalRodLenses4k x @_result.RodLenses4kUnitPrice.ToString("C"))</td>
+                                    <td class="text-end">@_calc.RodLenses4kFullPrice.ToString("C")</td>
+                                </tr>
+                                @if (_calc.RodLenses4kDiscount > 0)
+                                {
+                                    <tr class="text-danger">
+                                        <td>4K Rod Lens Discount</td>
+                                        <td class="text-end">-@_calc.RodLenses4kDiscount.ToString("C")</td>
+                                    </tr>
+                                }
+                            }
+
+                            <tr class="fw-semibold table-light">
+                                <td>Total</td>
+                                <td class="text-end">@_calc.Total.ToString("C")</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </CardBody>
+            </Card>
+        }
+        else
+        {
+            <Card Class="mb-3 border-warning">
+                <CardHeader Class="bg-warning bg-opacity-25">
+                    Unknown Pricing — Company ID @_companyId
+                </CardHeader>
+                <CardBody>
+                    <p class="text-muted small mb-3">
+                        This company isn't in the Dorado pricing config yet. Select a pricing group to continue.
+                        The selection will be saved and used automatically next time.
+                    </p>
+                    <div class="row g-2 mb-3">
+                        @foreach (var kvp in DoradoPricingConfig.Groups)
+                        {
+                            var groupId = kvp.Key;
+                            var group = kvp.Value;
+                            var isSelected = _selectedGroupId == groupId;
+                            var cardClass = isSelected ? "card h-100 border-primary" : "card h-100";
+                            <div class="col-md-4">
+                                <div class="@cardClass"
+                                     style="cursor: pointer;"
+                                     @onclick="() => SelectPricingGroup(groupId)">
+                                    <div class="card-body p-3">
+                                        <div class="d-flex justify-content-between align-items-center mb-2">
+                                            <span class="fw-semibold">Group @groupId</span>
+                                            @if (isSelected)
+                                            {
+                                                <i class="bi bi-check-circle-fill text-primary"></i>
+                                            }
+                                        </div>
+                                        <table class="table table-sm table-borderless mb-0 small">
+                                            <tbody>
+                                                <tr><td class="text-muted ps-0">Level 1</td><td class="text-end">@group.Level1.ToString("C0")</td></tr>
+                                                <tr><td class="text-muted ps-0">Level 2</td><td class="text-end">@group.Level2.ToString("C0")</td></tr>
+                                                <tr><td class="text-muted ps-0">Level 3</td><td class="text-end">@group.Level3.ToString("C0")</td></tr>
+                                                <tr><td class="text-muted ps-0">Max</td><td class="text-end">@group.MaxPrice.ToString("C0")</td></tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            </div>
+                        }
+                    </div>
+                    @if (_groupSaveSuccess)
+                    {
+                        <Callout Color="CalloutColor.Success" Class="mb-0">
+                            Group @_selectedGroupId saved for company @_companyId.
+                        </Callout>
+                    }
+                </CardBody>
+            </Card>
+        }
+
+        <Card Class="mb-3">
+            <CardHeader>Technical Observations</CardHeader>
+            <CardBody>
+                @if (_result.TechnicalObservations.Any())
+                {
+                    <ul class="mb-0">
+                        @foreach (var item in _result.TechnicalObservations)
+                        {
+                            <li>@item</li>
+                        }
+                    </ul>
+                }
+                else
+                {
+                    <p class="text-muted mb-0">None found.</p>
+                }
+            </CardBody>
+        </Card>
+
+        <Card Class="mb-3">
+            <CardHeader>Works Required</CardHeader>
+            <CardBody>
+                @if (!string.IsNullOrWhiteSpace(_result.WorksRequired))
+                {
+                    <p class="mb-0">@_result.WorksRequired</p>
+                }
+                else if (!string.IsNullOrWhiteSpace(_result.SpecialtyScopeDescription))
+                {
+                    <p class="mb-0">@_result.SpecialtyScopeDescription</p>
+                }
+                else
+                {
+                    <p class="text-muted mb-0">None found.</p>
+                }
+            </CardBody>
+        </Card>
+
+        @* ── Work Order Notes (ETA) — rigid and specialty only; blank posts nothing ── *@
+        @if (_activeTab != DoradoTab.SemiRigid)
+        {
+            <Card Class="mb-3">
+                <CardHeader>Work Order Notes</CardHeader>
+                <CardBody>
+                    <div class="d-flex align-items-center gap-2 small">
+                        <span>Estimated completion:</span>
+                        <input type="number" class="form-control form-control-sm" style="width: 80px;" min="1" step="1"
+                               value="@_completionDays"
+                               @oninput="e => _completionDays = int.TryParse(e.Value?.ToString(), out var v) && v > 0 ? v : null" />
+                        <span>working days</span>
+                    </div>
+                </CardBody>
+            </Card>
+        }
+
+        @* ── Notices ── *@
+        <QuoteNoticesCard Notices="_applicableNotices" SelectedIds="_selectedNoticeIds" />
+    }
+</div>
+
+@code {
+    private enum DoradoTab { Rigid, SemiRigid, Specialty }
+
+    // Core extraction/upload state — read across most of the page below.
+    private byte[]? _pdfBytes;
+    private DoradoQuoteExtraction? _result;
+    private DoradoQuoteCalculation? _calc;
+    private DoradoTab _activeTab = DoradoTab.Rigid;
+    private int? _completionDays;
+    private int _companyId;
+    private bool _loading = false;
+    private bool _submitting = false;
+    private bool _submitSuccess = false;
+    private string? _error;
+
+    private bool SubmitDisabled =>
+        _submitting
+        || string.IsNullOrEmpty(_selectedEquipmentId);
+
+    private const string CompanyGroupsScope = "dorado_company_groups";
+
+    // ── Lifecycle ────────────────────────────────────────────────────────────
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+
+        // Optional appsettings override: "Pricing": { "AudUsdRate": 0.66 }
+        var configured = Configuration["Pricing:AudUsdRate"];
+        if (decimal.TryParse(configured, NumberStyles.Any, CultureInfo.InvariantCulture, out var rate) && rate > 0)
+            _configuredRate = rate;
+
+        _audUsdRate = _configuredRate;
+    }
+
+    // ── Scope tab & notices ──────────────────────────────────────────────────
+
+    private List<QuoteNotice> _applicableNotices = new();
+    private HashSet<Guid> _selectedNoticeIds = new();
+
+    private bool ShowRodLensDetail => _calc == null || _calc.Mode == DoradoPricingMode.Level;
+
+    /// <summary>
+    /// Switching tabs drives WorksRequired/IsSpecialtyScope explicitly instead of inferring
+    /// them from extraction — DoradoPricingCalculator keys off exactly those two fields, so this
+    /// is the only thing tabs need to do. Rigid always needs a real level to price as Level
+    /// mode, so switching to it snaps onto the first level if none is set yet.
+    /// </summary>
+    private async Task SelectTab(DoradoTab tab)
+    {
+        if (_result == null) return;
+
+        _activeTab = tab;
+        switch (tab)
+        {
+            case DoradoTab.Rigid:
+                _result.IsSpecialtyScope = false;
+                if (!DoradoLevels.IsKnown(_result.WorksRequired))
+                    _result.WorksRequired = DoradoLevels.All[0];
+                break;
+            case DoradoTab.SemiRigid:
+                _result.IsSpecialtyScope = false;
+                _result.WorksRequired = string.Empty;
+                break;
+            case DoradoTab.Specialty:
+                _result.IsSpecialtyScope = true;
+                break;
+        }
+
+        Recalculate();
+        await LoadApplicableNoticesAsync();
+    }
+
+    /// <summary>Auto-selects the tab matching what the AI extracted, right after extraction —
+    /// the user can still switch tabs manually afterwards.</summary>
+    private async Task InferActiveTab()
+    {
+        if (_result == null) return;
+
+        _activeTab = _result.IsSpecialtyScope ? DoradoTab.Specialty
+            : DoradoLevels.IsKnown(_result.WorksRequired) ? DoradoTab.Rigid
+            : DoradoTab.SemiRigid;
+
+        await LoadApplicableNoticesAsync();
+    }
+
+    private async Task LoadApplicableNoticesAsync()
+    {
+        var target = _activeTab switch
+        {
+            DoradoTab.Rigid => QuoteNoticeTarget.DoradoRigid,
+            DoradoTab.SemiRigid => QuoteNoticeTarget.DoradoSemiRigid,
+            _ => QuoteNoticeTarget.DoradoSpecialty,
+        };
+
+        _applicableNotices = await Notices.GetApplicableAsync(target);
+        _selectedNoticeIds = _applicableNotices.Select(n => n.Id).ToHashSet();
+    }
+
+    private void OnLevelSelectChanged(ChangeEventArgs e)
+    {
+        if (_result == null) return;
+        _result.WorksRequired = DoradoLevels.Normalise(e.Value?.ToString());
+        Recalculate();
+    }
+
+    // ── Pricing calculation ──────────────────────────────────────────────────
+
+    // Dorado pricing group (for unknown companies)
+    private int? _selectedGroupId;
+    private DoradoPricingGroup? _activeGroup;
+    private bool _groupSaveSuccess = false;
+
+    // Apex pricing (semi-rigid path)
+    private int _apexGroup = 1;
+    private decimal _audUsdRate = ApexPricingConfig.DefaultAudUsdRate;
+    private decimal _configuredRate = ApexPricingConfig.DefaultAudUsdRate;
+
+    private void OnRateChanged(ChangeEventArgs e)
+    {
+        if (decimal.TryParse(e.Value?.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var rate)
+            && rate > 0)
+        {
+            _audUsdRate = rate;
+            Recalculate();
+        }
+    }
+
+    private void ResetRate()
+    {
+        _audUsdRate = _configuredRate;
+        Recalculate();
+    }
+
+    private void Recalculate()
+    {
+        if (_result == null)
+        {
+            _calc = null;
+            return;
+        }
+
+        try
+        {
+            _calc = DoradoPricingCalculator.Calculate(_result, _activeGroup, _apexGroup, _audUsdRate);
+        }
+        catch (Exception ex)
+        {
+            // Apex throws above its threshold — surface it rather than blanking the page.
+            _calc = null;
+            _error = "Pricing failed: " + ex.Message;
+        }
+    }
+
+    // ── Job data loading ─────────────────────────────────────────────────────
+
+    private List<JobEquipmentInfo> _jobEquipment = new();
+    private string? _selectedEquipmentId;
+    private bool _equipmentLoading = false;
+    private bool _jobLookupLoading = false;
+    private string? _ownerName;
+
+    private async Task LoadJobEquipmentAsync(int jobId)
+    {
+        _equipmentLoading = true;
+        try
+        {
+            _jobEquipment = await EquipmentLookup.LoadAsync(jobId);
+
+            if (_jobEquipment.Count == 1)
+                _selectedEquipmentId = _jobEquipment[0].EquipmentId;
+        }
+        catch (Exception ex)
+        {
+            _error = "Failed to load job equipment: " + ex.Message;
+        }
+        finally
+        {
+            _equipmentLoading = false;
+        }
+    }
+
+    private async Task LoadJobServicesAsync(int jobId)
+    {
+        _jobServicesLoading = true;
+        try
+        {
+            _jobServices = await ServiceLookup.LoadAsync(jobId);
+        }
+        catch (Exception ex)
+        {
+            _error = "Failed to load job services: " + ex.Message;
+        }
+        finally
+        {
+            _jobServicesLoading = false;
+        }
+    }
+
+    private async Task LoadOwnerNameAsync()
+    {
+        try
+        {
+            _ownerName = await JobLookup.GetCompanyNameAsync(_companyId);
+        }
+        catch (Exception ex)
+        {
+            _error = "Failed to load owner name: " + ex.Message;
+        }
+    }
+
+    // ── Apply Credit ─────────────────────────────────────────────────────────
+
+    private const string CreditDescription = "Credit Applied: ";
+    private List<JobServiceInfo> _jobServices = new();
+    private bool _jobServicesLoading = false;
+    private decimal _creditAmount;
+    private bool _creditSubmitting = false;
+    private bool _creditSuccess = false;
+    private string? _creditError;
+
+    private bool CreditDisabled =>
+        _creditSubmitting
+        || _creditAmount <= 0
+        || string.IsNullOrEmpty(_selectedEquipmentId);
+
+    private void ResetCreditForm()
+    {
+        _creditAmount = 0;
+        _creditSuccess = false;
+        _creditError = null;
+    }
+
+    private void OnCreditAmountChanged(ChangeEventArgs e)
+    {
+        _creditSuccess = false;
+        if (decimal.TryParse(e.Value?.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var amount))
+            _creditAmount = amount;
+    }
+
+    private async Task ApplyCredit()
+    {
+        if (_result == null) return;
+
+        if (!int.TryParse(_result.JobNumber, out var jobId))
+        {
+            _creditError = "Could not extract a valid job number from the quote.";
+            return;
+        }
+
+        _creditSubmitting = true;
+        _creditError = null;
+        _creditSuccess = false;
+        StateHasChanged();
+
+        try
+        {
+            var ok = await QuoteSubmission.PostAdjustmentAsync(jobId, CreditDescription, -_creditAmount, _selectedEquipmentId ?? "");
+
+            if (!ok)
+                throw new Exception("Credit line failed to post.");
+
+            _creditAmount = 0;
+            _creditSuccess = true;
+            await LoadJobServicesAsync(jobId);
+        }
+        catch (Exception ex)
+        {
+            _creditError = "Failed to apply credit: " + ex.Message;
+        }
+        finally
+        {
+            _creditSubmitting = false;
+        }
+    }
+
+    // ── Dorado pricing group persistence ───────────────────────────────────────
+
+    private void SelectPricingGroup(int groupId)
+    {
+        _selectedGroupId = groupId;
+        _groupSaveSuccess = false;
+
+        try
+        {
+            CompanyGroups.Save(CompanyGroupsScope, _companyId, groupId);
+            _groupSaveSuccess = true;
+        }
+        catch (Exception ex)
+        {
+            _error = "Failed to save pricing group: " + ex.Message;
+        }
+
+        if (DoradoPricingConfig.Groups.TryGetValue(groupId, out var group))
+        {
+            _activeGroup = group;
+            Recalculate();
+        }
+    }
+
+    // ── Upload → extract → submit flow ──────────────────────────────────────
+
+    private async Task HandleFileSelected(InputFileChangeEventArgs e)
+    {
+        _result = null;
+        _calc = null;
+        _error = null;
+        _submitSuccess = false;
+
+        var bytes = await QuotePdfUpload.ReadPdfAsync(e, msg => _error = msg);
+        if (bytes != null)
+            _pdfBytes = bytes;
+        StateHasChanged();
+    }
+
+    private async Task RunQuery()
+    {
+        if (_pdfBytes == null) return;
+
+        _loading = true;
+        _error = null;
+        _result = null;
+        _calc = null;
+        _completionDays = null;
+        _activeGroup = null;
+        _selectedGroupId = null;
+        _groupSaveSuccess = false;
+        _apexGroup = 1;
+        _audUsdRate = _configuredRate;
+        _ownerName = null;
+        _jobServices = new();
+        ResetCreditForm();
+        StateHasChanged();
+
+        try
+        {
+            var client = new DoradoQuoteExtractor(OpenAi);
+            _result = await client.ExtractAsync(_pdfBytes);
+
+            // Snap whatever came back onto a canonical level name (or "" for semi-rigid).
+            _result.WorksRequired = DoradoLevels.Normalise(_result.WorksRequired);
+            await InferActiveTab();
+
+            await RunJobLookupAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = "Extraction failed: " + ex.Message;
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task RetryJobLookup()
+    {
+        if (_result == null) return;
+
+        _jobLookupLoading = true;
+        _error = null;
+        _calc = null;
+        _activeGroup = null;
+        _selectedGroupId = null;
+        _groupSaveSuccess = false;
+        _selectedEquipmentId = null;
+        _jobEquipment = new();
+        _ownerName = null;
+        _jobServices = new();
+        ResetCreditForm();
+        StateHasChanged();
+
+        try
+        {
+            await RunJobLookupAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = "Job lookup failed: " + ex.Message;
+        }
+        finally
+        {
+            _jobLookupLoading = false;
+        }
+    }
+
+    private async Task RunJobLookupAsync()
+    {
+        if (_result == null) return;
+
+        int jobId;
+        if (!int.TryParse(_result.JobNumber, out jobId))
+        {
+            _error = "Could not extract a valid job number from the quote.";
+            return;
+        }
+
+        var companyId = await JobLookup.GetOwnerCompanyIdAsync(jobId);
+        if (companyId is null)
+            throw new Exception("Could not retrieve company ID for job " + jobId);
+        _companyId = companyId.Value;
+
+        await LoadJobEquipmentAsync(jobId);
+        await LoadJobServicesAsync(jobId);
+        await LoadOwnerNameAsync();
+
+        _apexGroup = ApexPricingConfig.GetGroupForCompany(_companyId);
+
+        // Dorado pricing group — hardcoded config first, then saved JSON overrides.
+        // Only matters for level quotes; semi-rigid prices without one.
+        _activeGroup = DoradoPricingConfig.GetGroupForCompany(_companyId);
+        if (_activeGroup == null)
+        {
+            var overrides = CompanyGroups.LoadSaved(CompanyGroupsScope);
+            if (overrides.TryGetValue(_companyId, out var savedGroupId)
+                && DoradoPricingConfig.Groups.TryGetValue(savedGroupId, out var savedGroup))
+            {
+                _selectedGroupId = savedGroupId;
+                _activeGroup = savedGroup;
+            }
+        }
+
+        Recalculate();
+    }
+
+    private async Task SubmitServices()
+    {
+        if (_result == null || _calc == null || string.IsNullOrEmpty(_selectedEquipmentId)) return;
+
+        _submitting = true;
+        _error = null;
+        _submitSuccess = false;
+        StateHasChanged();
+
+        try
+        {
+            int jobId;
+            if (!int.TryParse(_result.JobNumber, out jobId))
+            {
+                _error = "Could not extract a valid job number from the quote.";
+                return;
+            }
+
+            var lineItems = _calc.Mode == DoradoPricingMode.Apex
+                ? BuildApexLineItems()
+                : BuildLevelLineItems();
+
+            var selectedNotices = _applicableNotices.Where(n => _selectedNoticeIds.Contains(n.Id));
+
+            await QuoteSubmission.SubmitAsync(
+                jobId, _selectedEquipmentId,
+                lineItems, selectedNotices);
+
+            _submitSuccess = true;
+            await Analytics.TrackEventAsync("Quote services created — Dorado");
+        }
+        catch (Exception ex)
+        {
+            _error = "Submission failed: " + ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+
+    // ── Line item builders ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Semi-rigid: one service line at the Apex-derived AUD price. The quote total already
+    /// includes lenses and any specialty line, so nothing else is posted.
+    /// </summary>
+    private List<(string, decimal)> BuildApexLineItems()
+    {
+        var description = DoradoServiceDescriptions.GetSemiRigidDescription(
+            _result!.TechnicalObservations,
+            _result.SpecialtyScopeDescription);
+
+        return new List<(string, decimal)> { (description, _calc!.Total) };
+    }
+
+    /// <summary>
+    /// Rigid: level line, optional specialty surcharge, then rod lens extras.
+    /// </summary>
+    private List<(string, decimal)> BuildLevelLineItems()
+    {
+        var lineItems = new List<(string, decimal)>();
+
+        string mainDescription;
+        var postSurchargeSeparately = false;
+
+        if (_result!.IsSpecialtyScope)
+        {
+            mainDescription = DoradoServiceDescriptions.GetSpecialtyScopeDescription(
+                _result.TechnicalObservations,
+                _result.SpecialtyScopeDescription,
+                _result.SpecialtyScopePrice);
+            postSurchargeSeparately = _calc!.SpecialtySurcharge > 0;
+        }
+        else
+        {
+            mainDescription = DoradoServiceDescriptions.GetTechServiceDescription(
+                _result.WorksRequired,
+                _result.TechnicalObservations);
+        }
+
+        lineItems.Add((mainDescription, _calc!.BaseServicePrice));
+
+        if (postSurchargeSeparately)
+        {
+            var surchargeDescription = DoradoServiceDescriptions.GetSpecialtySurchargeDescription(
+                _result.SpecialtyScopeDescription,
+                _result.SpecialtyScopePrice);
+
+            lineItems.Add((surchargeDescription, _calc.SpecialtySurcharge));
+        }
+
+        if (_result.AdditionalRodLenses > 0)
+        {
+            var rodDescription = DoradoServiceDescriptions.GetRodLensDescription(
+                _result.AdditionalRodLenses,
+                _calc.RodLensesFullPrice,
+                _calc.RodLensDiscount);
+
+            lineItems.Add((rodDescription, _calc.RodLensesChargedPrice));
+        }
+
+        if (_result.AdditionalRodLenses4k > 0)
+        {
+            var rod4kDescription = DoradoServiceDescriptions.GetRodLens4kDescription(
+                _result.AdditionalRodLenses4k,
+                _result.RodLenses4kUnitPrice,
+                _calc.RodLenses4kFullPrice,
+                _calc.RodLenses4kDiscount);
+
+            lineItems.Add((rod4kDescription, _calc.RodLenses4kChargedPrice));
+        }
+
+        if (_completionDays != null)
+            lineItems.Add((QuoteServiceText.WorkOrderNotes(_completionDays.Value), 0m));
+
+        return lineItems;
+    }
+}

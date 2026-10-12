@@ -1,0 +1,481 @@
+﻿@page "/waiting-workshop-processing"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject ScopeJobStore ScopeJobs
+@inject WaitingWorkshopProcessingService Processing
+@inject JobTouchService JobTouch
+@inject JobStatusActionService StatusAction
+@inject ILogger<WaitingWorkshopProcessing> Logger
+
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    WaitingWorkshopProcessing — jobs currently being worked on in the
+    workshop, oldest first, with inline ETA editing, approval toggling and
+    PO-upload status (or "Credit Applied" from job.order_number in place of a
+    PO), filterable by approval and by PO. See also WaitingWorkshopAssignment (the queue before
+    this one) and WaitingQuoteConfirmation (same JobRow/touch-last-worked
+    shape, different queue).
+
+    ── Services ─────────────────────────────────────────────────────────────
+      ScopeJobs  — ScopeJobStore: excluded-model list applied to the queue
+      Processing — WaitingWorkshopProcessingService: GetJobsAsync (the
+                   queue), SaveEtaAsync / ToggleApprovalAsync (each stored
+                   as a job service, re-fetched after saving so the next
+                   save updates the same row instead of creating a new one)
+      JobTouch   — JobTouchService: TouchLastWorkedAsync bumps "last worked"
+                   to today without any other status change
+      StatusAction — JobStatusActionService: ChangeJobStatusAsync moves a job to
+                   Workshop Finalisation Complete; AddNoteServiceAsync then records
+                   the tracking number entered in the Finalise popup (if any) as a
+                   $0 NOTE service, same "Carrier: connote" format
+                   WorkshopFinalisationComplete's own manual-entry form writes (and
+                   ExtractTracking reads back) — so the job shows up there with
+                   tracking already filled in.
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      LoadJobsAsync wraps each WwpJobRecord in a JobRow carrying its own
+      per-row UI state (EtaInput, saving/touching flags). Every save/toggle
+      reloads the whole list rather than trusting the local edit, since the
+      *ServiceId fields (needed to update in place next time) only come back
+      from JMS after the row actually exists there.
+
+      Finalise button opens a small popup (Carrier + connote) instead of just
+      flipping the status blind — WorkshopFinalisationComplete otherwise shows
+      the job with no tracking and a "sitting since day one" clock, needing a
+      second manual-entry step anyway. The connote is optional: leaving it blank
+      just skips the AddNoteServiceAsync call, for cases where the tracking number
+      isn't known yet and will be entered on WorkshopFinalisationComplete later.
+      Status change happens first; the note (if any) is only added if that
+      succeeds, then the list reloads (the job leaves this queue once its status
+      changes).
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Waiting Workshop Processing</h1>
+    <p class="text-muted">Jobs currently in workshop processing. Oldest first.</p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else if (_jobs.Count == 0)
+{
+    <Callout Color="CalloutColor.Info">No jobs in this queue.</Callout>
+}
+else
+{
+    var shown = _jobs.Where(j => MatchesApproval(j) && MatchesPo(j)).ToList();
+
+    <div class="d-flex gap-3 flex-wrap mb-2">
+        <div class="btn-group btn-group-sm" role="group" aria-label="Approval filter">
+            @foreach (var f in Enum.GetValues<ApprovalFilter>())
+            {
+                <button type="button" class="btn @(_approvalFilter == f ? "btn-primary" : "btn-outline-primary")"
+                        @onclick="() => _approvalFilter = f">
+                    @ApprovalFilterLabel(f) (@_jobs.Count(j => MatchesApproval(j, f)))
+                </button>
+            }
+        </div>
+        <div class="btn-group btn-group-sm" role="group" aria-label="PO filter">
+            @foreach (var f in Enum.GetValues<PoFilter>())
+            {
+                <button type="button" class="btn @(_poFilter == f ? "btn-primary" : "btn-outline-primary")"
+                        @onclick="() => _poFilter = f">
+                    @PoFilterLabel(f) (@_jobs.Count(j => MatchesPo(j, f)))
+                </button>
+            }
+        </div>
+    </div>
+
+    <p class="text-muted">
+        @(shown.Count == _jobs.Count ? $"{_jobs.Count} job(s) in queue." : $"Showing {shown.Count} of {_jobs.Count} job(s).")
+    </p>
+    <table class="table table-striped align-middle">
+        <thead>
+            <tr>
+                <th>Job ID</th>
+                <th>Owner</th>
+                <th>Equipment</th>
+                <th>Fault</th>
+                <th>In Workshop Since</th>
+                <th>ETA</th>
+                <th>Approval</th>
+                <th>Last Worked</th>
+                <th>PO</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var job in shown)
+            {
+                <tr>
+                    <td>
+                        <a href="@JmsLinks.JobSummary(job.JobId)"
+                           target="_blank" rel="noopener noreferrer">@job.JobId</a>
+                    </td>
+                    <td>@job.Owner</td>
+                    <td>@job.Equipment</td>
+                    <td>@job.Fault</td>
+                    <td class="@StatusAgeClass(job.FirstSetDate)">
+                        @(job.FirstSetDate == DateTime.MinValue
+                            ? "—"
+                            : $"{(int)(DateTime.Today - job.FirstSetDate.Date).TotalDays} days ({job.FirstSetDate:dd MMM yyyy})")
+                    </td>
+                    <td>
+                        @if (job.Eta.HasValue)
+                        {
+                            <div>@job.Eta.Value.ToString("dd MMM yyyy")</div>
+                            <div class="small @EtaDaysClass(job.Eta)">@EtaDaysLabel(job.Eta)</div>
+                        }
+                        else
+                        {
+                            <div class="text-muted">Not set</div>
+                        }
+                        <div class="d-flex gap-1 mt-1">
+                            <input type="date" class="form-control form-control-sm" style="width:auto;" @bind="job.EtaInput" />
+                            <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                    Disabled="job.SavingEta" @onclick="() => SaveEtaAsync(job)">
+                                @(job.SavingEta ? "Saving..." : "Save")
+                            </Button>
+                        </div>
+                    </td>
+                    <td>
+                        @if (job.ApprovalConfirmed)
+                        {
+                            <Badge Color="BadgeColor.Success">✔ Confirmed</Badge>
+                        }
+                        else
+                        {
+                            <Badge Color="BadgeColor.Secondary">Not Confirmed</Badge>
+                        }
+                        <div class="mt-1">
+                            <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                    Disabled="job.SavingApproval" @onclick="() => ToggleApprovalAsync(job)">
+                                @(job.SavingApproval ? "Saving..." : (job.ApprovalConfirmed ? "Unconfirm" : "Confirm"))
+                            </Button>
+                        </div>
+                    </td>
+                    <td class="@StatusAgeClass(job.LastWorked)">
+                        @(job.LastWorked?.ToString("dd MMM yyyy") ?? "Never")
+                    </td>
+                    <td>
+                        @if (job.PoUploaded)
+                        {
+                            <Badge Color="BadgeColor.Success">✔ Uploaded</Badge>
+                        }
+                        else if (job.CreditApplied)
+                        {
+                            <Badge Color="BadgeColor.Info">Credit Applied</Badge>
+                        }
+                        else
+                        {
+                            <Badge Color="BadgeColor.Danger">✘ Missing</Badge>
+                        }
+                    </td>
+                    <td>
+                        <div class="d-flex flex-column gap-1">
+                            <Button Size="ButtonSize.Small" Color="ButtonColor.Primary" Outline="true"
+                                    Disabled="job.TouchingLastWorked" @onclick="() => TouchLastWorkedAsync(job)">
+                                @(job.TouchingLastWorked ? "..." : "Mark Worked")
+                            </Button>
+                            <Button Size="ButtonSize.Small" Color="ButtonColor.Success" Outline="true"
+                                    @onclick="() => OpenFinaliseModal(job)">
+                                Finalise
+                            </Button>
+                        </div>
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@if (_finalisingJob is { } finalising)
+{
+    <div class="modal fade show" style="display:block;" tabindex="-1" role="dialog">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Finalise Job @finalising.JobId</h5>
+                    <button type="button" class="btn-close" aria-label="Close" @onclick="CancelFinalise"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="text-muted">
+                        Sets this job to <strong>Workshop Finalisation Complete</strong>. Tracking details are
+                        optional — fill them in if you have them so they show up on that page immediately,
+                        or leave blank and enter them there later.
+                    </p>
+                    <div class="mb-3">
+                        <label class="form-label">Carrier</label>
+                        <select class="form-select" @bind="_finaliseCarrier">
+                            @foreach (var c in TrackingService.KnownCarrierPrefixes)
+                            {
+                                <option value="@c">@c</option>
+                            }
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Tracking / Connote Number (optional)</label>
+                        <input class="form-control" @bind="_finaliseConnote" @bind:event="oninput" />
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <Button Color="ButtonColor.Secondary" Outline="true" Disabled="_finalising" @onclick="CancelFinalise">
+                        Cancel
+                    </Button>
+                    <Button Color="ButtonColor.Success"
+                            Disabled="_finalising"
+                            @onclick="ConfirmFinaliseAsync">
+                        @(_finalising ? "Saving..." : "Mark Finalisation Complete")
+                    </Button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="modal-backdrop fade show"></div>
+}
+
+@code {
+    private bool _loading = true;
+    private List<JobRow> _jobs = new();
+
+    // ── Filters ──────────────────────────────────────────────────────────────
+
+    private enum ApprovalFilter { All, Confirmed, NotConfirmed }
+    private enum PoFilter { All, Uploaded, Missing, CreditApplied }
+
+    private ApprovalFilter _approvalFilter;
+    private PoFilter _poFilter;
+
+    private bool MatchesApproval(JobRow job) => MatchesApproval(job, _approvalFilter);
+    private bool MatchesPo(JobRow job) => MatchesPo(job, _poFilter);
+
+    private static bool MatchesApproval(JobRow job, ApprovalFilter f) => f switch
+    {
+        ApprovalFilter.Confirmed => job.ApprovalConfirmed,
+        ApprovalFilter.NotConfirmed => !job.ApprovalConfirmed,
+        _ => true,
+    };
+
+    // Same precedence as the PO column: an uploaded PO wins over Credit Applied.
+    private static bool MatchesPo(JobRow job, PoFilter f) => f switch
+    {
+        PoFilter.Uploaded => job.PoUploaded,
+        PoFilter.CreditApplied => !job.PoUploaded && job.CreditApplied,
+        PoFilter.Missing => !job.PoUploaded && !job.CreditApplied,
+        _ => true,
+    };
+
+    private static string ApprovalFilterLabel(ApprovalFilter f) => f switch
+    {
+        ApprovalFilter.NotConfirmed => "Not Confirmed",
+        _ => f.ToString(),
+    };
+
+    private static string PoFilterLabel(PoFilter f) => f switch
+    {
+        PoFilter.All => "All POs",
+        PoFilter.Uploaded => "PO Uploaded",
+        PoFilter.Missing => "PO Missing",
+        PoFilter.CreditApplied => "Credit Applied",
+        _ => f.ToString(),
+    };
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        await LoadJobsAsync();
+    }
+
+    private async Task LoadJobsAsync()
+    {
+        var exclusions = await ScopeJobs.LoadAsync();
+        var records = await Processing.GetJobsAsync(exclusions);
+
+        _jobs = records
+            .Select(r => new JobRow
+            {
+                Record = r,
+                EtaInput = r.Eta
+            })
+            .ToList();
+
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private async Task TouchLastWorkedAsync(JobRow job)
+    {
+        job.TouchingLastWorked = true;
+        StateHasChanged();
+
+        try
+        {
+            await JobTouch.TouchLastWorkedAsync(int.Parse(job.JobId),
+                msg => Logger.LogWarning("{Message}", msg));
+            await LoadJobsAsync();
+        }
+        finally
+        {
+            job.TouchingLastWorked = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task SaveEtaAsync(JobRow job)
+    {
+        if (job.EtaInput is not { } eta) return;
+
+        job.SavingEta = true;
+        StateHasChanged();
+
+        try
+        {
+            var ok = await Processing.SaveEtaAsync(int.Parse(job.JobId), job.EtaServiceId, eta,
+                msg => Logger.LogWarning("{Message}", msg));
+
+            // Re-pull from JMS rather than assuming success locally — this also
+            // picks up the new row's service_id so the NEXT save updates it in
+            // place instead of creating another one.
+            if (ok) await LoadJobsAsync();
+        }
+        finally
+        {
+            job.SavingEta = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task ToggleApprovalAsync(JobRow job)
+    {
+        job.SavingApproval = true;
+        StateHasChanged();
+
+        try
+        {
+            var ok = await Processing.ToggleApprovalAsync(int.Parse(job.JobId), job.ApprovalServiceId, !job.ApprovalConfirmed,
+                msg => Logger.LogWarning("{Message}", msg));
+            if (ok) await LoadJobsAsync();
+        }
+        finally
+        {
+            job.SavingApproval = false;
+            StateHasChanged();
+        }
+    }
+
+    // ── Finalise popup ───────────────────────────────────────────────────────
+
+    private JobRow? _finalisingJob;
+    private string _finaliseCarrier = TrackingService.KnownCarrierPrefixes[0];
+    private string? _finaliseConnote;
+    private bool _finalising;
+
+    private void OpenFinaliseModal(JobRow job)
+    {
+        _finalisingJob = job;
+        _finaliseCarrier = TrackingService.KnownCarrierPrefixes[0];
+        _finaliseConnote = null;
+    }
+
+    private void CancelFinalise()
+    {
+        if (_finalising) return;
+        _finalisingJob = null;
+    }
+
+    private async Task ConfirmFinaliseAsync()
+    {
+        if (_finalisingJob is not { } job) return;
+
+        _finalising = true;
+        StateHasChanged();
+
+        try
+        {
+            var jobId = int.Parse(job.JobId);
+            var connote = _finaliseConnote?.Trim();
+
+            var statusOk = await StatusAction.ChangeJobStatusAsync(jobId, JobStatus.WorkshopFinalisationComplete);
+            if (statusOk)
+            {
+                if (!string.IsNullOrWhiteSpace(connote))
+                    await StatusAction.AddNoteServiceAsync(jobId, $"{_finaliseCarrier}: {connote}");
+
+                _finalisingJob = null;
+                await LoadJobsAsync();
+            }
+        }
+        finally
+        {
+            _finalising = false;
+            StateHasChanged();
+        }
+    }
+
+    private static string EtaDaysLabel(DateTime? eta)
+    {
+        if (eta is null) return "";
+        var days = (int)(eta.Value.Date - DateTime.Today).TotalDays;
+        if (days > 0) return $"{days} day{(days == 1 ? "" : "s")} left";
+        if (days == 0) return "Due today";
+        return $"{-days} day{(-days == 1 ? "" : "s")} overdue";
+    }
+
+    private static string EtaDaysClass(DateTime? eta)
+    {
+        if (eta is null) return "";
+        var days = (eta.Value.Date - DateTime.Today).TotalDays;
+        if (days < 0) return "text-stale-danger";
+        if (days <= 2) return "text-stale-warn";
+        return "text-muted";
+    }
+
+    private static string StatusAgeClass(DateTime? date)
+    {
+        if (date is null) return "text-stale-danger";
+        var days = (DateTime.Today - date.Value.Date).TotalDays;
+        if (days >= 7) return "text-stale-danger";
+        if (days >= 5) return "text-stale-warn";
+        return "";
+    }
+
+    private class JobRow
+    {
+        public required WwpJobRecord Record { get; init; }
+
+        public string JobId => Record.JobId;
+        public string Owner => Record.Owner;
+        public string Equipment => Record.Equipment;
+        public string Fault => Record.Fault;
+        public DateTime FirstSetDate => Record.FirstSetDate;
+        public DateTime? LastWorked => Record.LastWorked;
+        public DateTime? Eta => Record.Eta;
+        public int? EtaServiceId => Record.EtaServiceId;
+        public bool ApprovalConfirmed => Record.ApprovalConfirmed;
+        public int? ApprovalServiceId => Record.ApprovalServiceId;
+        public bool PoUploaded => Record.PoUploaded;
+        public bool CreditApplied => Record.CreditApplied;
+
+        public DateTime? EtaInput { get; set; }
+        public bool SavingApproval { get; set; }
+        public bool SavingEta { get; set; }
+        public bool TouchingLastWorked { get; set; }
+    }
+}

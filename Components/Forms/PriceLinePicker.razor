@@ -1,0 +1,58 @@
+@using WorkshopDashboard.Data
+@using WorkshopDashboard.Services.Stores
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    PriceLinePicker — search box over an already-loaded price sheet (Apex
+    flexible repairs). Type a code or a few words ("bend gif", "F2010") and
+    pick a line; OnSelect hands back the whole line. Searches the list the
+    parent passes in, in memory (it's ~500 lines), so there's no network
+    call per keystroke to fall behind the typing.
+
+    ── Parameters ───────────────────────────────────────────────────────────
+      Lines     — the price sheet (ApexPriceSheetStore.LoadAsync)
+      OnSelect  — fired with the picked line
+      Placeholder
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="position-relative">
+    <input class="form-control form-control-sm" placeholder="@Placeholder" value="@_query"
+           @oninput="e => _query = e.Value?.ToString() ?? string.Empty"
+           @onfocus="() => _open = true" @onblur="() => _open = false" />
+    @if (_open && Hits.Count > 0)
+    {
+        <div class="border rounded bg-body position-absolute w-100 mt-1 p-1 shadow-sm" style="z-index:1050; max-height:320px; overflow-y:auto;">
+            @foreach (var line in Hits)
+            {
+                <button type="button" class="btn btn-sm btn-outline-secondary d-block w-100 text-start mb-1"
+                        @onmousedown="() => SelectAsync(line)" @onmousedown:preventDefault>
+                    <div class="d-flex justify-content-between gap-2">
+                        <span class="fw-semibold">@line.Code</span>
+                        <span class="text-nowrap">@line.PriceUsd.ToString("C")</span>
+                    </div>
+                    <div class="small text-muted">@line.Description</div>
+                </button>
+            }
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter] public IReadOnlyList<ApexPriceLine> Lines { get; set; } = Array.Empty<ApexPriceLine>();
+    [Parameter] public EventCallback<ApexPriceLine> OnSelect { get; set; }
+    [Parameter] public string Placeholder { get; set; } = "Search price sheet...";
+
+    private string _query = "";
+    private bool _open;
+
+    private List<ApexPriceLine> Hits =>
+        _query.Trim().Length < 2 ? new() : ApexPriceSheetStore.Search(Lines, _query, 8);
+
+    private async Task SelectAsync(ApexPriceLine line)
+    {
+        _query = "";
+        _open = false;
+        await OnSelect.InvokeAsync(line);
+    }
+}

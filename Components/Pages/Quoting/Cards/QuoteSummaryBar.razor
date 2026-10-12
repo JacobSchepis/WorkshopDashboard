@@ -1,0 +1,50 @@
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    QuoteSummaryBar — shared summary-bar card used by every repairer quote
+    page: editable Job Number + Retry lookup button.
+
+    ── Parameters ───────────────────────────────────────────────────────────
+      JobNumber/JobNumberChanged — the editable job number field
+      RetryLoading/OnRetry       — re-runs the job lookup for the typed number
+      ExtraFields — everything else in the bar (AUD/USD rate, totals, owner,
+        mode badges — genuinely different per repairer), rendered in the
+        same flex row after Job Number
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<Card Class="mb-3">
+    <CardBody Class="d-flex gap-4 flex-wrap align-items-end">
+        <div>
+            <div class="text-muted small mb-1">Job Number</div>
+            <div class="d-flex gap-2 align-items-center">
+                <input type="text" class="form-control form-control-sm"
+                       style="width: 120px;"
+                       value="@JobNumber"
+                       @oninput="e => JobNumberChanged.InvokeAsync(e.Value?.ToString() ?? string.Empty)" />
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                        Disabled="@(RetryLoading || string.IsNullOrWhiteSpace(JobNumber))"
+                        Loading="RetryLoading" @onclick="OnRetry">
+                    &#x21BB; Retry
+                </Button>
+            </div>
+        </div>
+
+        @if (ExtraFields != null)
+        {
+            @ExtraFields
+        }
+    </CardBody>
+</Card>
+
+@code {
+    [Parameter] public string JobNumber { get; set; } = string.Empty;
+    [Parameter] public EventCallback<string> JobNumberChanged { get; set; }
+    [Parameter] public bool RetryLoading { get; set; }
+    [Parameter] public EventCallback OnRetry { get; set; }
+
+    /// <summary>Repairer-specific fields rendered after Job Number in the same flex row
+    /// (AUD/USD rate, totals, owner, mode badges, etc.).</summary>
+    [Parameter] public RenderFragment? ExtraFields { get; set; }
+}

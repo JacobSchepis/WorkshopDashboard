@@ -1,0 +1,461 @@
+@page "/quote-ember"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+
+@using System.Globalization
+@using WorkshopDashboard.Services.Quoting.Ember
+@using WorkshopDashboard.Services.Quoting.Shipping
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Quoting
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Analytics
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+@using WorkshopDashboard.Components.Pages.Quoting.Cards
+
+@inject IConfiguration Configuration
+@inject IJsonCompletionClient OpenAi
+@inject CompanyGroupStore CompanyGroups
+@inject QuoteNoticeStore Notices
+@inject JobLookupService JobLookup
+@inject JobEquipmentLookup EquipmentLookup
+@inject QuoteSubmissionService QuoteSubmission
+@inject AnalyticsService Analytics
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    QuoteEmber — repairer quote extraction + pricing for Ember transducer repairs. One of six near-identical
+    per-repairer quoting pages (Apex/Bayside/Cobalt/Dorado/Ember/Falcon) sharing the
+    same upload→extract→submit shape; see QuoteDorado for the fullest write-up.
+    Unlike the others, the two services posted (Technical Observations,
+    Repairs Required) are free-text lists the user edits directly rather
+    than a priced line-item table.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      (extractor built inline in RunQuery, from src/Services/Quoting/Ember)
+      ShippingSelector — the company's freight zone; freight goes into the repair line
+      Notices          — QuoteNoticeStore: repairer-scope notices
+      JobLookup        — job -> owner company id / name
+      EquipmentLookup  — equipment options for the equipment selector
+      QuoteSubmission  — posts the two services back to JMS
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      HandleFileSelected -> RunQuery extracts the PDF's USD total plus the
+      observation/repair text lists (each independently add/removable) ->
+      the AUD/USD rate (OnRateChanged / ResetRate) converts the printed USD
+      cost to _customerPrice -> SubmitServices posts the two text-list
+      services at that price.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="container py-4" style="max-width: 860px;">
+    <div class="page-header">
+        <h1>Ember Quote Extractor</h1>
+        <p class="text-muted">Upload an Ember transducer repair quote to extract and create services.</p>
+    </div>
+
+    <QuoteUploadCard HasFile="_pdfBytes != null" HasResult="_result != null" Loading="_loading"
+                      Submitting="_submitting" SubmitSuccess="_submitSuccess" Error="@_error"
+                      CanSubmit="@(!_submitting && !string.IsNullOrEmpty(_selectedEquipmentId) && _selectedShippingGroupId != null)"
+                      OnFileSelected="HandleFileSelected" OnExtract="RunQuery" OnSubmit="SubmitServices" />
+
+    @if (_result != null)
+    {
+        @* ── Summary bar ── *@
+        <QuoteSummaryBar JobNumber="@_result.JobNumber" JobNumberChanged="v => _result.JobNumber = v"
+                          RetryLoading="_jobLookupLoading" OnRetry="RetryJobLookup">
+            <ExtraFields>
+                <div>
+                    <div class="text-muted small mb-1">AUD/USD Rate</div>
+                    <div class="d-flex gap-2 align-items-center">
+                        <input type="number" step="0.0001" min="0.0001"
+                               class="form-control form-control-sm" style="width: 100px;"
+                               value="@_audUsdRate.ToString(CultureInfo.InvariantCulture)"
+                               @onchange="OnRateChanged" />
+                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" @onclick="ResetRate">Reset</Button>
+                    </div>
+                </div>
+                <div>
+                    <div class="text-muted small">Ember Cost (USD)</div>
+                    <div class="fw-semibold">@_result.TotalPriceUsd.ToString("C")</div>
+                </div>
+                <div>
+                    <div class="text-muted small">Our Total (AUD)</div>
+                    <div class="fw-semibold text-success">@TotalCost.ToString("C")</div>
+                </div>
+            </ExtraFields>
+        </QuoteSummaryBar>
+
+        @* ── Equipment selector ── *@
+        <EquipmentSelectorCard Equipment="_jobEquipment" Loading="_equipmentLoading" @bind-SelectedEquipmentId="_selectedEquipmentId" />
+
+        @* ── Service 1: Technical Observations ── *@
+        <Card Class="mb-3">
+            <CardHeader>Service 1 — Technical Observations</CardHeader>
+            <CardBody>
+                @for (int i = 0; i < _result.TechnicalObservations.Count; i++)
+                {
+                    var idx = i;
+                    <div class="d-flex gap-2 mb-2">
+                        <textarea class="form-control form-control-sm"
+                                  rows="2"
+                                  style="font-size:0.85rem; resize:vertical;"
+                                  value="@_result.TechnicalObservations[idx]"
+                                  @oninput="e => _result.TechnicalObservations[idx] = e.Value?.ToString() ?? string.Empty"></textarea>
+                        <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" Class="align-self-start"
+                                @onclick="() => _result.TechnicalObservations.RemoveAt(idx)">
+                            ✕
+                        </Button>
+                    </div>
+                }
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="mt-1"
+                        @onclick="() => _result.TechnicalObservations.Add(string.Empty)">
+                    + Add
+                </Button>
+            </CardBody>
+        </Card>
+
+        @* ── Service 2: Repairs Required ── *@
+        <Card Class="mb-3">
+            <CardHeader>Service 2 — Repairs Required</CardHeader>
+            <CardBody>
+                @for (int i = 0; i < _result.RepairsRequired.Count; i++)
+                {
+                    var idx = i;
+                    <div class="d-flex gap-2 mb-2">
+                        <textarea class="form-control form-control-sm"
+                                  rows="2"
+                                  style="font-size:0.85rem; resize:vertical;"
+                                  value="@_result.RepairsRequired[idx]"
+                                  @oninput="e => _result.RepairsRequired[idx] = e.Value?.ToString() ?? string.Empty"></textarea>
+                        <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" Class="align-self-start"
+                                @onclick="() => _result.RepairsRequired.RemoveAt(idx)">
+                            ✕
+                        </Button>
+                    </div>
+                }
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="mb-3"
+                        @onclick="() => _result.RepairsRequired.Add(string.Empty)">
+                    + Add
+                </Button>
+
+                <table class="table table-sm mb-0">
+                    <tbody>
+                        <tr>
+                            <td>Ember Cost (USD)</td>
+                            <td class="text-end" style="width:160px">
+                                <div class="input-group input-group-sm justify-content-end">
+                                    <span class="input-group-text">$</span>
+                                    <input type="number" class="form-control text-end" style="width:90px"
+                                           step="0.01" value="@_result.TotalPriceUsd"
+                                           @oninput="e => UpdateCostUsd(e.Value?.ToString())" />
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td>Our Price (AUD)</td>
+                            <td class="text-end">
+                                <div class="input-group input-group-sm justify-content-end">
+                                    <span class="input-group-text">$</span>
+                                    <input type="number" class="form-control text-end" style="width:90px"
+                                           step="0.01" value="@_customerPrice"
+                                           @oninput="e => { if (decimal.TryParse(e.Value?.ToString(), out var v)) _customerPrice = v; }" />
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td>Freight @(_selectedShippingGroupId == null ? "(pick a shipping group below)" : "")</td>
+                            <td class="text-end">@Freight.ToString("C")</td>
+                        </tr>
+                        <tr class="fw-semibold table-light">
+                            <td>Total Cost</td>
+                            <td class="text-end">@TotalCost.ToString("C")</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </CardBody>
+        </Card>
+
+        @* ── Service 3: Work Order Notes (fixed template) ── *@
+        <Card Class="mb-3">
+            <CardHeader>Service 3 — Work Order Notes</CardHeader>
+            <CardBody>
+                <p class="small mb-1 text-muted">Estimated time of completion: <span class="fw-semibold text-dark">@_result.TurnaroundEstimate</span></p>
+                <p class="small mb-0 text-muted">Warranty: <span class="fw-semibold text-dark">@_result.WarrantyDays days</span></p>
+            </CardBody>
+        </Card>
+
+        @* ── Notices ── *@
+        <QuoteNoticesCard Notices="_applicableNotices" SelectedIds="_selectedNoticeIds" />
+
+        @* ── Shipping group selector ── *@
+        <ShippingSelectorCard SelectedShippingGroupId="_selectedShippingGroupId"
+                               OnSelect="SelectShippingGroup"
+                               SaveSuccess="_shippingGroupSaveSuccess"
+                               CompanyId="_companyId" />
+    }
+</div>
+
+@code {
+    private byte[]? _pdfBytes;
+    private EmberQuoteExtraction? _result;
+    private decimal _customerPrice;
+
+    // Freight is part of the repair line, not a line of its own.
+    private decimal Freight => ShippingConfig.FreightFor(_selectedShippingGroupId);
+    private decimal TotalCost => _customerPrice + Freight;
+
+    private int _companyId;
+    private bool _loading = false;
+    private bool _submitting = false;
+    private bool _submitSuccess = false;
+    private string? _error;
+
+    private List<JobEquipmentInfo> _jobEquipment = new();
+    private string? _selectedEquipmentId;
+    private bool _equipmentLoading = false;
+    private bool _jobLookupLoading = false;
+
+    private decimal _audUsdRate = EmberPricingConfig.DefaultAudUsdRate;
+    private decimal _configuredRate = EmberPricingConfig.DefaultAudUsdRate;
+
+    private int? _selectedShippingGroupId;
+    private bool _shippingGroupSaveSuccess = false;
+
+    private List<QuoteNotice> _applicableNotices = new();
+    private HashSet<Guid> _selectedNoticeIds = new();
+
+    private const string CompanyShippingGroupsScope = "ember_company_shipping_groups";
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+
+        // Optional appsettings override: "Pricing": { "EmberAudUsdRate": 0.69 }
+        var configured = Configuration["Pricing:EmberAudUsdRate"];
+        if (decimal.TryParse(configured, NumberStyles.Any, CultureInfo.InvariantCulture, out var rate) && rate > 0)
+            _configuredRate = rate;
+
+        _audUsdRate = _configuredRate;
+    }
+
+    private void OnRateChanged(ChangeEventArgs e)
+    {
+        if (decimal.TryParse(e.Value?.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var rate) && rate > 0)
+        {
+            _audUsdRate = rate;
+            RecalculatePrice();
+        }
+    }
+
+    private void ResetRate()
+    {
+        _audUsdRate = _configuredRate;
+        RecalculatePrice();
+    }
+
+    private void RecalculatePrice()
+    {
+        if (_result == null) return;
+        _customerPrice = EmberPricingConfig.Calculate(_result.TotalPriceUsd, _audUsdRate).Total;
+    }
+
+    private void UpdateCostUsd(string? value)
+    {
+        if (_result == null) return;
+        if (!decimal.TryParse(value, out var d)) d = 0m;
+        _result.TotalPriceUsd = d;
+        _customerPrice = EmberPricingConfig.Calculate(d, _audUsdRate).Total;
+    }
+
+    private async Task LoadJobEquipmentAsync(int jobId)
+    {
+        _equipmentLoading = true;
+        try
+        {
+            _jobEquipment = await EquipmentLookup.LoadAsync(jobId);
+
+            if (_jobEquipment.Count == 1)
+                _selectedEquipmentId = _jobEquipment[0].EquipmentId;
+        }
+        catch (Exception ex)
+        {
+            _error = "Failed to load job equipment: " + ex.Message;
+        }
+        finally
+        {
+            _equipmentLoading = false;
+        }
+    }
+
+    private async Task LoadApplicableNoticesAsync()
+    {
+        _applicableNotices = await Notices.GetApplicableAsync(QuoteNoticeTarget.Ember);
+        _selectedNoticeIds = _applicableNotices.Select(n => n.Id).ToHashSet();
+    }
+
+    private void SelectShippingGroup(int shippingGroupId)
+    {
+        _selectedShippingGroupId = shippingGroupId;
+        _shippingGroupSaveSuccess = false;
+
+        try
+        {
+            CompanyGroups.Save(CompanyShippingGroupsScope, _companyId, shippingGroupId);
+            _shippingGroupSaveSuccess = true;
+        }
+        catch (Exception ex)
+        {
+            _error = "Failed to save shipping group: " + ex.Message;
+        }
+    }
+
+    private async Task HandleFileSelected(InputFileChangeEventArgs e)
+    {
+        _result = null;
+        _error = null;
+        _submitSuccess = false;
+
+        var bytes = await QuotePdfUpload.ReadPdfAsync(e, msg => _error = msg);
+        if (bytes != null)
+            _pdfBytes = bytes;
+        StateHasChanged();
+    }
+
+    private async Task RunQuery()
+    {
+        if (_pdfBytes == null) return;
+
+        _loading = true;
+        _error = null;
+        _result = null;
+        _customerPrice = 0;
+        _submitSuccess = false;
+        _selectedEquipmentId = null;
+        _jobEquipment = new();
+        _audUsdRate = _configuredRate;
+        _selectedShippingGroupId = null;
+        _shippingGroupSaveSuccess = false;
+        StateHasChanged();
+
+        try
+        {
+            var client = new EmberQuoteExtractor(OpenAi);
+            _result = await client.ExtractAsync(_pdfBytes);
+            RecalculatePrice();
+
+            await LoadApplicableNoticesAsync();
+            await RunJobLookupAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = "Extraction failed: " + ex.Message;
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task RetryJobLookup()
+    {
+        if (_result == null) return;
+
+        _jobLookupLoading = true;
+        _error = null;
+        _selectedEquipmentId = null;
+        _jobEquipment = new();
+        _selectedShippingGroupId = null;
+        _shippingGroupSaveSuccess = false;
+        StateHasChanged();
+
+        try
+        {
+            await RunJobLookupAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = "Job lookup failed: " + ex.Message;
+        }
+        finally
+        {
+            _jobLookupLoading = false;
+        }
+    }
+
+    private async Task RunJobLookupAsync()
+    {
+        if (_result == null) return;
+
+        int jobId;
+        if (!int.TryParse(_result.JobNumber, out jobId))
+        {
+            _error = "Could not extract a valid job number from the quote.";
+            return;
+        }
+
+        var companyId = await JobLookup.GetOwnerCompanyIdAsync(jobId);
+        if (companyId is null)
+            throw new Exception("Could not retrieve company ID for job " + jobId);
+        _companyId = companyId.Value;
+
+        await LoadJobEquipmentAsync(jobId);
+
+        var shippingOverrides = CompanyGroups.LoadSaved(CompanyShippingGroupsScope);
+        if (shippingOverrides.TryGetValue(_companyId, out var savedShippingGroupId)
+            && ShippingConfig.Groups.ContainsKey(savedShippingGroupId))
+        {
+            _selectedShippingGroupId = savedShippingGroupId;
+        }
+    }
+
+    private async Task SubmitServices()
+    {
+        if (_result == null || string.IsNullOrEmpty(_selectedEquipmentId)) return;
+        if (_selectedShippingGroupId == null) return;
+
+        _submitting = true;
+        _error = null;
+        _submitSuccess = false;
+        StateHasChanged();
+
+        try
+        {
+            int jobId;
+            if (!int.TryParse(_result.JobNumber, out jobId))
+            {
+                _error = "Could not extract a valid job number from the quote.";
+                return;
+            }
+
+            var lineItems = new List<(string, decimal)>
+            {
+                (EmberServiceDescriptions.GetTechnicalObservationsDescription(_result), 0m),
+                (EmberServiceDescriptions.GetRepairsDescription(_result, _customerPrice, Freight), TotalCost),
+                (EmberServiceDescriptions.GetWorkOrderNotesDescription(_result), 0m),
+            };
+
+            var selectedNotices = _applicableNotices.Where(n => _selectedNoticeIds.Contains(n.Id));
+
+            await QuoteSubmission.SubmitAsync(
+                jobId, _selectedEquipmentId,
+                lineItems, selectedNotices);
+
+            _submitSuccess = true;
+            await Analytics.TrackEventAsync("Quote services created — Ember");
+        }
+        catch (Exception ex)
+        {
+            _error = "Submission failed: " + ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+}

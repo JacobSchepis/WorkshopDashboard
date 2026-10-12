@@ -1,0 +1,22 @@
+﻿@using BlazorBootstrap
+
+@* SubmitSection — the shared "Upload" button: disables itself and swaps its
+   label while OnSubmit is running, so every form using it gets the same
+   busy-state behavior for free. *@
+
+<Button Color="ButtonColor.Primary" @onclick="Submit" Disabled="Busy">
+    @(Busy ? "Uploading..." : "Upload")
+</Button>
+
+@code {
+    [Parameter] public EventCallback OnSubmit { get; set; }
+
+    private bool Busy { get; set; }
+
+    public async Task Submit()
+    {
+        Busy = true;
+        await OnSubmit.InvokeAsync(null);
+        Busy = false;
+    }
+}

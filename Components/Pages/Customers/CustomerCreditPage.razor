@@ -1,0 +1,172 @@
+@page "/customer-credit"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject ScopeCustomerStore Customers
+@inject ICustomerCreditSource CreditLookup
+
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.External.Google
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    CustomerCredit — read-only view of a scope customer's credit, sourced
+    live from the shared Google Sheet (credit is no longer managed on JMS).
+
+    Each ScopeCustomer optionally carries a CreditSheetTabName (set on
+    ScopeCustomerManager.razor, exact match against the sheet's tab titles —
+    tab names don't necessarily match JMS company names, so this isn't
+    auto-derived). Only customers with that field set are selectable here;
+    everyone else is listed but greyed out as a reminder to link them.
+
+    CustomerCreditLookup does the actual Sheets API read — see that class for
+    the fixed row/column layout this depends on.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Customer Credit</h1>
+    <p class="text-muted">
+        Live from the credit-tracking Google Sheet — credit is no longer managed on JMS. Pick a
+        customer below to see their credit tab. Customers greyed out have no credit sheet tab
+        linked yet; add one on the
+        <a href="scope-customers">Scope Customer Manager</a>.
+    </p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else
+{
+    <div class="row g-4">
+        <div class="col-md-4">
+            <Card>
+                <CardHeader>Customers (@_customers.Count)</CardHeader>
+                <CardBody>
+                    <input class="form-control mb-3" placeholder="Filter by name..."
+                           value="@_filter" @oninput="@(e => _filter = e.Value?.ToString() ?? "")" />
+
+                    <div class="list-group">
+                        @foreach (var c in _customers
+                            .Where(c => string.IsNullOrWhiteSpace(_filter) || c.DisplayName.Contains(_filter, StringComparison.OrdinalIgnoreCase))
+                            .OrderBy(c => c.DisplayName, StringComparer.OrdinalIgnoreCase))
+                        {
+                            var linked = !string.IsNullOrWhiteSpace(c.CreditSheetTabName);
+                            <button type="button"
+                                    class="list-group-item list-group-item-action @(c.DisplayName == _selected?.DisplayName ? "active" : "")"
+                                    disabled="@(!linked)"
+                                    @onclick="() => SelectAsync(c)">
+                                @c.DisplayName
+                                @if (!linked)
+                                {
+                                    <span class="text-muted small d-block">No credit sheet linked</span>
+                                }
+                            </button>
+                        }
+                    </div>
+                </CardBody>
+            </Card>
+        </div>
+
+        <div class="col-md-8">
+            @if (_selected is null)
+            {
+                <p class="text-muted">Select a customer to view their credit.</p>
+            }
+            else if (_loadingCredit)
+            {
+                <div class="d-flex align-items-center gap-2">
+                    <Spinner Color="SpinnerColor.Primary" />
+                    <span>Loading credit for @_selected.DisplayName...</span>
+                </div>
+            }
+            else if (_credit is { Error: { Length: > 0 } })
+            {
+                <Alert Color="AlertColor.Danger">@_credit.Error</Alert>
+            }
+            else if (_credit is not null)
+            {
+                <Card Class="mb-4">
+                    <CardHeader>@_selected.DisplayName — Totals</CardHeader>
+                    <CardBody>
+                        <div class="row g-3">
+                            <div class="col-6">
+                                <div class="text-muted small text-uppercase">Total Accrued</div>
+                                <div class="fs-4 fw-bold">@(string.IsNullOrWhiteSpace(_credit.TotalAccrued) ? "—" : _credit.TotalAccrued)</div>
+                            </div>
+                            <div class="col-6">
+                                <div class="text-muted small text-uppercase">Total Remaining</div>
+                                <div class="fs-4 fw-bold">@(string.IsNullOrWhiteSpace(_credit.TotalRemaining) ? "—" : _credit.TotalRemaining)</div>
+                            </div>
+                        </div>
+                    </CardBody>
+                </Card>
+
+                <Card>
+                    <CardHeader>Credit Lines (@_credit.Lines.Count)</CardHeader>
+                    <CardBody>
+                        @if (_credit.Lines.Count == 0)
+                        {
+                            <p class="text-muted mb-0">No credit lines recorded.</p>
+                        }
+                        else
+                        {
+                            <Grid TItem="CreditLine" Class="table table-striped align-middle mb-0" Data="_credit.Lines">
+                                <GridColumns>
+                                    <GridColumn TItem="CreditLine" HeaderText="Serial Number">@context.SerialNumber</GridColumn>
+                                    <GridColumn TItem="CreditLine" HeaderText="Model">@context.Model</GridColumn>
+                                    <GridColumn TItem="CreditLine" HeaderText="Credit Gained">@context.CreditGained</GridColumn>
+                                    <GridColumn TItem="CreditLine" HeaderText="Credit Deducted">@context.CreditDeducted</GridColumn>
+                                    <GridColumn TItem="CreditLine" HeaderText="Date">@context.Date</GridColumn>
+                                    <GridColumn TItem="CreditLine" HeaderText="Quote No.">@context.QuoteNo</GridColumn>
+                                    <GridColumn TItem="CreditLine" HeaderText="Purchase Offer No.">@context.PurchaseOfferNo</GridColumn>
+                                    <GridColumn TItem="CreditLine" HeaderText="Remaining Balance">@context.RemainingBalance</GridColumn>
+                                </GridColumns>
+                            </Grid>
+                        }
+                    </CardBody>
+                </Card>
+            }
+        </div>
+    </div>
+}
+
+@code {
+    private bool _loading = true;
+    private List<ScopeCustomer> _customers = new();
+    private string _filter = "";
+
+    private ScopeCustomer? _selected;
+    private bool _loadingCredit;
+    private CustomerCredit? _credit;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        _customers = await Customers.LoadAsync();
+        _loading = false;
+    }
+
+    private async Task SelectAsync(ScopeCustomer customer)
+    {
+        if (string.IsNullOrWhiteSpace(customer.CreditSheetTabName)) return;
+
+        _selected = customer;
+        _credit = null;
+        _loadingCredit = true;
+        StateHasChanged();
+
+        _credit = await CreditLookup.GetCreditAsync(customer.CreditSheetTabName);
+
+        _loadingCredit = false;
+        StateHasChanged();
+    }
+}

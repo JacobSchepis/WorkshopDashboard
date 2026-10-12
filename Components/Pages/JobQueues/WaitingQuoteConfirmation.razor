@@ -1,0 +1,241 @@
+@page "/waiting-quote-confirmation"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject ScopeJobStore ScopeJobs
+@inject WaitingQuoteConfirmationService Confirmations
+@inject JobTouchService JobTouch
+@inject ILogger<WaitingQuoteConfirmation> Logger
+
+@using System.Globalization
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    WaitingQuoteConfirmation — jobs sitting on an unapproved quote, waiting
+    for the customer to confirm. Oldest-first queue with inline follow-up
+    date editing and a "mark worked today" action.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      ScopeJobs     — ScopeJobStore: excluded-model list applied to the queue
+      Confirmations — WaitingQuoteConfirmationService: GetJobsAsync (the
+                      queue itself) and SaveFollowUpAsync (per-job follow-up
+                      date, stored as a job service)
+      JobTouch      — JobTouchService: TouchLastWorkedAsync bumps "last
+                      worked" to today without any other status change
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      LoadJobsAsync wraps each WqcJobRecord in a JobRow carrying its own
+      per-row UI state (FollowUpInput, saving/touching flags) so edits to
+      one row don't need to re-render the whole table. "Email Customer" opens
+      the owner's Waiting Quote page (WaitingQuoteDetail), which sends the
+      reminder email covering all of that customer's outstanding quotes.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Waiting Quote Confirmation</h1>
+    <p class="text-muted">Jobs waiting on the customer to confirm a quote. Oldest first.</p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else if (_jobs.Count == 0)
+{
+    <Callout Color="CalloutColor.Info">No jobs in this queue.</Callout>
+}
+else
+{
+    <p class="text-muted">@_jobs.Count job(s) in queue.</p>
+    <table class="table table-striped align-middle">
+        <thead>
+            <tr>
+                <th>Job ID</th>
+                <th>Owner</th>
+                <th>Equipment</th>
+                <th>Fault</th>
+                <th>Waiting Since</th>
+                <th>Unapproved Quote(s)</th>
+                <th>Last Follow Up</th>
+                <th>Last Worked</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var job in _jobs)
+            {
+                <tr>
+                    <td>
+                        <a href="@JmsLinks.JobSummary(job.JobId)"
+                           target="_blank" rel="noopener noreferrer">@job.JobId</a>
+                    </td>
+                    <td>@job.Owner</td>
+                    <td>@job.Equipment</td>
+                    <td>@job.Fault</td>
+                    <td class="@StatusAgeClass(job.FirstSetDate)">
+                        @(job.FirstSetDate == DateTime.MinValue
+                            ? "—"
+                            : $"{(int)(DateTime.Today - job.FirstSetDate.Date).TotalDays} days ({job.FirstSetDate:dd MMM yyyy})")
+                    </td>
+                    <td>
+                        @if (job.Quotes.Count == 0)
+                        {
+                            <span class="text-muted">—</span>
+                        }
+                        else
+                        {
+                            foreach (var quote in job.Quotes)
+                            {
+                                <div class="mb-1">
+                                    <a href="@JmsLinks.JobSummary(job.JobId)"
+                                       target="_blank" rel="noopener noreferrer">Q-@quote.QuoteId</a>
+                                    <span>$@quote.Price.ToString("N2") inc GST</span>
+                                    <span class="text-muted">($@quote.PriceExGst.ToString("N2") ex GST)</span>
+                                    <div class="small text-muted">@quote.QuoteDate.ToString("dd MMM yyyy")</div>
+                                </div>
+                            }
+                        }
+                    </td>
+                    <td>
+                        @if (job.FollowUp.HasValue)
+                        {
+                            <div>@job.FollowUp.Value.ToString("dd MMM yyyy")</div>
+                        }
+                        else
+                        {
+                            <div class="text-muted">Not set</div>
+                        }
+                        <div class="d-flex gap-1 mt-1">
+                            <input type="date" class="form-control form-control-sm" style="width:auto;" @bind="job.FollowUpInput" />
+                            <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                    Disabled="job.SavingFollowUp" @onclick="() => SaveFollowUpAsync(job)">
+                                @(job.SavingFollowUp ? "Saving..." : "Save")
+                            </Button>
+                        </div>
+                    </td>
+                    <td class="@StatusAgeClass(job.LastWorked)">
+                        @(job.LastWorked?.ToString("dd MMM yyyy") ?? "Never")
+                    </td>
+                    <td>
+                        <Button Type="ButtonType.Link" To="@CustomerEmailUrl(job)" Size="ButtonSize.Small"
+                                Color="ButtonColor.Primary" Outline="true" Disabled="job.Record.OwnerCompanyId == 0">
+                            Email Customer
+                        </Button>
+                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                Disabled="job.TouchingLastWorked" @onclick="() => TouchLastWorkedAsync(job)">
+                            @(job.TouchingLastWorked ? "..." : "Mark Worked")
+                        </Button>
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private bool _loading = true;
+    private List<JobRow> _jobs = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        await LoadJobsAsync();
+    }
+
+    private async Task LoadJobsAsync()
+    {
+        var exclusions = await ScopeJobs.LoadAsync();
+        var records = await Confirmations.GetJobsAsync(exclusions);
+
+        _jobs = records
+            .Select(r => new JobRow
+            {
+                Record = r,
+                FollowUpInput = r.FollowUp
+            })
+            .ToList();
+
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private static string CustomerEmailUrl(JobRow job) =>
+        $"/waiting-quote/{Uri.EscapeDataString(job.Owner)}/{job.Record.OwnerCompanyId}";
+
+    private async Task TouchLastWorkedAsync(JobRow job)
+    {
+        job.TouchingLastWorked = true;
+        StateHasChanged();
+
+        try
+        {
+            await JobTouch.TouchLastWorkedAsync(int.Parse(job.JobId),
+                msg => Logger.LogWarning("{Message}", msg));
+            await LoadJobsAsync();
+        }
+        finally
+        {
+            job.TouchingLastWorked = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task SaveFollowUpAsync(JobRow job)
+    {
+        if (job.FollowUpInput is not { } followUp) return;
+
+        job.SavingFollowUp = true;
+        StateHasChanged();
+
+        try
+        {
+            var ok = await Confirmations.SaveFollowUpAsync(int.Parse(job.JobId), job.FollowUpServiceId, followUp,
+                msg => Logger.LogWarning("{Message}", msg));
+            if (ok) await LoadJobsAsync();
+        }
+        finally
+        {
+            job.SavingFollowUp = false;
+            StateHasChanged();
+        }
+    }
+
+    private static string StatusAgeClass(DateTime? date)
+    {
+        if (date is null || date == DateTime.MinValue) return "text-stale-danger";
+        var days = (DateTime.Today - date.Value.Date).TotalDays;
+        if (days >= 7) return "text-stale-danger";
+        if (days >= 5) return "text-stale-warn";
+        return "";
+    }
+
+    private class JobRow
+    {
+        public required WqcJobRecord Record { get; init; }
+
+        public string JobId => Record.JobId;
+        public string Owner => Record.Owner;
+        public string Equipment => Record.Equipment;
+        public string Fault => Record.Fault;
+        public DateTime FirstSetDate => Record.FirstSetDate;
+        public DateTime? LastWorked => Record.LastWorked;
+        public DateTime? FollowUp => Record.FollowUp;
+        public int? FollowUpServiceId => Record.FollowUpServiceId;
+        public List<WqcQuoteInfo> Quotes => Record.Quotes;
+
+        public bool TouchingLastWorked { get; set; }
+        public DateTime? FollowUpInput { get; set; }
+        public bool SavingFollowUp { get; set; }
+    }
+}

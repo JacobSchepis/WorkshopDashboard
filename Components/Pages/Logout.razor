@@ -1,0 +1,25 @@
+@page "/logout"
+@using Microsoft.AspNetCore.Authentication
+@using Microsoft.AspNetCore.Authentication.Cookies
+@using WorkshopDashboard.Services.Accounts
+@inject NavigationManager Nav
+@inject UserAccountService Accounts
+
+@code {
+    [CascadingParameter]
+    public HttpContext HttpContext { get; set; } = default!;
+
+    protected override async Task OnInitializedAsync()
+    {
+        // Drop their JMS session too, so it doesn't linger after they've left.
+        var username = HttpContext.User.Identity?.Name;
+        if (!string.IsNullOrEmpty(username)) Accounts.Logout(username);
+
+        // Sign out of YOUR cookie scheme
+        await HttpContext.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+
+        HttpContext.Session.Clear();
+
+        Nav.NavigateTo("/login", forceLoad: true);
+    }
+}

@@ -1,0 +1,81 @@
+@inherits LayoutComponentBase
+
+<main class="kiosk-main">
+    <JmsOfflineBanner />
+    @Body
+</main>
+
+@*
+    Wall-mounted kiosk screens have nobody there to scroll them, so content that doesn't fit
+    one screen must scroll itself. By default this watches .kiosk-main's own scrollable area
+    (not the window — .kiosk-main is a fixed-height, overflow-hidden box, see
+    KioskLayout.razor.css) and, only when its content is actually taller than the screen,
+    slowly scrolls down, pauses at the bottom to read, jumps back to the top, pauses, and
+    repeats.
+
+    A page can opt out of scrolling the whole screen and instead scroll just one box on it —
+    e.g. a table that can grow long while the rest of the layout (header, other cards) should
+    stay put — by marking that box's own scrollable element (the one with overflow-y set, not
+    a wrapping Card) with class="kiosk-scroll". When any .kiosk-scroll boxes exist on the page,
+    those are what get auto-scrolled instead of .kiosk-main; see WorkshopNotifications.razor's
+    "Incoming shipments" table for an example. Pages with no .kiosk-scroll box keep the
+    original whole-page behaviour unchanged.
+
+    Re-measures every tick rather than once on load, so it keeps working as Blazor's periodic
+    reloads change how much content there is (e.g. more/fewer rule alerts or shipments), and
+    per-element scroll state is tracked in a WeakMap so it survives re-renders as long as the
+    element itself isn't replaced. Plain JS, no interop — nothing here needs to call back into
+    .NET, and a self-contained loop survives Blazor Server's periodic re-renders without
+    needing to be restarted from C# after each one.
+*@
+<script>
+    (function () {
+        if (window.__kioskAutoScrollStarted) return;
+        window.__kioskAutoScrollStarted = true;
+
+        const scrollStep = 1;       // px per tick, scrolling down
+        const tickMs = 30;          // ms between ticks
+        const pauseAtBottomMs = 4000;
+        const pauseAtTopMs = 1500;
+
+        const states = new WeakMap();
+
+        function advance(el, state) {
+            const maxScroll = el.scrollHeight - el.clientHeight;
+
+            if (maxScroll <= 2) {
+                // Fits in the box — stay pinned at the top, nothing to scroll.
+                el.scrollTop = 0;
+                return;
+            }
+
+            if (Date.now() < state.pausedUntil) return;
+
+            if (state.goingDown) {
+                el.scrollTop = Math.min(el.scrollTop + scrollStep, maxScroll);
+                if (el.scrollTop >= maxScroll) {
+                    state.pausedUntil = Date.now() + pauseAtBottomMs;
+                    state.goingDown = false;
+                }
+            } else {
+                el.scrollTop = 0;
+                state.pausedUntil = Date.now() + pauseAtTopMs;
+                state.goingDown = true;
+            }
+        }
+
+        function tick() {
+            const scoped = document.querySelectorAll('.kiosk-scroll');
+            const targets = scoped.length > 0 ? scoped : document.querySelectorAll('.kiosk-main');
+
+            targets.forEach(el => {
+                if (!states.has(el)) states.set(el, { goingDown: true, pausedUntil: 0 });
+                advance(el, states.get(el));
+            });
+
+            setTimeout(tick, tickMs);
+        }
+
+        tick();
+    })();
+</script>

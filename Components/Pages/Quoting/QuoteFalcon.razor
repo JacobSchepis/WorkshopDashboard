@@ -1,0 +1,417 @@
+@page "/quote-falcon"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+
+@using WorkshopDashboard.Services.Quoting.Falcon
+@using static WorkshopDashboard.Services.Quoting.Falcon.FalconPricingConfig
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Quoting
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Analytics
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+@using WorkshopDashboard.Components.Pages.Quoting.Cards
+
+@inject IConfiguration Configuration
+@inject IJsonCompletionClient OpenAi
+@inject CompanyGroupStore CompanyGroups
+@inject QuoteNoticeStore Notices
+@inject JobLookupService JobLookup
+@inject QuoteSubmissionService QuoteSubmission
+@inject AnalyticsService Analytics
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    QuoteFalcon — repairer quote extraction + pricing for Falcon Surgical
+    (Falcon). One of six near-identical per-repairer quoting pages (Apex/Bayside/
+    Cobalt/Dorado/Ember/Falcon) sharing the same upload→extract→submit shape;
+    see QuoteDorado for the fullest write-up. No equipment selector — Falcon
+    quotes are per-instrument line items, each with its own AUD pricing via
+    FalconPricingConfig, not tied to one piece of job equipment.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      (extractor built inline in RunQuery, from src/Services/Quoting/Falcon)
+      Notices          — QuoteNoticeStore: repairer-scope notices
+      JobLookup        — job -> owner company id / name
+      QuoteSubmission  — posts the priced line items back to JMS
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      HandleFileSelected -> RunQuery extracts each instrument line (source
+      text preserved alongside the parsed identifier/qty/notes) and prices
+      it via FalconPricingConfig; the reconciliation callout compares the
+      summed lines (FalconLineTotal) against the quote's printed Subtotal.
+      "Consolidate by item" merges duplicate instruments before submit.
+      SubmitServices posts CustomerTotal as the priced line items.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="container py-4" style="max-width: 1200px;">
+    <div class="page-header">
+        <h1>Falcon Quote Extractor</h1>
+        <p class="text-muted">Upload a Falcon Surgical PDF quote to extract and create services.</p>
+    </div>
+
+    <QuoteUploadCard HasFile="_pdfBytes != null" HasResult="_result != null" Loading="_loading"
+                      Submitting="_submitting" SubmitSuccess="_submitSuccess" Error="@_error"
+                      CanSubmit="!_submitting"
+                      OnFileSelected="HandleFileSelected" OnExtract="RunQuery" OnSubmit="SubmitServices">
+        <ExtraActions>
+            <div class="form-check align-self-center ms-1">
+                <input class="form-check-input" type="checkbox" id="consolidateCheck"
+                       checked="@_consolidateItems"
+                       @onchange="e => _consolidateItems = (bool)(e.Value ?? false)" />
+                <label class="form-check-label small text-muted" for="consolidateCheck">
+                    Consolidate by item
+                </label>
+            </div>
+        </ExtraActions>
+    </QuoteUploadCard>
+
+    @if (_result != null)
+    {
+        @* ── Summary bar ── *@
+        <QuoteSummaryBar JobNumber="@_result.JobNumber" JobNumberChanged="v => _result.JobNumber = v"
+                          RetryLoading="_jobLookupLoading" OnRetry="RetryJobLookup">
+            <ExtraFields>
+                <div>
+                    <div class="text-muted small">Quote Number</div>
+                    <div class="fw-semibold">@(string.IsNullOrWhiteSpace(_result.QuoteNumber) ? "Not found" : _result.QuoteNumber)</div>
+                </div>
+                <div>
+                    <div class="text-muted small">Instruments</div>
+                    <div class="fw-semibold">@_result.LineItems.Count</div>
+                </div>
+                <div>
+                    <div class="text-muted small">Falcon Total (inc GST)</div>
+                    <div class="fw-semibold">@_result.TotalPrice.ToString("C")</div>
+                </div>
+            </ExtraFields>
+        </QuoteSummaryBar>
+
+        @* ── Reconciliation check ── *@
+        <Callout Color="ReconCalloutColor" Class="mb-3">
+            <div class="d-flex justify-content-between align-items-start flex-wrap gap-3">
+                <div>
+                    <div class="fw-semibold">@ReconHeadline</div>
+                    <div class="small">@ReconDetail</div>
+                </div>
+                <div class="small text-end">
+                    <div>Sum of @_result.LineItems.Count line items: <span class="fw-semibold">@_result.FalconLineTotal.ToString("C")</span></div>
+                    <div>Subtotal printed on quote: <span class="fw-semibold">@_result.Subtotal.ToString("C")</span></div>
+                    <div>Variance: <span class="fw-semibold">@_result.SubtotalVariance.ToString("C")</span></div>
+                </div>
+            </div>
+        </Callout>
+
+        @* ── Line items ── *@
+        <Card Class="mb-3">
+            <CardHeader Class="d-flex justify-content-between align-items-center">
+                <span>Line Items</span>
+                <span class="text-muted fw-normal small">Our total: <span class="fw-semibold text-dark">@CustomerTotal.ToString("C")</span></span>
+            </CardHeader>
+            <CardBody Class="p-0">
+                <table class="table table-sm mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th>Description</th>
+                            <th class="text-end" style="width:60px">Qty</th>
+                            <th class="text-end" style="width:90px">Falcon Unit</th>
+                            <th class="text-end" style="width:100px">Our Unit</th>
+                            <th class="text-end" style="width:85px">Falcon Total</th>
+                            <th class="text-end" style="width:85px">Our Total</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @for (int i = 0; i < _result.LineItems.Count; i++)
+                        {
+                            var item = _result.LineItems[i];
+                            var idx = i;
+                            var sourceText = item.SourceText;
+                            var notesText = item.RawNotesText;
+                            var idClass = string.IsNullOrWhiteSpace(item.Identifier)
+                                ? "form-control form-control-sm mb-1 border-warning"
+                                : "form-control form-control-sm mb-1";
+                            <tr class="@(item.IsZeroCost ? "text-muted" : "") align-middle">
+                                <td>
+                                    <div class="row g-2">
+                                        <div class="col-5">
+                                            <div class="falcon-lbl">Source &mdash; as printed on quote</div>
+                                            <pre class="falcon-src">@sourceText</pre>
+                                        </div>
+                                        <div class="col-7">
+                                            <div class="falcon-lbl">Parsed &mdash; as it will be sent</div>
+                                            <div class="d-flex align-items-center gap-1 mb-1">
+                                                <input class="form-control form-control-sm" style="font-size:0.8rem"
+                                                       placeholder="Equipment type"
+                                                       value="@item.EquipmentType"
+                                                       @oninput="e => item.EquipmentType = e.Value?.ToString() ?? string.Empty" />
+                                                <span class="text-muted small">&ndash;</span>
+                                                <input class="form-control form-control-sm" style="font-size:0.8rem"
+                                                       placeholder="Repair action"
+                                                       value="@item.RepairAction"
+                                                       @oninput="e => item.RepairAction = e.Value?.ToString() ?? string.Empty" />
+                                            </div>
+                                            <input class="@idClass" style="font-size:0.8rem"
+                                                   placeholder="No identifier found"
+                                                   value="@item.Identifier"
+                                                   @oninput="e => item.Identifier = e.Value?.ToString()" />
+                                            <textarea class="form-control form-control-sm"
+                                                      rows="3"
+                                                      placeholder="Notes (one per line)"
+                                                      style="font-size:0.8rem; resize:vertical;"
+                                                      value="@notesText"
+                                                      @oninput="e => item.SetNotesFromText(e.Value?.ToString())"></textarea>
+                                        </div>
+                                    </div>
+                                </td>
+                                <td class="text-end">
+                                    <input type="number"
+                                           class="form-control form-control-sm text-end"
+                                           style="width:55px"
+                                           min="1"
+                                           step="1"
+                                           value="@item.Quantity"
+                                           @oninput="e => { if (int.TryParse(e.Value?.ToString(), out var q)) item.Quantity = q; }" />
+                                </td>
+                                <td class="text-end small">@item.UnitPrice.ToString("C")</td>
+                                <td class="text-end">
+                                    @if (item.IsZeroCost)
+                                    {
+                                        <span class="small text-muted">—</span>
+                                    }
+                                    else
+                                    {
+                                        <div class="input-group input-group-sm justify-content-end">
+                                            <span class="input-group-text">$</span>
+                                            <input type="number"
+                                                   class="form-control text-end"
+                                                   style="width:65px"
+                                                   step="0.01"
+                                                   value="@_customerPrices[idx]"
+                                                   @oninput="e => UpdateCustomerPrice(idx, e.Value?.ToString())" />
+                                        </div>
+                                    }
+                                </td>
+                                <td class="text-end small">@item.ExtendedPrice.ToString("C")</td>
+                                <td class="text-end small fw-semibold">@(item.IsZeroCost ? "—" : (item.Quantity * _customerPrices[idx]).ToString("C"))</td>
+                            </tr>
+                        }
+                    </tbody>
+                    <tfoot class="table-light">
+                        <tr>
+                            <td colspan="4" class="text-end fw-semibold small">Falcon Subtotal (summed)</td>
+                            <td class="text-end fw-semibold small">@_result.FalconLineTotal.ToString("C")</td>
+                            <td></td>
+                        </tr>
+                        <tr>
+                            <td colspan="4" class="text-end fw-semibold small">Our Total</td>
+                            <td></td>
+                            <td class="text-end fw-semibold">@CustomerTotal.ToString("C")</td>
+                        </tr>
+                    </tfoot>
+                </table>
+            </CardBody>
+        </Card>
+
+        @* ── Notices ── *@
+        <QuoteNoticesCard Notices="_applicableNotices" SelectedIds="_selectedNoticeIds" />
+    }
+</div>
+
+@code {
+    private byte[]? _pdfBytes;
+    private FalconQuoteExtraction? _result;
+    private List<decimal> _customerPrices = new();
+    private decimal CustomerTotal => _result == null ? 0m :
+        _result.LineItems.Select((item, i) => item.IsZeroCost ? 0m : item.Quantity * _customerPrices[i]).Sum();
+    private int _companyId;
+
+    // ── Reconciliation display (ternaries live here, not in markup) ──
+    private CalloutColor ReconCalloutColor =>
+        _result != null && _result.Reconciles ? CalloutColor.Success : CalloutColor.Danger;
+
+    private string ReconHeadline =>
+        _result == null ? string.Empty
+        : _result.Reconciles
+            ? "Reconciled — every line item accounted for."
+            : "Does NOT reconcile — the extraction missed, duplicated or misread a row.";
+
+    private string ReconDetail =>
+        _result == null ? string.Empty
+        : !_result.Reconciles
+            ? "Do not submit until this balances. Compare the Source column against Parsed to find the bad row."
+            : _result.MissingIdentifierCount > 0
+                ? $"{_result.MissingIdentifierCount} item(s) have no identifier — check the highlighted fields before submitting."
+                : "All items have an identifier.";
+    private bool _loading = false;
+    private bool _submitting = false;
+    private bool _submitSuccess = false;
+    private bool _jobLookupLoading = false;
+    private string? _error;
+
+    private bool _consolidateItems = false;
+
+    private List<QuoteNotice> _applicableNotices = new();
+    private HashSet<Guid> _selectedNoticeIds = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+    }
+
+    private async Task LoadApplicableNoticesAsync()
+    {
+        _applicableNotices = await Notices.GetApplicableAsync(QuoteNoticeTarget.Falcon);
+        _selectedNoticeIds = _applicableNotices.Select(n => n.Id).ToHashSet();
+    }
+
+    private async Task HandleFileSelected(InputFileChangeEventArgs e)
+    {
+        _result = null;
+        _error = null;
+        _submitSuccess = false;
+
+        var bytes = await QuotePdfUpload.ReadPdfAsync(e, msg => _error = msg);
+        if (bytes != null)
+            _pdfBytes = bytes;
+    }
+
+    private async Task RunQuery()
+    {
+        if (_pdfBytes == null) return;
+
+        _loading = true;
+        _error = null;
+        _result = null;
+        _customerPrices = new();
+        _submitSuccess = false;
+        StateHasChanged();
+
+        try
+        {
+            var client = new FalconQuoteExtractor(OpenAi);
+            _result = await client.ExtractAsync(_pdfBytes);
+            _customerPrices = _result.LineItems
+                .Select(i => i.IsZeroCost ? 0m : FalconPricingConfig.GetCustomerPrice(i.UnitPrice))
+                .ToList();
+
+            await LoadApplicableNoticesAsync();
+            await RunJobLookupAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = "Extraction failed: " + ex.Message;
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task RetryJobLookup()
+    {
+        if (_result == null) return;
+
+        _jobLookupLoading = true;
+        _error = null;
+        StateHasChanged();
+
+        try
+        {
+            await RunJobLookupAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = "Job lookup failed: " + ex.Message;
+        }
+        finally
+        {
+            _jobLookupLoading = false;
+        }
+    }
+
+    private async Task RunJobLookupAsync()
+    {
+        if (_result == null) return;
+
+        int jobId;
+        if (!int.TryParse(_result.JobNumber, out jobId))
+        {
+            _error = "Could not extract a valid job number from the quote.";
+            return;
+        }
+
+        var companyId = await JobLookup.GetOwnerCompanyIdAsync(jobId);
+        if (companyId is null)
+            throw new Exception("Could not retrieve company ID for job " + jobId);
+        _companyId = companyId.Value;
+    }
+
+    private void UpdateCustomerPrice(int index, string? value)
+    {
+        if (index >= 0 && index < _customerPrices.Count)
+            _customerPrices[index] = decimal.TryParse(value, out var d) ? d : 0m;
+    }
+
+    private async Task SubmitServices()
+    {
+        if (_result == null) return;
+
+        _submitting = true;
+        _error = null;
+        _submitSuccess = false;
+        StateHasChanged();
+
+        try
+        {
+            int jobId;
+            if (!int.TryParse(_result.JobNumber, out jobId))
+            {
+                _error = "Could not extract a valid job number from the quote.";
+                return;
+            }
+
+            // Consolidated: one line per item using qty * unit price as the total cost
+            // Expanded: one line per individual unit
+            var lineItems = new List<(string, decimal)>();
+            for (int i = 0; i < _result.LineItems.Count; i++)
+            {
+                var item = _result.LineItems[i];
+                var unitPrice = _customerPrices[i];
+
+                if (_consolidateItems)
+                {
+                    lineItems.Add((item.ServiceDescription, item.Quantity * unitPrice));
+                }
+                else
+                {
+                    for (int unit = 0; unit < item.Quantity; unit++)
+                        lineItems.Add((item.ServiceDescription, unitPrice));
+                }
+            }
+
+            var selectedNotices = _applicableNotices.Where(n => _selectedNoticeIds.Contains(n.Id));
+
+            // No rigid/flex distinction — Falcon is surgical instruments only.
+            await QuoteSubmission.SubmitAsync(
+                jobId, equipmentId: "",
+                lineItems, selectedNotices);
+
+            _submitSuccess = true;
+            await Analytics.TrackEventAsync("Quote services created — Falcon");
+        }
+        catch (Exception ex)
+        {
+            _error = "Submission failed: " + ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+}

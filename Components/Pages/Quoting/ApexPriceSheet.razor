@@ -1,0 +1,263 @@
+@page "/apex-price-sheet"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+
+@using BlazorBootstrap
+@using WorkshopDashboard.Data
+@using WorkshopDashboard.Services.Stores
+
+@inject ApexPriceSheetStore PriceSheet
+@inject IWebHostEnvironment Env
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    ApexPriceSheet — Apex's flexible repair price sheet (USD), which
+    QuoteInHouseFlex prices repairs from. Confidential, so it lives only in
+    the database: import it from App_Data/apex-pricing.csv (copied onto the
+    server by hand) or upload a CSV. Every import previews what would change
+    — lines added/removed, price changes — before replacing the stored sheet.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Apex Price Sheet</h1>
+    <p class="text-muted">Apex's flexible repair prices (USD), used to price in-house flex quotes.</p>
+</div>
+
+@if (_error != null)
+{
+    <Callout Color="CalloutColor.Danger" Class="mb-3">@_error</Callout>
+}
+@if (_message != null)
+{
+    <Callout Color="CalloutColor.Success" Class="mb-3">@_message</Callout>
+}
+
+<Card Class="mb-3">
+    <CardHeader>Import</CardHeader>
+    <CardBody>
+        @if (_preview == null)
+        {
+            <div class="d-flex gap-4 flex-wrap align-items-end">
+                <div>
+                    <div class="small text-muted mb-1">
+                        From the server: <code>App_Data/@ApexPriceSheetStore.DefaultFileName</code>
+                        @if (_serverFile != null)
+                        {
+                            <span>· updated @_serverFile.LastWriteTime.ToString("d MMM yyyy h:mm tt")</span>
+                        }
+                        else
+                        {
+                            <span>· not there</span>
+                        }
+                    </div>
+                    <Button Color="ButtonColor.Primary" Size="ButtonSize.Small" Disabled="@(_serverFile == null || _busy)" @onclick="PreviewServerFileAsync">
+                        Check for changes
+                    </Button>
+                </div>
+                <div>
+                    <div class="small text-muted mb-1">Or upload a CSV</div>
+                    <InputFile OnChange="PreviewUploadAsync" accept=".csv" class="form-control form-control-sm" disabled="@_busy" />
+                </div>
+            </div>
+            <div class="form-text mt-2">
+                Columns: line_item, code, description, category, price_usd. Importing replaces the whole sheet, after showing you what would change.
+            </div>
+        }
+        else if (!_preview.HasChanges)
+        {
+            <p class="mb-2">That file is the same as the stored sheet (@_preview.Incoming.Count lines) — nothing to import.</p>
+            <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" @onclick="CancelPreview">OK</Button>
+        }
+        else
+        {
+            <p class="mb-2">
+                <strong>@_preview.Incoming.Count lines</strong> in the file.
+                @_preview.Added.Count added · @_preview.Removed.Count removed ·
+                @_preview.PriceChanged.Count price change@(_preview.PriceChanged.Count == 1 ? "" : "s") ·
+                @_preview.DescriptionChanged description change@(_preview.DescriptionChanged == 1 ? "" : "s")
+            </p>
+
+            @if (_preview.PriceChanged.Count > 0)
+            {
+                <div class="small fw-semibold mb-1">Price changes</div>
+                <table class="table table-sm mb-3">
+                    <tbody>
+                        @foreach (var (old, @new) in _preview.PriceChanged)
+                        {
+                            <tr>
+                                <td class="text-nowrap">@old.Code</td>
+                                <td>@Truncate(@new.Description)</td>
+                                <td class="text-end text-nowrap">@old.PriceUsd.ToString("C") → <strong>@(@new.PriceUsd.ToString("C"))</strong></td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
+            @if (_preview.Added.Count > 0)
+            {
+                <div class="small fw-semibold mb-1">Added</div>
+                <ul class="small mb-3">
+                    @foreach (var l in _preview.Added.Take(50))
+                    {
+                        <li>@l.Code — @Truncate(l.Description) (@l.PriceUsd.ToString("C"))</li>
+                    }
+                    @if (_preview.Added.Count > 50)
+                    {
+                        <li class="text-muted">…and @(_preview.Added.Count - 50) more</li>
+                    }
+                </ul>
+            }
+            @if (_preview.Removed.Count > 0)
+            {
+                <div class="small fw-semibold mb-1">Removed</div>
+                <ul class="small mb-3">
+                    @foreach (var l in _preview.Removed)
+                    {
+                        <li>@l.Code — @Truncate(l.Description)</li>
+                    }
+                </ul>
+            }
+
+            <div class="d-flex gap-2">
+                <Button Color="ButtonColor.Primary" Size="ButtonSize.Small" Loading="_busy" @onclick="ApplyAsync">Import</Button>
+                <Button Color="ButtonColor.Secondary" Size="ButtonSize.Small" Outline="true" Disabled="_busy" @onclick="CancelPreview">Cancel</Button>
+            </div>
+        }
+    </CardBody>
+</Card>
+
+<Card>
+    <CardHeader Class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <span>Price lines <span class="text-muted">(@_lines.Count)</span></span>
+        <input type="search" class="form-control form-control-sm" style="max-width: 320px;" placeholder="Search code or words, e.g. bending GIF"
+               value="@_search" @oninput="e => _search = e.Value?.ToString() ?? string.Empty" />
+    </CardHeader>
+    <CardBody>
+        @if (_lines.Count == 0)
+        {
+            <p class="text-muted mb-0">No price sheet imported yet.</p>
+        }
+        else
+        {
+            var shown = string.IsNullOrWhiteSpace(_search) ? _lines.Take(100).ToList() : ApexPriceSheetStore.Search(_lines, _search, 100);
+            <table class="table table-sm align-middle mb-0">
+                <thead>
+                    <tr>
+                        <th>Code</th>
+                        <th>Repair</th>
+                        <th>Category</th>
+                        <th class="text-end">USD</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var l in shown)
+                    {
+                        <tr>
+                            <td class="text-nowrap">@l.Code</td>
+                            <td class="small">@l.Description</td>
+                            <td class="small text-muted text-nowrap">@l.Category</td>
+                            <td class="text-end text-nowrap">@l.PriceUsd.ToString("C")</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+            @if (shown.Count == 100)
+            {
+                <p class="text-muted small mt-2 mb-0">Showing the first 100 — search to narrow it down.</p>
+            }
+            else if (shown.Count == 0)
+            {
+                <p class="text-muted small mt-2 mb-0">Nothing matches.</p>
+            }
+        }
+    </CardBody>
+</Card>
+
+@code {
+    private List<ApexPriceLine> _lines = new();
+    private string _search = "";
+    private FileInfo? _serverFile;
+    private ApexPriceSheetDiff? _preview;
+    private bool _busy;
+    private string? _error;
+    private string? _message;
+
+    private string ServerFilePath => Path.Combine(Env.ContentRootPath, "App_Data", ApexPriceSheetStore.DefaultFileName);
+
+    protected override async Task OnInitializedAsync()
+    {
+        _lines = await PriceSheet.LoadAsync();
+        RefreshServerFile();
+    }
+
+    private void RefreshServerFile()
+    {
+        var file = new FileInfo(ServerFilePath);
+        _serverFile = file.Exists ? file : null;
+    }
+
+    private async Task PreviewServerFileAsync()
+    {
+        RefreshServerFile();
+        if (_serverFile == null) return;
+        await PreviewAsync(() => Task.FromResult<Stream>(File.OpenRead(ServerFilePath)));
+    }
+
+    private async Task PreviewUploadAsync(InputFileChangeEventArgs e)
+    {
+        await PreviewAsync(async () =>
+        {
+            // Copy into memory first — the browser stream can't be read synchronously by the CSV parser.
+            var ms = new MemoryStream();
+            await e.File.OpenReadStream(maxAllowedSize: 5 * 1024 * 1024).CopyToAsync(ms);
+            ms.Position = 0;
+            return ms;
+        });
+    }
+
+    private async Task PreviewAsync(Func<Task<Stream>> open)
+    {
+        _error = null;
+        _message = null;
+        _busy = true;
+        try
+        {
+            await using var stream = await open();
+            _preview = await PriceSheet.PreviewAsync(stream);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task ApplyAsync()
+    {
+        if (_preview == null) return;
+        _busy = true;
+        try
+        {
+            await PriceSheet.ReplaceAllAsync(_preview.Incoming);
+            _message = $"Imported {_preview.Incoming.Count} price lines.";
+            _preview = null;
+            _lines = await PriceSheet.LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = "Import failed: " + ex.Message;
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private void CancelPreview() => _preview = null;
+
+    private static string Truncate(string text, int max = 110) =>
+        text.Length <= max ? text : text[..max] + "…";
+}

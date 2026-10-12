@@ -1,0 +1,187 @@
+@page "/jms-uptime"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@inject JmsUptimeStore UptimeStore
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    JmsUptime — reads the outage history JmsUptimeMonitorService records
+    (JmsUptimeStore, one-minute pings against
+    JMS) and shows it as a month calendar
+    (downtime per day) plus this-week/this-month totals. See
+    JmsUptimeReport for the day-splitting/summing logic.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>JMS Uptime</h1>
+</div>
+
+@if (_loading)
+{
+    <Spinner Color="SpinnerColor.Primary" />
+}
+else
+{
+    <div class="mb-3">
+        @if (_isCurrentlyUp)
+        {
+            <span class="badge bg-success" style="font-size:1rem;">🟢 JMS is up</span>
+        }
+        else
+        {
+            <span class="badge bg-danger" style="font-size:1rem;">🔴 JMS is down</span>
+        }
+    </div>
+
+    <div class="d-flex gap-3 mb-4">
+        <div class="card p-3">
+            <div class="text-muted small">This week</div>
+            <div class="fs-4">@FormatDuration(_thisWeekTotal)</div>
+        </div>
+        <div class="card p-3">
+            <div class="text-muted small">This month</div>
+            <div class="fs-4">@FormatDuration(_thisMonthTotal)</div>
+        </div>
+    </div>
+
+    <div class="d-flex align-items-center gap-2 mb-3">
+        <Button Color="ButtonColor.Secondary" Outline="true" Size="ButtonSize.Small" @onclick="PrevMonth">←</Button>
+        <h5 class="mb-0">@_viewedMonth.ToString("MMMM yyyy")</h5>
+        <Button Color="ButtonColor.Secondary" Outline="true" Size="ButtonSize.Small" @onclick="NextMonth">→</Button>
+    </div>
+
+    <table class="table table-bordered text-center align-middle" style="max-width:700px;">
+        <thead>
+            <tr>
+                @foreach (var d in WeekdayHeaders)
+                {
+                    <th>@d</th>
+                }
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var week in _calendarWeeks)
+            {
+                <tr>
+                    @foreach (var day in week)
+                    {
+                        @if (day is null)
+                        {
+                            <td class="bg-body-tertiary"></td>
+                        }
+                        else
+                        {
+                            var downtime = _dailyDowntime.GetValueOrDefault(day.Value);
+                            <td class="@(downtime > TimeSpan.Zero ? "text-danger" : "")">
+                                <div>@day.Value.Day</div>
+                                @if (downtime > TimeSpan.Zero)
+                                {
+                                    <div class="small">@FormatDuration(downtime)</div>
+                                }
+                            </td>
+                        }
+                    }
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private static readonly string[] WeekdayHeaders = { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
+
+    private bool _loading = true;
+    private DateTime _viewedMonth = new(DateTime.Today.Year, DateTime.Today.Month, 1);
+    private List<JmsOutagePeriod> _periods = new();
+    private Dictionary<DateTime, TimeSpan> _dailyDowntime = new();
+    private List<List<DateTime?>> _calendarWeeks = new();
+    private TimeSpan _thisWeekTotal;
+    private TimeSpan _thisMonthTotal;
+    private bool _isCurrentlyUp = true;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        _loading = true;
+        StateHasChanged();
+
+        _periods = await UptimeStore.LoadAsync();
+        _isCurrentlyUp = !_periods.Any(p => p.EndedAt == null);
+
+        var monthStart = _viewedMonth;
+        var monthEnd = monthStart.AddMonths(1);
+        _dailyDowntime = JmsUptimeReport.DailyDowntime(_periods, monthStart, monthEnd);
+        _calendarWeeks = BuildCalendarGrid(monthStart, monthEnd);
+
+        var today = DateTime.Today;
+        var daysSinceMonday = ((int)today.DayOfWeek + 6) % 7;
+        var weekStart = today.AddDays(-daysSinceMonday);
+        _thisWeekTotal = JmsUptimeReport.TotalDowntime(_periods, weekStart, weekStart.AddDays(7));
+
+        var thisMonthStart = new DateTime(today.Year, today.Month, 1);
+        _thisMonthTotal = JmsUptimeReport.TotalDowntime(_periods, thisMonthStart, thisMonthStart.AddMonths(1));
+
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private static List<List<DateTime?>> BuildCalendarGrid(DateTime monthStart, DateTime monthEndExclusive)
+    {
+        var weeks = new List<List<DateTime?>>();
+        var firstWeekday = ((int)monthStart.DayOfWeek + 6) % 7; // Monday = 0
+
+        var current = new List<DateTime?>();
+        for (var i = 0; i < firstWeekday; i++) current.Add(null);
+
+        for (var day = monthStart; day < monthEndExclusive; day = day.AddDays(1))
+        {
+            current.Add(day);
+            if (current.Count == 7)
+            {
+                weeks.Add(current);
+                current = new List<DateTime?>();
+            }
+        }
+
+        if (current.Count > 0)
+        {
+            while (current.Count < 7) current.Add(null);
+            weeks.Add(current);
+        }
+
+        return weeks;
+    }
+
+    private async Task PrevMonth()
+    {
+        _viewedMonth = _viewedMonth.AddMonths(-1);
+        await LoadAsync();
+    }
+
+    private async Task NextMonth()
+    {
+        _viewedMonth = _viewedMonth.AddMonths(1);
+        await LoadAsync();
+    }
+
+    private static string FormatDuration(TimeSpan span)
+    {
+        if (span <= TimeSpan.Zero) return "—";
+        if (span.TotalHours >= 1) return $"{(int)span.TotalHours}h {span.Minutes}m";
+        return $"{(int)span.TotalMinutes}m";
+    }
+}

@@ -1,0 +1,404 @@
+@page "/shipping-checks"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+
+@using System.Diagnostics
+@using System.Globalization
+@using System.Text.RegularExpressions
+@using CsvHelper
+@using CsvHelper.Configuration
+@using Microsoft.AspNetCore.Components.Authorization
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.External.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@inject TrackingService TrackingService
+@inject ShippingJobLookup Jobs
+@inject TimesheetLoggingService TimesheetLogging
+@inject CurrentUserResolver CurrentUser
+@inject AuthenticationStateProvider AuthStateProvider
+@inject ILogger<ShippingChecks> Logger
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    ShippingChecks — three independent job-status queues shown as stacked
+    tables, each with live carrier tracking resolved from the job's connote/
+    notes: Waiting For Arrival At Workshop, Waiting Outward Shipping, Unit
+    Departed Workshop.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      Jobs            — ShippingJobLookup: GetJobsAsync per status id
+      TrackingService — PrimeAllAsync (logs into JMLA + bulk-fetches once,
+                        before any per-job lookups) then GetJobTrackingAsync
+                        per job
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      GetStuff loads all three job lists in parallel, primes the tracking
+      cache once, then fetches tracking for all three lists in parallel —
+      each job's tracking result populates its dictionary and re-renders
+      immediately (LoadTrackingAsync calls StateHasChanged per result, not
+      once at the end) so the table fills in progressively.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Shipping Checks</h1>
+</div>
+
+<!-- ───────────────────────── Waiting For Arrival At Workshop ───────────────────────── -->
+
+<h5>Waiting For Arrival At Workshop</h5>
+
+@if (_loadingArrival)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else if (_arrivalJobs.Count == 0)
+{
+    <Callout Color="CalloutColor.Info">No jobs found.</Callout>
+}
+else
+{
+    <table class="table table-striped align-middle">
+        <thead>
+            <tr>
+                <th>Job</th>
+                <th>Owner</th>
+                <th>Model</th>
+                <th>Notes</th>
+                <th>Connote</th>
+                <th>Status Changed</th>
+                <th>Tracking</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var job in _arrivalJobs)
+            {
+                <tr>
+                    <td>
+                        <a href="@JmsLinks.JobSummary(job.JobId)"
+                           target="_blank" rel="noopener noreferrer">
+                            @job.JobId
+                        </a>
+                    </td>
+                    <td>@job.Owner</td>
+                    <td>@job.Model</td>
+                    <td>@job.Notes</td>
+                    <td>@((MarkupString)string.Join("<br />", job.Connote))</td>
+                    <td class="@(job.StatusChangeDate < DateTime.Today.AddDays(-7) ? "text-stale-danger" : "")">
+                        @job.StatusChangeDate.ToString("dd MMM yyyy")
+                    </td>
+                    <td>
+                        @RenderTracking(_arrivalTracking, job.JobId)
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+<hr class="my-4" />
+
+<!-- ───────────────────────── Waiting Outward Shipping ───────────────────────── -->
+
+<h5>Waiting Outward Shipping</h5>
+
+@if (_loadingOutward)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else if (_outwardJobs.Count == 0)
+{
+    <Callout Color="CalloutColor.Info">No jobs found.</Callout>
+}
+else
+{
+    <table class="table table-striped align-middle">
+        <thead>
+            <tr>
+                <th>Job</th>
+                <th>Owner</th>
+                <th>Model</th>
+                <th>Notes</th>
+                <th>Connote</th>
+                <th>Status Changed</th>
+                <th>Tracking</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var job in _outwardJobs)
+            {
+                <tr>
+                    <td>
+                        <a href="@JmsLinks.JobSummary(job.JobId)"
+                           target="_blank" rel="noopener noreferrer">
+                            @job.JobId
+                        </a>
+                    </td>
+                    <td>@job.Owner</td>
+                    <td>@job.Model</td>
+                    <td>@job.Notes</td>
+                    <td>@((MarkupString)string.Join("<br />", job.Connote))</td>
+                    <td class="@(job.StatusChangeDate < DateTime.Today.AddDays(-7) ? "text-stale-danger" : "")">
+                        @job.StatusChangeDate.ToString("dd MMM yyyy")
+                    </td>
+                    <td>
+                        @RenderTracking(_outwardTracking, job.JobId)
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+<hr class="my-4" />
+
+<!-- ───────────────────────── Unit Departed ───────────────────────── -->
+
+<h5>Unit Departed</h5>
+
+@if (_loadingDeparted)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else if (_departedJobs.Count == 0)
+{
+    <Callout Color="CalloutColor.Info">No jobs found.</Callout>
+}
+else
+{
+    <table class="table table-striped align-middle">
+        <thead>
+            <tr>
+                <th>Job</th>
+                <th>Owner</th>
+                <th>Model</th>
+                <th>Notes</th>
+                <th>Connote</th>
+                <th>Status Changed</th>
+                <th>Tracking</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var job in _departedJobs)
+            {
+                <tr>
+                    <td>
+                        <a href="@JmsLinks.JobSummary(job.JobId)"
+                           target="_blank" rel="noopener noreferrer">
+                            @job.JobId
+                        </a>
+                    </td>
+                    <td>@job.Owner</td>
+                    <td>@job.Model</td>
+                    <td>@job.Notes</td>
+                    <td>@((MarkupString)string.Join("<br />", job.Connote))</td>
+                    <td class="@(job.StatusChangeDate < DateTime.Today.AddDays(-7) ? "text-stale-danger" : "")">
+                        @job.StatusChangeDate.ToString("dd MMM yyyy")
+                    </td>
+                    <td>
+                        @RenderTracking(_departedTracking, job.JobId)
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+
+    // ── State ────────────────────────────────────────────────────────────────
+
+    private List<ShippingJobRecord> _arrivalJobs = new();
+    private List<ShippingJobRecord> _outwardJobs = new();
+    private List<ShippingJobRecord> _departedJobs = new();
+
+    private bool _loadingArrival = false;
+    private bool _loadingOutward = false;
+    private bool _loadingDeparted = false;
+
+    // jobId → TrackingResult, populated after jobs load
+    private Dictionary<int, TrackingResult> _arrivalTracking = new();
+    private Dictionary<int, TrackingResult> _outwardTracking = new();
+    private Dictionary<int, TrackingResult> _departedTracking = new();
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+        await GetStuff();
+    }
+
+    // ── Load ──────────────────────────────────────────────────────────────────
+
+    private async Task GetStuff()
+    {
+        var sw = Stopwatch.StartNew();
+
+        await Task.WhenAll(
+            LoadJobsAsync((int)JobStatus.WaitingForArrivalAtWorkshop, filterHistoryToStatus: true, connoteStatusLabel: "Waiting for arrival at Workshop", jobs: _arrivalJobs, setLoading: v => _loadingArrival = v),
+            LoadJobsAsync((int)JobStatus.WaitingOutwardShipping, filterHistoryToStatus: true, connoteStatusLabel: "Waiting Outward Shipping", jobs: _outwardJobs, setLoading: v => _loadingOutward = v),
+            LoadJobsAsync((int)JobStatus.UnitDepartedWorkshop, filterHistoryToStatus: false, connoteStatusLabel: "Waiting Outward Shipping", jobs: _departedJobs, setLoading: v => _loadingDeparted = v)
+        );
+
+        sw.Stop();
+        Logger.LogDebug("Shipping jobs loaded in {Seconds:F2}s", sw.Elapsed.TotalSeconds);
+
+        // Prime the JMLA cache (login + bulk fetch) before any per-job lookups
+        await TrackingService.PrimeAllAsync();
+
+        // Kick off tracking lookups concurrently; re-render as each result arrives
+        await Task.WhenAll(
+            LoadTrackingAsync(_arrivalJobs, _arrivalTracking),
+            LoadTrackingAsync(_outwardJobs, _outwardTracking),
+            LoadTrackingAsync(_departedJobs, _departedTracking)
+        );
+
+        await LogShippingChecksTimesheetAsync();
+    }
+
+    // Admin task (not tied to a job) — once per day regardless of how many times this page is
+    // loaded, since re-loading the same dashboard isn't new work. 2 min per job actually opened
+    // (loaded + tracking resolved), not per table.
+    private async Task LogShippingChecksTimesheetAsync()
+    {
+        var totalJobs = _arrivalJobs.Count + _outwardJobs.Count + _departedJobs.Count;
+        if (totalJobs == 0) return;
+
+        var provided = _arrivalTracking.Values.Concat(_outwardTracking.Values).Concat(_departedTracking.Values)
+            .Count(t => t.TrackingNumber != null && t.ErrorMessage == null);
+        var missing = totalJobs - provided;
+        var viewer = await ResolveViewerNameAsync();
+
+        var notes = $"Loaded {totalJobs} jobs, {_arrivalJobs.Count} waiting arrival, "
+            + $"{_outwardJobs.Count} waiting outward shipping, {_departedJobs.Count} unit departed.\n"
+            + $"Provided {provided} tracking details.\n"
+            + $"{missing} jobs did not have tracking details or failed.\n"
+            + $"Information provided to {viewer}.";
+
+        await TimesheetLogging.LogAdminTaskAsync(totalJobs * 2.0 / 60, notes, taskKey: "shipping-checks-daily");
+    }
+
+    // Distinct from TimesheetLoggingService's fixed technician attribution — this is just who
+    // actually consulted the dashboard, for the notes' own audit trail.
+    private async Task<string> ResolveViewerNameAsync()
+    {
+        var resolved = await CurrentUser.ResolveAsync();
+        if (resolved is { } r) return r.Name;
+
+        var auth = await AuthStateProvider.GetAuthenticationStateAsync();
+        return auth.User.Identity?.Name ?? "unknown user";
+    }
+
+    private async Task LoadJobsAsync(int jobStatusId, bool filterHistoryToStatus, string connoteStatusLabel,
+                                     List<ShippingJobRecord> jobs, Action<bool> setLoading)
+    {
+        setLoading(true);
+        StateHasChanged();
+
+        var result = await Jobs.GetJobsAsync(jobStatusId, filterHistoryToStatus, connoteStatusLabel);
+        jobs.Clear();
+        jobs.AddRange(result);
+
+        setLoading(false);
+        StateHasChanged();
+    }
+
+    // ── Tracking ──────────────────────────────────────────────────────────────
+
+    private async Task LoadTrackingAsync(List<ShippingJobRecord> jobs, Dictionary<int, TrackingResult> results)
+    {
+        results.Clear();
+
+        var tasks = jobs.Select(async job =>
+        {
+            var tracking = await TrackingService.GetJobTrackingAsync(job.Connote, job.Notes);
+            return (job.JobId, tracking);
+        });
+
+        foreach (var (jobId, tracking) in await Task.WhenAll(tasks))
+        {
+            results[jobId] = tracking;
+            StateHasChanged(); // re-render each result as it arrives
+        }
+    }
+
+    // Renders the tracking cell for a given job — used inline in the table
+    private RenderFragment RenderTracking(Dictionary<int, TrackingResult> dict, int jobId) => __builder =>
+    {
+        if (!dict.TryGetValue(jobId, out var t))
+        {
+            __builder.AddContent(0, "Loading…");
+            return;
+        }
+
+        if (t.TrackingNumber == null)
+        {
+            __builder.AddContent(0, "—");
+            return;
+        }
+
+        // Carrier badge
+        __builder.OpenElement(0, "span");
+        __builder.AddAttribute(1, "class", "badge bg-secondary me-1");
+        __builder.AddContent(2, t.Carrier);
+        __builder.CloseElement();
+
+        // Status — green if delivered, warning icon if error
+        if (t.ErrorMessage != null)
+        {
+            __builder.OpenElement(3, "span");
+            __builder.AddAttribute(4, "class", "text-danger");
+            __builder.AddAttribute(5, "title", t.ErrorMessage);
+            __builder.AddContent(6, "⚠ Error");
+            __builder.CloseElement();
+        }
+        else
+        {
+            __builder.OpenElement(3, "span");
+            __builder.AddAttribute(4, "class", t.IsDelivered ? "text-success fw-bold" : "");
+            __builder.AddContent(5, t.Status);
+            __builder.CloseElement();
+        }
+
+        // Location + timestamp on a new line if available
+        if (t.LastEventTime.HasValue || t.LastLocation != null)
+        {
+            __builder.OpenElement(6, "br");
+            __builder.CloseElement();
+            __builder.OpenElement(7, "small");
+            __builder.AddAttribute(8, "class", "text-muted");
+            var meta = string.Join(" · ", new[]
+            {
+                t.LastLocation,
+                t.LastEventTime?.ToString("dd MMM HH:mm")
+                }.Where(s => s != null));
+            __builder.AddContent(9, meta);
+            __builder.CloseElement();
+        }
+    };
+
+}

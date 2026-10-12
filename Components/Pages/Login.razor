@@ -1,0 +1,105 @@
+@page "/login"
+
+@using System.Security.Claims
+@using Microsoft.AspNetCore.Authentication
+@using Microsoft.AspNetCore.Authentication.Cookies
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Accounts
+
+@inject UserAccountService Accounts
+@inject NavigationManager Nav
+@inject IConfiguration Config
+@inject ILogger<Login> Logger
+
+@attribute [AllowAnonymous]
+
+@*
+    Static server-rendered on purpose (no @rendermode): SignInAsync has to set the auth
+    cookie on the form-post response, which an interactive circuit can't do. The login rules
+    themselves (JMS first, saved password only when JMS is unreachable) live in
+    UserAccountService.
+*@
+
+<div class="page-header text-center">
+    <h1>Work Login</h1>
+</div>
+
+@if (Config.GetValue<bool>(WorkshopDashboard.Demo.DemoMode.ConfigKey))
+{
+    <div class="row">
+        <div class="col-lg-4 offset-lg-4 alert alert-info">
+            This is a demo with made-up data. Log in as <strong>demo</strong> / <strong>demo</strong>.
+        </div>
+    </div>
+}
+
+<div class="row">
+    <div class="col-lg-4 offset-lg-4 pt-4 pb-4 border">
+        <EditForm Model="@Model" OnValidSubmit="DoLogin" FormName="LoginForm">
+            <DataAnnotationsValidator />
+            <ValidationSummary />
+            <div class="mb-3">
+                <label>User Name</label>
+                <InputText @bind-Value=Model.Username class="form-control" placeholder="Username" />
+                <ValidationMessage For="() => Model.Username" />
+            </div>
+            <div class="mb-3">
+                <label>Password</label>
+                <InputText @bind-Value=Model.Password type="password" class="form-control" placeholder="Password" />
+                <ValidationMessage For="() => Model.Password" />
+            </div>
+            <div class="mb-3 text-center">
+                <span class="text-danger">@errorMessage</span>
+            </div>
+            <div class="mb-3 d-grid gap-2">
+                <button type="submit" class="btn btn-primary">Login</button>
+            </div>
+        </EditForm>
+    </div>
+</div>
+
+@code {
+    [CascadingParameter]
+    public HttpContext? HttpContext { get; set; }
+
+    [SupplyParameterFromForm]
+    public LoginViewModel Model { get; set; } = new();
+
+    public string? errorMessage;
+
+    async Task DoLogin()
+    {
+        if (string.IsNullOrWhiteSpace(Model.Username) || string.IsNullOrEmpty(Model.Password))
+        {
+            errorMessage = "Username and password are required.";
+            return;
+        }
+
+        var (result, username) = await Accounts.LoginAsync(Model.Username, Model.Password);
+        Logger.LogInformation("Login for {Username}: {Result}", Model.Username.Trim(), result);
+
+        switch (result)
+        {
+            case AppLoginResult.InvalidCredentials:
+                errorMessage = "Invalid username or password.";
+                return;
+            case AppLoginResult.JmsUnavailable:
+                errorMessage = "JMS can't be reached right now. If you've logged in here before, use the same password as last time; otherwise try again once JMS is back.";
+                return;
+        }
+
+        var claims = new List<Claim>
+        {
+            new(ClaimTypes.Name, username!),
+            new(ClaimTypes.Role, "Admin")
+        };
+
+        var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
+        await HttpContext!.SignInAsync(
+            CookieAuthenticationDefaults.AuthenticationScheme,
+            new ClaimsPrincipal(identity),
+            new AuthenticationProperties { IsPersistent = true });
+
+        Nav.NavigateTo("/");
+    }
+}

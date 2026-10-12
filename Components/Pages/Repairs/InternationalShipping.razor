@@ -1,0 +1,855 @@
+@page "/international-shipping"
+@page "/international-shipping-jobs"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject CustomsInfoStore CustomsInfo
+@inject RepairerStore Repairers
+@inject CurrentUserResolver CurrentUser
+@inject IWebHostEnvironment Env
+@inject JobEquipmentLookup EquipmentLookup
+@inject JobLookupService JobLookup
+@inject JobStatusActionService StatusAction
+@inject WorkshopDashboard.Services.Analytics.AnalyticsService Analytics
+@inject TimesheetLoggingService TimesheetLogging
+
+@using CsvHelper
+@using CsvHelper.Configuration
+@using System.Globalization
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Components.Forms
+@using WorkshopDashboard.Abstract
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.External.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using WorkshopDashboard.Util
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    InternationalShipping — "Repair Request" page, two independent tabs over
+    the same job-id lookup box:
+      • US (Equipment) — per-equipment row; generates the Customs Info PDF
+        and DHL item-details CSV (needs CustomsInfoStore data per model) plus
+        a generic repair-request PDF.
+      • AU (Jobs)       — per-job row, no customs step; just the repair-
+        request PDF.
+    Both tabs share the bottom "Book Shipment" panel, which logs a freight
+    service line — description formatted as "<Carrier>: <connote>" from the
+    Courier dropdown + connote field, the format both
+    JmsQueries.WaitingWorkshopAssignmentQuery and TrackingService.ExtractTracking
+    expect — (split evenly across selected jobs) and moves them to Waiting
+    Workshop Assignment.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      EquipmentLookup / JobLookup — resolve the typed job ids to rows (JMS)
+      CustomsInfo                 — per-model manufacturer/510(k)/HTS profile
+      Repairers                   — destination-company dropdown options
+      CurrentUser                 — pre-fills "Signed by" with the logged-in user
+      StatusAction                — posts the freight line + job status change
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      Lookup() (Equipment or Jobs, by tab) -> user edits notes/priority/
+      approval inline -> Generate*Form / GenerateDhlCsv build a PDF/CSV client
+      -side from CustomsInfo data -> BookShipment posts the freight line via
+      StatusAction and advances every selected job's status.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Repair Request</h1>
+</div>
+
+<Card Class="mb-3">
+    <CardHeader>
+        <Tabs NavStyle="NavStyle.Pills">
+            <Tab Title="US (Equipment)" Active="@(_tab == RepairTab.Equipment)" OnClick="@(() => SwitchTab(RepairTab.Equipment))"><Content></Content></Tab>
+            <Tab Title="AU (Jobs)" Active="@(_tab == RepairTab.Jobs)" OnClick="@(() => SwitchTab(RepairTab.Jobs))"><Content></Content></Tab>
+        </Tabs>
+    </CardHeader>
+    <CardBody>
+        <JobIdsSection @ref="_jobIdsSection" />
+        <Button Color="ButtonColor.Primary" @onclick="Lookup">Look Up @(_tab == RepairTab.Equipment ? "Equipment" : "Jobs")</Button>
+    </CardBody>
+</Card>
+
+@if (_tab == RepairTab.Equipment && _equipment.Count > 0)
+{
+    <Card Class="mb-3">
+        <CardBody>
+            <table class="table table-striped align-middle" style="table-layout:fixed;">
+                <colgroup>
+                    <col style="width:20%">
+                    <col style="width:44%">
+                    <col style="width:11%">
+                    <col style="width:9%">
+                    <col style="width:4%">
+                </colgroup>
+                <thead>
+                    <tr>
+                        <th>Equipment</th>
+                        <th>Fault / Notes</th>
+                        <th>Priority</th>
+                        <th>Approval</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var item in _equipment)
+                    {
+                        <tr class="@(item.isChecked ? "table-active" : "")">
+                            <td>
+                                <div class="fw-semibold">@item.Owner</div>
+                                <div>@($"{item.ModelManufacturer} {item.Model}")</div>
+                                <div class="text-muted small">@item.SerialNumber</div>
+                                @if (_configuredModelIds.Contains(item.ModelId))
+                                {
+                                    <span class="badge bg-success mt-1">Customs ✓</span>
+                                    @if (_modelsMissingLst.Contains(item.ModelId))
+                                    {
+                                        <span class="badge bg-warning text-dark mt-1">⚠ LST Unknown</span>
+                                    }
+                                }
+                                else
+                                {
+                                    <span class="badge bg-warning text-dark mt-1">⚠ No customs info</span>
+                                }
+                            </td>
+                            <td>
+                                <input class="form-control form-control-sm"
+                                       type="text"
+                                       @bind="item.Notes"
+                                       @bind:event="oninput"
+                                       placeholder="No fault found" />
+                            </td>
+                            <td>
+                                <Button Size="ButtonSize.Small"
+                                        Color="PriorityButtonColor(item.Priority)"
+                                        @onclick="() => item.Priority = NextPriority(item.Priority)">
+                                    @item.Priority
+                                </Button>
+                            </td>
+                            <td>
+                                <Button Size="ButtonSize.Small"
+                                        Color="@(item.IsPreApproved ? ButtonColor.Success : ButtonColor.Secondary)"
+                                        Outline="@(!item.IsPreApproved)"
+                                        @onclick="() => item.IsPreApproved = !item.IsPreApproved">
+                                    @(item.IsPreApproved ? "Approved" : "Pending")
+                                </Button>
+                            </td>
+                            <td class="text-end">
+                                <input type="checkbox" @bind="item.isChecked" />
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+
+            <div class="d-flex justify-content-between align-items-center mt-3">
+                <span class="text-muted">@_equipment.Count(e => e.isChecked) of @_equipment.Count selected</span>
+                <div class="d-flex align-items-center gap-2">
+                    <select class="form-select form-select-sm" style="width:220px;" @bind="_destinationCompany">
+                        <option value="">-- Destination company --</option>
+                        @foreach (var r in _repairers.OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase))
+                        {
+                            <option value="@r.Name">@r.Name</option>
+                        }
+                    </select>
+                    <input class="form-control form-control-sm" style="width:160px;"
+                           placeholder="Signed by"
+                           @bind="_signedByName" @bind:event="oninput" />
+                    <input class="form-control form-control-sm" style="width:80px;"
+                           placeholder="Currency"
+                           @bind="_currency" @bind:event="oninput" />
+                    <Button Color="ButtonColor.Secondary"
+                            @onclick="GenerateCustomsInfoForm"
+                            Disabled="@(!_equipment.Any(e => e.isChecked))">
+                        Generate Customs Info
+                    </Button>
+                    <Button Color="ButtonColor.Secondary"
+                            @onclick="GenerateDhlCsv"
+                            Disabled="@(!_equipment.Any(e => e.isChecked))">
+                        Generate DHL CSV
+                    </Button>
+                    <Button Color="ButtonColor.Success"
+                            @onclick="GenerateEquipmentRepairForm"
+                            Disabled="@(!_equipment.Any(e => e.isChecked))">
+                        Generate Repair Form
+                    </Button>
+                </div>
+            </div>
+
+            @if (!string.IsNullOrWhiteSpace(_customsWarning))
+            {
+                <Callout Color="CalloutColor.Warning" Class="mt-3">@_customsWarning</Callout>
+            }
+
+            @if (!string.IsNullOrWhiteSpace(_dhlWarning))
+            {
+                <Callout Color="CalloutColor.Warning" Class="mt-3">@_dhlWarning</Callout>
+            }
+        </CardBody>
+    </Card>
+}
+
+@if (_tab == RepairTab.Jobs && _jobs.Count > 0)
+{
+    <Card Class="mb-3">
+        <CardBody>
+            <table class="table table-striped align-middle" style="table-layout:fixed;">
+                <colgroup>
+                    <col style="width:16%">
+                    <col style="width:59%">
+                    <col style="width:11%">
+                    <col style="width:9%">
+                    <col style="width:4%">
+                </colgroup>
+                <thead>
+                    <tr>
+                        <th>Job</th>
+                        <th>Fault / Notes</th>
+                        <th>Priority</th>
+                        <th>Approval</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var job in _jobs)
+                    {
+                        <tr class="@(job.isChecked ? "table-active" : "")">
+                            <td>
+                                <div class="fw-semibold">@job.JobId</div>
+                                <div class="text-muted small">@job.Owner</div>
+                            </td>
+                            <td>
+                                <input class="form-control form-control-sm"
+                                       type="text"
+                                       @bind="job.Notes"
+                                       @bind:event="oninput"
+                                       placeholder="No fault found" />
+                            </td>
+                            <td>
+                                <Button Size="ButtonSize.Small"
+                                        Color="PriorityButtonColor(job.Priority)"
+                                        @onclick="() => job.Priority = NextPriority(job.Priority)">
+                                    @job.Priority
+                                </Button>
+                            </td>
+                            <td>
+                                <Button Size="ButtonSize.Small"
+                                        Color="@(job.IsPreApproved ? ButtonColor.Success : ButtonColor.Secondary)"
+                                        Outline="@(!job.IsPreApproved)"
+                                        @onclick="() => job.IsPreApproved = !job.IsPreApproved">
+                                    @(job.IsPreApproved ? "Approved" : "Pending")
+                                </Button>
+                            </td>
+                            <td class="text-end">
+                                <input type="checkbox" @bind="job.isChecked" />
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+
+            <div class="d-flex justify-content-between align-items-center mt-3">
+                <span class="text-muted">@_jobs.Count(j => j.isChecked) of @_jobs.Count selected</span>
+                <Button Color="ButtonColor.Success"
+                        @onclick="GenerateJobRepairForm"
+                        Disabled="@(!_jobs.Any(j => j.isChecked))">
+                    Generate Repair Form
+                </Button>
+            </div>
+        </CardBody>
+    </Card>
+}
+
+@if (_pdfBytes != null)
+{
+    <Card>
+        <CardHeader>
+            <div class="d-flex justify-content-between align-items-center">
+                <span>Repair Request Form Preview</span>
+                <a class="btn btn-outline-primary btn-sm" href="@_pdfDataUrl" download="RepairRequestForm.pdf"
+                   @onclick='() => Analytics.TrackEventAsync("Repair Request Form downloaded")'>Download PDF</a>
+            </div>
+        </CardHeader>
+        <CardBody>
+            <iframe src="@_pdfDataUrl" width="100%" height="800px"></iframe>
+        </CardBody>
+    </Card>
+}
+
+@if (_customsPdfBytes != null)
+{
+    <Card Class="mt-3">
+        <CardHeader>
+            <div class="d-flex justify-content-between align-items-center">
+                <span>Customs Info Form Preview</span>
+                <a class="btn btn-outline-primary btn-sm" href="@_customsPdfDataUrl" download="CustomsInfoForm.pdf"
+                   @onclick='() => Analytics.TrackEventAsync("Customs Info PDF downloaded")'>Download PDF</a>
+            </div>
+        </CardHeader>
+        <CardBody>
+            <iframe src="@_customsPdfDataUrl" width="100%" height="800px"></iframe>
+        </CardBody>
+    </Card>
+}
+
+@if (_dhlCsvContent != null)
+{
+    <Card Class="mt-3">
+        <CardHeader>
+            <div class="d-flex justify-content-between align-items-center">
+                <span>DHL Item Details CSV Preview</span>
+                <a class="btn btn-outline-primary btn-sm" href="@_dhlCsvDataUrl" download="MyDHL_ItemDetails.csv"
+                   @onclick='() => Analytics.TrackEventAsync("DHL CSV downloaded")'>Download CSV</a>
+            </div>
+        </CardHeader>
+        <CardBody>
+            <pre class="mb-0" style="max-height:400px; overflow:auto;">@_dhlCsvContent</pre>
+        </CardBody>
+    </Card>
+}
+
+<Card Class="mt-3">
+    <CardHeader>Book Shipment</CardHeader>
+    <CardBody>
+        <p class="text-muted">Once the shipment is booked, log the freight cost and tracking number here to record it against the @(SelectedJobIds.Count) selected job@(SelectedJobIds.Count == 1 ? "" : "s") and move @(SelectedJobIds.Count == 1 ? "it" : "them") to Waiting Workshop Assignment.</p>
+        <div class="mb-3" style="max-width: 220px;">
+            <label class="form-label">Courier</label>
+            <select class="form-select" @bind="_freightCarrier">
+                @foreach (var c in TrackingService.KnownCarrierPrefixes)
+                {
+                    <option value="@c">@c</option>
+                }
+            </select>
+        </div>
+        <TextSection @ref="_freightDescriptionSection" Heading="Tracking Number / Connote" />
+        <CostPriceSection @ref="_freightCostSection" Heading="Freight Cost" />
+        <Button Color="ButtonColor.Success" Class="mt-2" @onclick="BookShipment" Disabled="_bookingShipment">
+            @(_bookingShipment ? "Booking..." : "Book Shipment")
+        </Button>
+
+        @if (!string.IsNullOrWhiteSpace(_freightError))
+        {
+            <Callout Color="CalloutColor.Danger" Class="mt-3">@_freightError</Callout>
+        }
+    </CardBody>
+</Card>
+
+@code {
+    private enum RepairTab { Equipment, Jobs }
+
+    private RepairTab _tab = RepairTab.Equipment;
+
+    private JobIdsSection? _jobIdsSection;
+
+    private List<EquipmentItem> _equipment = new();
+    private List<JobItem> _jobs = new();
+
+    private byte[]? _pdfBytes;
+    private string? _pdfDataUrl;
+
+    private byte[]? _customsPdfBytes;
+    private string? _customsPdfDataUrl;
+    private string? _customsWarning;
+    private HashSet<int> _configuredModelIds = new();
+    private HashSet<int> _modelsMissingLst = new();
+    private List<Repairer> _repairers = new();
+    private string _destinationCompany = "";
+    private string _signedByName = "";
+    private string _currency = "USD";
+    private byte[]? _logoBytes;
+
+    private string? _dhlCsvContent;
+    private string? _dhlCsvDataUrl;
+    private string? _dhlWarning;
+
+    // Building "<Carrier>: <connote>" explicitly here (rather than guessing at booking
+    // time) is what let TrackingService.ExtractTracking drop its old digit-length-only
+    // fallback for this source.
+    private string _freightCarrier = TrackingService.KnownCarrierPrefixes[0];
+
+    private TextSection? _freightDescriptionSection;
+    private CostPriceSection? _freightCostSection;
+    private string? _freightError;
+    private bool _bookingShipment;
+
+    private enum JobPriority { Urgent, Medium, Low }
+
+    private List<int> SelectedJobIds => _tab == RepairTab.Equipment
+        ? _equipment.Where(e => e.isChecked).Select(e => e.JobId).ToList()
+        : _jobs.Where(j => j.isChecked).Select(j => j.JobId).ToList();
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+
+        var customsData = await CustomsInfo.LoadAsync();
+        _configuredModelIds = customsData.Models.Select(m => m.ModelId).ToHashSet();
+        _modelsMissingLst = customsData.Models
+            .Where(m => string.IsNullOrWhiteSpace(m.DeviceListingNumber))
+            .Select(m => m.ModelId)
+            .ToHashSet();
+        _repairers = await Repairers.LoadAsync();
+
+        var currentUser = await CurrentUser.ResolveAsync();
+        if (currentUser is not null) _signedByName = currentUser.Value.Name;
+
+        var logoPath = Path.Combine(Env.ContentRootPath, "Resources", "Images", "logo.png");
+        if (File.Exists(logoPath))
+            _logoBytes = await File.ReadAllBytesAsync(logoPath);
+    }
+
+    // ── Lookup ───────────────────────────────────────────────────────────────
+
+    private void SwitchTab(RepairTab tab)
+    {
+        _tab = tab;
+    }
+
+    private Task Lookup()
+    {
+        // Any previously generated form/CSV was built from whatever job numbers were entered
+        // last — clearing them on every new lookup makes it obvious they haven't been
+        // (re)generated for the current job numbers yet, so nobody downloads/uses a document
+        // that's actually for a different job.
+        ClearGeneratedDocuments();
+        return _tab == RepairTab.Equipment ? LookupEquipment() : LookupJobs();
+    }
+
+    private void ClearGeneratedDocuments()
+    {
+        _pdfBytes = null;
+        _pdfDataUrl = null;
+        _customsPdfBytes = null;
+        _customsPdfDataUrl = null;
+        _customsWarning = null;
+        _dhlCsvContent = null;
+        _dhlCsvDataUrl = null;
+        _dhlWarning = null;
+    }
+
+    private async Task LookupEquipment()
+    {
+        if (_jobIdsSection == null) return;
+
+        var jobIds = _jobIdsSection.JobIds;
+
+        _equipment.RemoveAll(e => !jobIds.Contains(e.JobId));
+
+        var existingJobIds = _equipment.Select(e => e.JobId).ToHashSet();
+        var newJobIds = jobIds.Where(id => !existingJobIds.Contains(id)).ToList();
+
+        if (newJobIds.Count > 0)
+        {
+            var newEquipment = await GetEquipments(newJobIds);
+            _equipment.AddRange(newEquipment);
+        }
+
+        _equipment = _equipment
+            .OrderBy(e => jobIds.IndexOf(e.JobId))
+            .ToList();
+    }
+
+    private async Task LookupJobs()
+    {
+        if (_jobIdsSection == null) return;
+
+        var jobIds = _jobIdsSection.JobIds;
+
+        _jobs.RemoveAll(j => !jobIds.Contains(j.JobId));
+
+        var existingJobIds = _jobs.Select(j => j.JobId).ToHashSet();
+        var newJobIds = jobIds.Where(id => !existingJobIds.Contains(id)).ToList();
+
+        if (newJobIds.Count > 0)
+        {
+            var newJobs = await GetJobs(newJobIds);
+            _jobs.AddRange(newJobs);
+        }
+
+        _jobs = _jobs
+            .OrderBy(j => jobIds.IndexOf(j.JobId))
+            .ToList();
+    }
+
+    // ── Equipment tab: form generation ──────────────────────────────────────
+
+    private async Task GenerateEquipmentRepairForm()
+    {
+        var selected = _equipment.Where(e => e.isChecked).ToList();
+        if (selected.Count == 0) return;
+
+        var repairItems = selected.Select(e => new RepairItem
+        {
+            Model = $"{e.ModelManufacturer} {e.Model}",
+            SerialNo = e.SerialNumber,
+            JobRef = e.JobId.ToString(),
+            FaultDetails = string.IsNullOrWhiteSpace(e.Notes) ? "No fault found" : e.Notes,
+            Priority = e.Priority.ToString(),
+            ApprovalStatus = e.IsPreApproved ? "Pre-approved" : "Not Pre-approved"
+        }).ToList();
+
+        var generator = new RepairRequestFormGenerator();
+        _pdfBytes = generator.Generate(repairItems);
+        _pdfDataUrl = $"data:application/pdf;base64,{Convert.ToBase64String(_pdfBytes)}";
+        await Analytics.TrackEventAsync("Generate Repair Form");
+    }
+
+    private async Task GenerateCustomsInfoForm()
+    {
+        _customsWarning = null;
+
+        var selected = _equipment.Where(e => e.isChecked).ToList();
+        if (selected.Count == 0) return;
+
+        var items = new List<CustomsInfoItem>();
+        var missing = new List<string>();
+
+        foreach (var e in selected)
+        {
+            var (model, manufacturer, fda510k) = await CustomsInfo.ResolveAsync(e.ModelId);
+            if (model is null)
+            {
+                missing.Add($"Job {e.JobId} ({e.ModelManufacturer} {e.Model})");
+                continue;
+            }
+
+            items.Add(new CustomsInfoItem
+            {
+                SerialNumber = e.SerialNumber,
+                ModelLabel = $"{e.ModelManufacturer} {e.Model}",
+                ManufacturerName = manufacturer?.Name ?? model.ManufacturerName,
+                ManufacturerAddress = manufacturer?.Address ?? "",
+                RegistrationNumber = manufacturer?.RegistrationNumber ?? "",
+                HtsCode = model.HtsCode,
+                FdaProductCode = fda510k?.ProductCode ?? "",
+                Fda510k = model.Fda510kNumber,
+                RegulationNumber = fda510k?.RegulationNumber ?? "",
+                CountryOfOrigin = manufacturer?.Country ?? "",
+                Description = BuildCustomsDescription(e, model, manufacturer, fda510k),
+                DeclaredValue = string.IsNullOrWhiteSpace(model.DeclaredValue) ? "" : $"{model.DeclaredValue} {_currency}"
+            });
+        }
+
+        if (missing.Count > 0)
+            _customsWarning = $"No customs info configured for: {string.Join(", ", missing)}. Add it in Customs Info Manager.";
+
+        if (items.Count == 0) return;
+
+        if (string.IsNullOrWhiteSpace(_destinationCompany))
+        {
+            _customsWarning = (_customsWarning is null ? "" : _customsWarning + " ")
+                + "Pick a destination company above, then generate again.";
+            return;
+        }
+
+        var generator = new CustomsInfoFormGenerator();
+        _customsPdfBytes = generator.Generate(items, _destinationCompany, _logoBytes, _signedByName);
+        _customsPdfDataUrl = $"data:application/pdf;base64,{Convert.ToBase64String(_customsPdfBytes)}";
+        await Analytics.TrackEventAsync("Generate Customs Info");
+    }
+
+    /// <summary>Builds the customs description in the fixed structure every reference entry
+    /// followed: "MANUFACTURER MODEL Type - SN: [serial] - REPAIR AND RETURN. Manufacturer Reg.
+    /// No: [reg no]. FDA Code: product code / 510(k)". Computed from JMS's own manufacturer/
+    /// model text plus the model's customs profile — no per-model template to maintain. The
+    /// registration number and FDA Code clauses are each omitted when there's nothing on file.</summary>
+    private static string BuildCustomsDescription(EquipmentItem e, CustomsModel model, CustomsManufacturer? manufacturer, CustomsFda510k? fda510k)
+    {
+        var description = $"{e.ModelManufacturer.ToUpperInvariant()} {e.Model} {model.Type} - SN: {e.SerialNumber} - REPAIR AND RETURN.";
+
+        if (!string.IsNullOrWhiteSpace(manufacturer?.RegistrationNumber))
+            description += $" Manufacturer Reg. No: {manufacturer.RegistrationNumber}.";
+
+        if (string.IsNullOrWhiteSpace(model.Fda510kNumber))
+            return description;
+
+        var productCode = fda510k?.ProductCode ?? "";
+        return $"{description} FDA Code: {productCode} / {model.Fda510kNumber}";
+    }
+
+    private async Task GenerateDhlCsv()
+    {
+        _dhlWarning = null;
+
+        var selected = _equipment.Where(e => e.isChecked).ToList();
+        if (selected.Count == 0) return;
+
+        var rows = new List<DhlItemCsvRow>();
+        var missing = new List<string>();
+        var incomplete = new List<string>();
+
+        foreach (var e in selected)
+        {
+            var (model, manufacturer, fda510k) = await CustomsInfo.ResolveAsync(e.ModelId);
+            if (model is null)
+            {
+                missing.Add($"Job {e.JobId} ({e.ModelManufacturer} {e.Model})");
+                continue;
+            }
+
+            var country = manufacturer?.Country ?? "";
+            var countryCode = CountryCodes.ToAlpha2(country);
+
+            if (string.IsNullOrWhiteSpace(model.HtsCode) || string.IsNullOrWhiteSpace(model.DeclaredValue)
+                || string.IsNullOrWhiteSpace(model.Weight) || countryCode is null)
+            {
+                incomplete.Add($"Job {e.JobId} ({e.ModelManufacturer} {e.Model})");
+            }
+
+            rows.Add(new DhlItemCsvRow
+            {
+                Description = BuildCustomsDescription(e, model, manufacturer, fda510k),
+                CommodityCode = model.HtsCode,
+                DeclaredValue = model.DeclaredValue,
+                Weight = model.Weight,
+                CountryOfOrigin = country,
+                SerialNumber = e.SerialNumber
+            });
+        }
+
+        if (missing.Count > 0)
+            _dhlWarning = $"No customs info configured for: {string.Join(", ", missing)}. Add it in Customs Info Manager.";
+
+        if (incomplete.Count > 0)
+        {
+            var msg = $"Missing HTS code, declared value, weight, and/or a recognised country of origin for: {string.Join(", ", incomplete)} — those cells were left blank, fix them in Customs Info Manager or edit the CSV before uploading.";
+            _dhlWarning = _dhlWarning is null ? msg : _dhlWarning + " " + msg;
+        }
+
+        if (rows.Count == 0) return;
+
+        _dhlCsvContent = DhlItemCsvGenerator.Generate(rows, string.IsNullOrWhiteSpace(_currency) ? "USD" : _currency.Trim().ToUpperInvariant());
+        _dhlCsvDataUrl = $"data:text/csv;base64,{Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(_dhlCsvContent))}";
+        await Analytics.TrackEventAsync("Generate DHL CSV");
+    }
+
+    // ── Jobs tab: form generation ────────────────────────────────────────────
+
+    private async Task GenerateJobRepairForm()
+    {
+        var selected = _jobs.Where(j => j.isChecked).ToList();
+        if (selected.Count == 0) return;
+
+        var repairItems = selected.Select(j => new JobRepairItem
+        {
+            JobId = j.JobId.ToString(),
+            FaultDetails = string.IsNullOrWhiteSpace(j.Notes) ? "No fault found" : j.Notes,
+            Priority = j.Priority.ToString(),
+            ApprovalStatus = j.IsPreApproved ? "Pre-approved" : "Not Pre-approved"
+        }).ToList();
+
+        var generator = new JobRepairRequestFormGenerator();
+        _pdfBytes = generator.Generate(repairItems);
+        _pdfDataUrl = $"data:application/pdf;base64,{Convert.ToBase64String(_pdfBytes)}";
+        await Analytics.TrackEventAsync("Generate Repair Form");
+    }
+
+    // ── Book shipment ────────────────────────────────────────────────────────
+
+    private async Task BookShipment()
+    {
+        _freightError = null;
+
+        var jobIds = SelectedJobIds;
+        if (jobIds.Count == 0)
+        {
+            _freightError = "Select at least one job first.";
+            return;
+        }
+
+        var connote = _freightDescriptionSection?.Text?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(connote))
+        {
+            _freightError = "Tracking number / connote is required.";
+            return;
+        }
+
+        // "<Carrier>: <connote>" — the format JmsQueries.WaitingWorkshopAssignmentQuery
+        // filters for and TrackingService.ExtractTracking parses back out.
+        var description = $"{_freightCarrier}: {connote}";
+
+        _bookingShipment = true;
+
+        var perJobCost = Math.Round((_freightCostSection?.Value ?? 0m) / jobIds.Count, 2, MidpointRounding.AwayFromZero);
+
+        foreach (var id in jobIds)
+        {
+            try
+            {
+                var res = await StatusAction.AddFreightServiceAsync(id, description, perJobCost);
+
+                if (res is not { Success: true })
+                {
+                    var msg = res is { } r
+                        ? $"❌ Job {id}: HTTP {r.StatusCode} ({r.ReasonPhrase})"
+                        : $"❌ Job {id}: JMS session unavailable.";
+                    _freightError ??= msg;
+                }
+            }
+            catch (Exception ex)
+            {
+                _freightError ??= $"❌ Job {id}: {ex.Message}";
+            }
+
+            await StatusAction.ChangeJobStatusAsync(id, JobStatus.WaitingWorkshopAssignment);
+        }
+
+        // Booking a shipment to a repairer means that repairer now handles this equipment's
+        // models going forward — feed that straight into RepairerStore so RepairerManager.razor
+        // stops flagging future jobs with the same model as unassigned.
+        if (_tab == RepairTab.Equipment && !string.IsNullOrWhiteSpace(_destinationCompany))
+        {
+            var modelIds = _equipment.Where(e => e.isChecked && e.ModelId > 0).Select(e => e.ModelId).Distinct();
+            foreach (var modelId in modelIds)
+            {
+                try
+                {
+                    await Repairers.AddModelAsync(_destinationCompany, modelId);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    _freightError ??= ex.Message;
+                }
+            }
+        }
+
+        _bookingShipment = false;
+        await Analytics.TrackEventAsync("Book Shipment", quantity: jobIds.Count);
+
+        // One timesheet entry per job for the whole workflow that led up to this booking
+        // (paperwork generation + the booking itself) — not one entry per button click, since
+        // booking a shipment necessarily means the earlier generate steps were already done.
+        var tsEntries = BuildBookingTimesheetEntries();
+        if (tsEntries.Count > 0)
+            await TimesheetLogging.LogVariableForJobsAsync(tsEntries);
+    }
+
+    // 5 min per job for the booking itself + 3 min per equipment item on that job (Equipment
+    // tab only — the AU Jobs tab has no equipment/customs step). A job can carry several
+    // checked equipment rows, so group by job id first to get an accurate per-job count.
+    private const double BookingMinutes = 5.0;
+    private const double PerEquipmentMinutes = 3.0;
+
+    private List<(int JobId, double EstimatedHours, string Notes)> BuildBookingTimesheetEntries()
+    {
+        var notes = BuildBookingNotes();
+
+        var equipmentCountByJob = _tab == RepairTab.Equipment
+            ? _equipment.Where(e => e.isChecked).GroupBy(e => e.JobId).ToDictionary(g => g.Key, g => g.Count())
+            : _jobs.Where(j => j.isChecked).Select(j => j.JobId).Distinct().ToDictionary(id => id, _ => 0);
+
+        return equipmentCountByJob.Select(kvp =>
+        {
+            var (jobId, equipmentCount) = (kvp.Key, kvp.Value);
+            var minutes = BookingMinutes + PerEquipmentMinutes * equipmentCount;
+            return (jobId, minutes / 60.0, notes);
+        }).ToList();
+    }
+
+    // Lists what booking a shipment always entails — not conditional on which buttons were
+    // actually clicked this session, since a booking implies the whole workflow happened.
+    // Doesn't include the tracking number/cost values themselves — those already live on the
+    // freight service line this booking just posted to the job. The customs/DHL CSV steps only
+    // apply on the Equipment tab — the AU Jobs tab has no customs step at all.
+    private string BuildBookingNotes()
+    {
+        var steps = new List<string> { "Repair request form generated" };
+
+        if (_tab == RepairTab.Equipment)
+        {
+            steps.Add("DHL customs declaration generated");
+            steps.Add("Shipment CSV for DHL booking created");
+        }
+
+        steps.Add("Shipping tracking number and unit cost for shipment uploaded to services");
+
+        return string.Join(". ", steps) + ".";
+    }
+
+    // ── Priority helpers ─────────────────────────────────────────────────────
+
+    private static ButtonColor PriorityButtonColor(JobPriority p) => p switch
+    {
+        JobPriority.Urgent => ButtonColor.Danger,
+        JobPriority.Medium => ButtonColor.Warning,
+        _ => ButtonColor.Secondary
+    };
+
+    private static JobPriority NextPriority(JobPriority p) => p switch
+    {
+        JobPriority.Urgent => JobPriority.Medium,
+        JobPriority.Medium => JobPriority.Low,
+        _ => JobPriority.Urgent
+    };
+
+    private static JobPriority PriorityFromId(int priorityId) => priorityId switch
+    {
+        1 => JobPriority.Urgent,
+        2 => JobPriority.Medium,
+        _ => JobPriority.Low
+    };
+
+    // ── Data loading ─────────────────────────────────────────────────────────
+
+    private async Task<List<EquipmentItem>> GetEquipments(List<int> ids)
+    {
+        var rows = await EquipmentLookup.LoadForJobsAsync(ids);
+
+        return rows.Select(r => new EquipmentItem(
+            r.JobId,
+            r.ModelId ?? 0,
+            r.OwnerName,
+            r.ManufacturerName,
+            r.ModelNameNo,
+            r.Notes,
+            r.SerialNo,
+            PriorityFromId(r.JobPriorityId),
+            false
+        )).ToList();
+    }
+
+    private async Task<List<JobItem>> GetJobs(List<int> ids)
+    {
+        var rows = await JobLookup.GetJobsByIdsAsync(ids);
+
+        return rows.Select(r => new JobItem(
+            r.JobId,
+            r.OwnerName ?? "",
+            r.Notes ?? "",
+            PriorityFromId(r.JobPriorityId)
+        )).ToList();
+    }
+
+    private class EquipmentItem(int JobId, int ModelId, string Owner, string ModelManufacturer, string Model, string Fault, string SerialNumber, JobPriority Priority, bool isChecked)
+    {
+        public int JobId { get; set; } = JobId;
+        public int ModelId { get; set; } = ModelId;
+        public string Owner { get; set; } = Owner;
+        public string ModelManufacturer { get; set; } = ModelManufacturer;
+        public string Model { get; set; } = Model;
+        public string Notes { get; set; } = Fault;
+        public string SerialNumber { get; set; } = SerialNumber;
+        public JobPriority Priority { get; set; } = Priority;
+        public bool IsPreApproved { get; set; } = false;
+        public bool isChecked { get; set; } = isChecked;
+    }
+
+    private class JobItem(int JobId, string Owner, string Notes, JobPriority Priority)
+    {
+        public int JobId { get; set; } = JobId;
+        public string Owner { get; set; } = Owner;
+        public string Notes { get; set; } = Notes;
+        public JobPriority Priority { get; set; } = Priority;
+        public bool IsPreApproved { get; set; } = false;
+        public bool isChecked { get; set; } = false;
+    }
+
+}

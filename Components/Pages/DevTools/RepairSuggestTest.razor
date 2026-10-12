@@ -1,0 +1,271 @@
+@page "/repair-suggest-test"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+
+@inherits DevOnlyComponentBase
+
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Services.Quoting.Apex
+@using BlazorBootstrap
+
+@inject ApexRepairSuggester Suggester
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    RepairSuggestTest — scratchpad for ApexRepairSuggester: paste an
+    inspection note (and optionally the scope model), see which Apex price
+    sheet lines it would pick, why, and at what USD total. Read-only — it
+    only calls the AI and reads the price sheet, never JMS. Dev Tools only
+    (DevOnlyComponentBase). Used to judge the suggestions against real past
+    quotes before they go anywhere near the In-house Flex page.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Repair Suggestion Test</h1>
+    <p class="text-muted">Paste an inspection note to see which Apex price sheet lines it would suggest.</p>
+</div>
+
+@if (IsDevAuthorized)
+{
+    <Card Class="mb-3">
+        <CardBody>
+            <label class="form-label">Inspection notes</label>
+            <textarea class="form-control mb-3" rows="8" placeholder="Paste the technician's inspection notes here"
+                      @bind="_notes" @bind:event="oninput"></textarea>
+
+            <div class="d-flex gap-3 align-items-end flex-wrap">
+                <div>
+                    <label class="form-label">Scope model <span class="text-muted small">(optional)</span></label>
+                    <input class="form-control" style="width: 260px;" placeholder="e.g. Olympus GIF-H190" @bind="_model" @bind:event="oninput" />
+                </div>
+                <div>
+                    <label class="form-label">AI model</label>
+                    <select class="form-select" style="width: 320px;" @bind="_aiModel">
+                        @foreach (var (id, label) in ApexRepairSuggester.Models)
+                        {
+                            <option value="@id">@label</option>
+                        }
+                    </select>
+                </div>
+                <Button Color="ButtonColor.Primary" Loading="_running" LoadingText="Thinking..."
+                        Disabled="@(_running || string.IsNullOrWhiteSpace(_notes))" @onclick="SuggestAsync">
+                    Suggest repairs
+                </Button>
+            </div>
+        </CardBody>
+    </Card>
+
+    @if (_error != null)
+    {
+        <Callout Color="CalloutColor.Danger" Class="mb-3">@_error</Callout>
+    }
+
+    @if (_result != null)
+    {
+        <Card Class="mb-3">
+            <CardHeader Class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <span>Suggested repairs</span>
+                <span class="fw-semibold">Total @_result.TotalUsd.ToString("C") USD</span>
+            </CardHeader>
+            <CardBody>
+                @if (_result.Repairs.Count == 0)
+                {
+                    <p class="text-muted mb-0">No repairs suggested.</p>
+                }
+                else
+                {
+                    <table class="table table-sm align-middle mb-0">
+                        <thead>
+                            <tr>
+                                <th>Code</th>
+                                <th>Price sheet line</th>
+                                <th>Why</th>
+                                <th>Confidence</th>
+                                <th class="text-end">USD</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var r in _result.Repairs)
+                            {
+                                <tr>
+                                    <td class="text-nowrap fw-semibold">@r.Line.Code</td>
+                                    <td class="small">@r.Line.Description<div class="text-muted">@r.Line.Category</div></td>
+                                    <td class="small">@r.Reason</td>
+                                    <td>
+                                        <Badge Color="@(r.Confidence switch { SuggestionConfidence.High => BadgeColor.Success, SuggestionConfidence.Medium => BadgeColor.Warning, _ => BadgeColor.Danger })">
+                                            @r.Confidence
+                                        </Badge>
+                                    </td>
+                                    <td class="text-end text-nowrap">@r.Line.PriceUsd.ToString("C")</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                }
+            </CardBody>
+        </Card>
+
+        @* ── Pass 2: combining into caps / broader repairs ── *@
+        <Card Class="mb-3">
+            <CardHeader Class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                <span>Combining (pass 2)</span>
+                @if (_result.PassOneTotalUsd != _result.TotalUsd)
+                {
+                    <span class="text-success fw-semibold">
+                        @_result.PassOneTotalUsd.ToString("C") → @_result.TotalUsd.ToString("C") · saves @((_result.PassOneTotalUsd - _result.TotalUsd).ToString("C"))
+                    </span>
+                }
+            </CardHeader>
+            <CardBody>
+                @if (_result.PassTwoRawJson == null)
+                {
+                    <p class="text-muted mb-0">Skipped — fewer than two lines to combine.</p>
+                }
+                else if (_result.Consolidations.Count == 0)
+                {
+                    <p class="text-muted mb-0">Nothing to combine.</p>
+                }
+                else
+                {
+                    <ul class="mb-3">
+                        @foreach (var c in _result.Consolidations)
+                        {
+                            <li class="mb-2">
+                                @if (c.Accepted)
+                                {
+                                    <Badge Color="BadgeColor.Success">Applied</Badge>
+                                }
+                                else
+                                {
+                                    <Badge Color="BadgeColor.Secondary">Not applied</Badge>
+                                }
+                                <strong class="ms-1">@c.Line.Code</strong>
+                                @(c.IsSwap ? "in place of" : "already includes")
+                                @string.Join(", ", c.Replaced.Select(r => r.Code))
+                                @if (c.Accepted)
+                                {
+                                    <span class="text-success">(saves @c.SavingUsd.ToString("C"))</span>
+                                }
+                                <div class="small text-muted">@c.Explanation</div>
+                                @if (c.RejectedBecause != null)
+                                {
+                                    <div class="small text-danger">@c.RejectedBecause</div>
+                                }
+                            </li>
+                        }
+                    </ul>
+                }
+
+                <a href="" class="small" @onclick="() => _showPassOne = !_showPassOne" @onclick:preventDefault>
+                    @(_showPassOne ? "Hide" : "Show") the lines before combining (@_result.PassOneRepairs.Count, @_result.PassOneTotalUsd.ToString("C"))
+                </a>
+                @if (_showPassOne)
+                {
+                    <table class="table table-sm small mt-2 mb-0">
+                        <tbody>
+                            @foreach (var r in _result.PassOneRepairs)
+                            {
+                                <tr>
+                                    <td class="text-nowrap fw-semibold">@r.Line.Code</td>
+                                    <td>@r.Line.Description</td>
+                                    <td class="text-muted">@r.Reason</td>
+                                    <td class="text-end text-nowrap">@r.Line.PriceUsd.ToString("C")</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                }
+            </CardBody>
+        </Card>
+
+        <div class="row g-3 mb-3">
+            <div class="col-md-6">
+                <Card Class="h-100">
+                    <CardHeader>Technical observations (draft)</CardHeader>
+                    <CardBody>
+                        @if (_result.TechnicalObservations.Count == 0)
+                        {
+                            <p class="text-muted mb-0">None.</p>
+                        }
+                        <ul class="mb-0">
+                            @foreach (var o in _result.TechnicalObservations)
+                            {
+                                <li>@o</li>
+                            }
+                        </ul>
+                    </CardBody>
+                </Card>
+            </div>
+            <div class="col-md-6">
+                <Card Class="h-100">
+                    <CardHeader>Findings with no matching line</CardHeader>
+                    <CardBody>
+                        @if (_result.UnmatchedFindings.Count == 0)
+                        {
+                            <p class="text-muted mb-0">None.</p>
+                        }
+                        <ul class="mb-0">
+                            @foreach (var f in _result.UnmatchedFindings)
+                            {
+                                <li>@f</li>
+                            }
+                        </ul>
+                        @if (_result.RejectedCodes.Count > 0)
+                        {
+                            <Callout Color="CalloutColor.Warning" Class="mt-3 mb-0">
+                                Dropped codes that aren't on the price sheet: @string.Join(", ", _result.RejectedCodes)
+                            </Callout>
+                        }
+                    </CardBody>
+                </Card>
+            </div>
+        </div>
+
+        <p class="text-muted small">
+            @_result.Model · @_result.Elapsed.TotalSeconds.ToString("0.0")s ·
+            @(_result.Deterministic ? "repeatable (temperature 0)" : "not guaranteed repeatable — this model ignores temperature") ·
+            @_result.InputTokens.ToString("N0") tokens in, @_result.OutputTokens.ToString("N0") out
+            · <a href="" @onclick="() => _showRaw = !_showRaw" @onclick:preventDefault>@(_showRaw ? "hide" : "show") raw response</a>
+        </p>
+        @if (_showRaw)
+        {
+            <div class="small fw-semibold">Pass 1</div>
+            <pre class="small border rounded p-2">@_result.RawJson</pre>
+            @if (_result.PassTwoRawJson != null)
+            {
+                <div class="small fw-semibold">Pass 2</div>
+                <pre class="small border rounded p-2">@_result.PassTwoRawJson</pre>
+            }
+        }
+    }
+}
+
+@code {
+    private string _notes = "";
+    private string _model = "";
+    private string _aiModel = ApexRepairSuggester.DefaultModel;
+    private bool _running;
+    private string? _error;
+    private ApexRepairSuggestion? _result;
+    private bool _showRaw;
+    private bool _showPassOne;
+
+    private async Task SuggestAsync()
+    {
+        _running = true;
+        _error = null;
+        _result = null;
+        try
+        {
+            _result = await Suggester.SuggestAsync(_notes, _model, _aiModel);
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        finally
+        {
+            _running = false;
+        }
+    }
+}

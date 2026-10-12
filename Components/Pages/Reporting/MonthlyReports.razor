@@ -1,0 +1,313 @@
+@page "/monthly-reports"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+@implements IDisposable
+
+@using BlazorBootstrap
+@using WorkshopDashboard.Data
+@using WorkshopDashboard.Services.Reporting
+
+@inject MonthlyReportService Reports
+@inject WorkshopDashboard.Services.Analytics.AnalyticsService Analytics
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    MonthlyReports — status of the monthly site report packs, one row per
+    site for the chosen month. MonthlyReportWorker queues last month on the
+    1st and builds them in the background; this page updates live (via
+    MonthlyReportService.Changed), downloads finished packs from
+    /monthly-reports/{id}, and retries failed ones. "Queue" builds any month
+    on demand for enabled sites that don't have a pack for it yet.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Monthly Reports</h1>
+    <p class="text-muted">
+        Each site's RS Progress, Job Repair Summary, Job Progress and RS Performance reports, combined into one PDF. Delete old months to keep the disk tidy.
+        Built automatically on the 1st for the month before. <a href="monthly-report-sites">Choose sites</a>
+    </p>
+</div>
+
+@if (_error != null)
+{
+    <Callout Color="CalloutColor.Danger" Class="mb-3">@_error</Callout>
+}
+
+<Card Class="mb-3">
+    <CardBody Class="d-flex gap-4 flex-wrap align-items-end">
+        <div>
+            <label class="text-muted small mb-1 d-block">Month</label>
+            <select class="form-select form-select-sm" style="width: 160px;" value="@_month" @onchange="e => SelectMonthAsync(e.Value?.ToString())">
+                @foreach (var m in _months)
+                {
+                    <option value="@m">@MonthLabel(m)</option>
+                }
+            </select>
+        </div>
+        <div>
+            <label class="text-muted small mb-1 d-block">Queue a month</label>
+            <div class="d-flex gap-2">
+                <input type="month" class="form-control form-control-sm" style="width: 160px;"
+                       value="@_queueMonth" @onchange="e => _queueMonth = e.Value?.ToString()" />
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Primary" Disabled="@(string.IsNullOrEmpty(_queueMonth))" @onclick="QueueAsync">
+                    Queue
+                </Button>
+            </div>
+        </div>
+        @if (_queueMessage != null)
+        {
+            <span class="small text-muted">@_queueMessage</span>
+        }
+    </CardBody>
+</Card>
+
+@if (_runs is null)
+{
+    <Spinner Color="SpinnerColor.Primary" />
+}
+else if (_runs.Count == 0)
+{
+    <p class="text-muted">No reports for @MonthLabel(_month) yet.</p>
+}
+else
+{
+    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
+        <span class="small text-muted">
+            @(_runs.Count(r => r.State == MonthlyReportState.Done) - _missing.Count) of @_runs.Count done
+            @if (_runs.Any(r => r.State == MonthlyReportState.Failed))
+            {
+                <span>· <span class="text-danger">@_runs.Count(r => r.State == MonthlyReportState.Failed) failed</span></span>
+            }
+            @if (_missing.Count > 0)
+            {
+                <span>· <span class="text-warning">@_missing.Count file@(_missing.Count == 1 ? "" : "s") missing</span></span>
+            }
+        </span>
+        <span class="d-flex gap-2">
+            @if (_missing.Count > 0)
+            {
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Warning" Outline="true" @onclick="RebuildMissingAsync">Rebuild missing</Button>
+            }
+            @if (_confirmDeleteMonth)
+            {
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" @onclick="DeleteMonthAsync">Delete all @MonthLabel(_month)?</Button>
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" @onclick="() => _confirmDeleteMonth = false">Cancel</Button>
+            }
+            else
+            {
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" @onclick="() => _confirmDeleteMonth = true">Delete all</Button>
+            }
+        </span>
+    </div>
+    <table class="table table-sm align-middle">
+        <thead>
+            <tr>
+                <th>Site</th>
+                <th>Status</th>
+                <th>Finished</th>
+                <th style="width:190px"></th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var run in _runs)
+            {
+                <tr>
+                    <td>@run.CompanyName</td>
+                    <td>
+                        @switch (run.State)
+                        {
+                            case MonthlyReportState.Done when _missing.Contains(run.Id):
+                                <Badge Color="BadgeColor.Warning">File missing</Badge>
+                                break;
+                            case MonthlyReportState.Done:
+                                <Badge Color="BadgeColor.Success">Done</Badge>
+                                break;
+                            case MonthlyReportState.Running:
+                                <Badge Color="BadgeColor.Primary">Building</Badge>
+                                @if (run.Step != null)
+                                {
+                                    <span class="small text-muted ms-1">@run.Step</span>
+                                }
+                                break;
+                            case MonthlyReportState.Failed:
+                                <Badge Color="BadgeColor.Danger">Failed</Badge>
+                                break;
+                            default:
+                                <Badge Color="BadgeColor.Secondary">Waiting</Badge>
+                                @if (run.Attempts > 0)
+                                {
+                                    <span class="small text-muted ms-1">retry @(run.Attempts + 1) of @MonthlyReportService.MaxAttempts at @run.NextAttemptAtUtc.ToLocalTime().ToString("h:mm tt")</span>
+                                }
+                                break;
+                        }
+                        @if (run.LastError != null && run.State != MonthlyReportState.Done)
+                        {
+                            <div class="small @(run.State == MonthlyReportState.Failed ? "text-danger" : "text-muted")">@run.LastError</div>
+                        }
+                    </td>
+                    <td class="text-nowrap small">@run.FinishedAtUtc?.ToLocalTime().ToString("d MMM h:mm tt")</td>
+                    <td class="text-end text-nowrap">
+                        @if (run.State == MonthlyReportState.Done && !_missing.Contains(run.Id))
+                        {
+                            <a class="btn btn-sm btn-outline-primary" href="monthly-reports/@run.Id" target="_blank">Download</a>
+                        }
+                        @if (run.State != MonthlyReportState.Running)
+                        {
+                            <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="ms-1" @onclick="() => RetryAsync(run)">
+                                @(run.State == MonthlyReportState.Done ? "Rebuild" : "Retry now")
+                            </Button>
+                            @if (_confirmDeleteId == run.Id)
+                            {
+                                <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Class="ms-1" @onclick="() => DeleteRunAsync(run)">Delete?</Button>
+                            }
+                            else
+                            {
+                                <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" Class="ms-1" @onclick="() => _confirmDeleteId = run.Id">✕</Button>
+                            }
+                        }
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private List<string> _months = new();
+    private string _month = "";
+    private List<MonthlyReportRun>? _runs;
+    private string? _queueMonth;
+    private string? _queueMessage;
+    private string? _error;
+    private HashSet<int> _missing = new();
+    private int? _confirmDeleteId;
+    private bool _confirmDeleteMonth;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var lastMonth = MonthlyReportService.MonthKey(MonthlyReportService.PreviousMonth(DateTime.Today));
+        _queueMonth = lastMonth;
+        await LoadMonthsAsync();
+        _month = _months.FirstOrDefault() ?? lastMonth;
+        await LoadRunsAsync();
+        Reports.Changed += OnChanged;
+    }
+
+    private async Task LoadMonthsAsync()
+    {
+        _months = await Reports.ListMonthsAsync();
+        if (_month != "" && !_months.Contains(_month)) _months.Insert(0, _month);
+        if (_months.Count == 0) _months.Add(MonthlyReportService.MonthKey(MonthlyReportService.PreviousMonth(DateTime.Today)));
+    }
+
+    private async Task LoadRunsAsync()
+    {
+        _runs = await Reports.ListRunsAsync(_month);
+        _missing = _runs.Where(Reports.IsFileMissing).Select(r => r.Id).ToHashSet();
+    }
+
+    private async Task SelectMonthAsync(string? month)
+    {
+        _month = month ?? _month;
+        _queueMessage = null;
+        _confirmDeleteId = null;
+        _confirmDeleteMonth = false;
+        await LoadRunsAsync();
+    }
+
+    private async Task QueueAsync()
+    {
+        _error = null;
+        if (!DateTime.TryParseExact(_queueMonth + "-01", "yyyy-MM-dd", null, System.Globalization.DateTimeStyles.None, out var month))
+            return;
+
+        try
+        {
+            var added = await Reports.QueueMonthAsync(month);
+            await Analytics.TrackEventAsync("Monthly report packs queued", detail: _queueMonth, quantity: added);
+            _queueMessage = added == 0
+                ? $"Every enabled site already has a {MonthLabel(_queueMonth!)} pack — use Retry/Rebuild to redo one."
+                : $"Queued {added} site{(added == 1 ? "" : "s")} for {MonthLabel(_queueMonth!)}.";
+            _month = _queueMonth!;
+            await LoadMonthsAsync();
+            await LoadRunsAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+    }
+
+    private async Task RetryAsync(MonthlyReportRun run)
+    {
+        _error = null;
+        try
+        {
+            await Reports.RetryAsync(run.Id);
+            await Analytics.TrackEventAsync("Monthly report pack retried", detail: $"{run.CompanyName} ({run.Month})");
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        await LoadRunsAsync();
+    }
+
+    private async Task RebuildMissingAsync()
+    {
+        await RunAsync(async () =>
+        {
+            var count = await Reports.RebuildMissingAsync(_month);
+            await Analytics.TrackEventAsync("Monthly report packs rebuilt", detail: _month, quantity: count);
+            _queueMessage = $"Rebuilding {count} missing pack{(count == 1 ? "" : "s")} for {MonthLabel(_month)}.";
+        });
+    }
+
+    private async Task DeleteRunAsync(MonthlyReportRun run)
+    {
+        _confirmDeleteId = null;
+        await RunAsync(async () =>
+        {
+            if (!await Reports.DeleteRunAsync(run.Id))
+                _error = $"{run.CompanyName} is being built right now — try again once it's finished.";
+        });
+    }
+
+    private async Task DeleteMonthAsync()
+    {
+        _confirmDeleteMonth = false;
+        await RunAsync(async () =>
+        {
+            var (deleted, skipped) = await Reports.DeleteMonthAsync(_month);
+            _queueMessage = $"Deleted {deleted} pack{(deleted == 1 ? "" : "s")} for {MonthLabel(_month)}."
+                + (skipped > 0 ? $" {skipped} being built right now {(skipped == 1 ? "was" : "were")} left alone." : "");
+            await LoadMonthsAsync();
+        });
+    }
+
+    private async Task RunAsync(Func<Task> action)
+    {
+        _error = null;
+        try
+        {
+            await action();
+        }
+        catch (Exception ex)
+        {
+            _error = ex.Message;
+        }
+        await LoadRunsAsync();
+    }
+
+    private void OnChanged() => _ = InvokeAsync(async () =>
+    {
+        await LoadRunsAsync();
+        StateHasChanged();
+    });
+
+    private static string MonthLabel(string month) =>
+        DateTime.TryParseExact(month + "-01", "yyyy-MM-dd", null, System.Globalization.DateTimeStyles.None, out var d)
+            ? d.ToString("MMMM yyyy") : month;
+
+    public void Dispose() => Reports.Changed -= OnChanged;
+}

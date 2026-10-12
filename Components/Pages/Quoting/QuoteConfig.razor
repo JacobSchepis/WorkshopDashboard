@@ -1,0 +1,318 @@
+@page "/quote-config"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject QuoteNoticeStore Notices
+
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Quoting
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    QuoteConfig — admin control for what quote pages add automatically:
+
+      • Notices: admin-defined disclaimer/advisory text (e.g. Apex's "Leak
+        Advisory"), each with its own Order, offered as tick/untick
+        checkboxes on the quote page itself (QuoteNoticesCard) rather than
+        posted unconditionally — the same page can quote a small-diameter
+        flex scope one time and a large-diameter one the next, and only the
+        first should get a small-diameter advisory. A notice is either
+        Global (every quote — this is also where a standing "quote validity"
+        or assessment-fee disclaimer belongs now, instead of being hardcoded)
+        or targeted at specific quote flows — Dorado's three tabs are separate
+        targets from the rest since a flex-scope notice shouldn't show up on
+        a rigid Dorado quote.
+
+    Read by QuoteSubmissionService / the quote pages on submit.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Quote Config</h1>
+    <p class="text-muted">
+        The notices quote pages offer after the main quote content, and the order they print in.
+    </p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else
+{
+    <Card Class="mb-4">
+        <CardHeader>@(_editingId is null ? "Add Notice" : "Edit Notice")</CardHeader>
+        <CardBody>
+            @if (!string.IsNullOrEmpty(_formError))
+            {
+                <Callout Color="CalloutColor.Danger" Class="mb-3">@_formError</Callout>
+            }
+
+            <div class="mb-3" style="max-width: 480px;">
+                <label class="form-label">Title</label>
+                <input class="form-control" placeholder="e.g. Leak Advisory" @bind-value="_formTitle" />
+            </div>
+
+            <div class="mb-3">
+                <label class="form-label">Text</label>
+                <textarea class="form-control" rows="4" @bind="_formText"></textarea>
+            </div>
+
+            <div class="mb-3" style="max-width: 160px;">
+                <label class="form-label">Order</label>
+                <input type="number" class="form-control" value="@_formOrder"
+                       @onchange="e => { if (int.TryParse(e.Value?.ToString(), out var v)) _formOrder = v; }" />
+                <div class="form-text">Lower prints first, relative to the other notices.</div>
+            </div>
+
+            <div class="mb-3">
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="noticeGlobalCheck"
+                           checked="@_formIsGlobal"
+                           @onchange="e => _formIsGlobal = (bool)(e.Value ?? false)" />
+                    <label class="form-check-label" for="noticeGlobalCheck">Global (applies to every quote)</label>
+                </div>
+            </div>
+
+            @if (!_formIsGlobal)
+            {
+                <div class="mb-3">
+                    <label class="form-label d-block">Applies to</label>
+                    <div class="d-flex flex-wrap gap-3">
+                        @foreach (var target in NoticeTargets)
+                        {
+                            var checkboxId = "noticeTarget_" + target;
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="@checkboxId"
+                                       checked="@_formTargets.Contains(target)"
+                                       @onchange="e => ToggleTarget(target, (bool)(e.Value ?? false))" />
+                                <label class="form-check-label" for="@checkboxId">@TargetLabel(target)</label>
+                            </div>
+                        }
+                    </div>
+                </div>
+            }
+
+            <div class="d-flex gap-2">
+                <Button Color="ButtonColor.Primary" Disabled="_saving" @onclick="SaveNoticeAsync">
+                    @(_saving ? "Saving..." : _editingId is null ? "Add Notice" : "Save Changes")
+                </Button>
+                @if (_editingId is not null)
+                {
+                    <Button Color="ButtonColor.Secondary" Outline="true" Disabled="_saving" @onclick="CancelEdit">
+                        Cancel
+                    </Button>
+                }
+            </div>
+        </CardBody>
+    </Card>
+
+    <Card>
+        <CardHeader>Notices (@_notices.Count)</CardHeader>
+        <CardBody>
+            @if (_notices.Count == 0)
+            {
+                <p class="text-muted small mb-0">No notices yet — add one above.</p>
+            }
+            else
+            {
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead>
+                            <tr>
+                                <th style="width:70px">Order</th>
+                                <th>Title</th>
+                                <th>Applies To</th>
+                                <th>Text</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var notice in _notices.OrderBy(n => n.Order))
+                            {
+                                <tr>
+                                    <td class="text-muted small">@notice.Order</td>
+                                    <td class="fw-semibold">@notice.Title</td>
+                                    <td class="small">
+                                        @if (notice.IsGlobal)
+                                        {
+                                            <Badge Color="BadgeColor.Info">Global</Badge>
+                                        }
+                                        else if (notice.Targets.Count == 0)
+                                        {
+                                            <span class="text-muted">— none —</span>
+                                        }
+                                        else
+                                        {
+                                            @string.Join(", ", notice.Targets.Select(TargetLabel))
+                                        }
+                                    </td>
+                                    <td class="small text-muted" style="max-width: 360px; white-space: pre-wrap;">@Truncate(notice.Text)</td>
+                                    <td class="text-end" style="white-space: nowrap;">
+                                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="me-2" @onclick="() => StartEdit(notice)">
+                                            Edit
+                                        </Button>
+                                        @if (_pendingDeleteId == notice.Id)
+                                        {
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" @onclick="() => DeleteNoticeAsync(notice.Id)">
+                                                Confirm?
+                                            </Button>
+                                        }
+                                        else
+                                        {
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" @onclick="() => _pendingDeleteId = notice.Id">
+                                                Delete
+                                            </Button>
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </CardBody>
+    </Card>
+}
+
+@code {
+    private static readonly QuoteNoticeTarget[] NoticeTargets = Enum.GetValues<QuoteNoticeTarget>();
+
+    private bool _loading = true;
+    private List<QuoteNotice> _notices = new();
+
+    private Guid? _editingId;
+    private string _formTitle = "";
+    private string _formText = "";
+    private int _formOrder;
+    private bool _formIsGlobal;
+    private List<QuoteNoticeTarget> _formTargets = new();
+    private string? _formError;
+    private bool _saving;
+
+    private Guid? _pendingDeleteId;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        await ReloadAsync();
+        _formOrder = await Notices.GetNextOrderAsync();
+    }
+
+    private async Task ReloadAsync()
+    {
+        _notices = await Notices.LoadAsync();
+        _loading = false;
+    }
+
+    private void ToggleTarget(QuoteNoticeTarget target, bool isChecked)
+    {
+        if (isChecked && !_formTargets.Contains(target)) _formTargets.Add(target);
+        else if (!isChecked) _formTargets.Remove(target);
+    }
+
+    private void StartEdit(QuoteNotice notice)
+    {
+        _editingId = notice.Id;
+        _formTitle = notice.Title;
+        _formText = notice.Text;
+        _formOrder = notice.Order;
+        _formIsGlobal = notice.IsGlobal;
+        _formTargets = new List<QuoteNoticeTarget>(notice.Targets);
+        _formError = null;
+    }
+
+    private void CancelEdit()
+    {
+        _editingId = null;
+        _formTitle = "";
+        _formText = "";
+        _formOrder = _notices.Count == 0 ? 200 : _notices.Max(n => n.Order) + 10;
+        _formIsGlobal = false;
+        _formTargets = new();
+        _formError = null;
+    }
+
+    private async Task SaveNoticeAsync()
+    {
+        _formError = null;
+
+        if (string.IsNullOrWhiteSpace(_formTitle))
+        {
+            _formError = "Enter a title.";
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(_formText))
+        {
+            _formError = "Enter the notice text.";
+            return;
+        }
+        if (!_formIsGlobal && _formTargets.Count == 0)
+        {
+            _formError = "Select at least one target, or mark this notice Global.";
+            return;
+        }
+
+        var notice = new QuoteNotice
+        {
+            Id = _editingId ?? Guid.NewGuid(),
+            Title = _formTitle.Trim(),
+            Text = _formText.Trim(),
+            Order = _formOrder,
+            IsGlobal = _formIsGlobal,
+            Targets = _formIsGlobal ? new() : new List<QuoteNoticeTarget>(_formTargets),
+        };
+
+        _saving = true;
+        StateHasChanged();
+
+        try
+        {
+            if (_editingId is null)
+                await Notices.AddAsync(notice);
+            else
+                await Notices.UpdateAsync(_editingId.Value, notice);
+
+            CancelEdit();
+            await ReloadAsync();
+        }
+        catch (Exception ex)
+        {
+            _formError = ex.Message;
+        }
+        finally
+        {
+            _saving = false;
+        }
+    }
+
+    private async Task DeleteNoticeAsync(Guid id)
+    {
+        _pendingDeleteId = null;
+        await Notices.RemoveAsync(id);
+        if (_editingId == id) CancelEdit();
+        await ReloadAsync();
+    }
+
+    private static string TargetLabel(QuoteNoticeTarget target) => target switch
+    {
+        QuoteNoticeTarget.DoradoRigid => "Dorado — Rigid",
+        QuoteNoticeTarget.DoradoSemiRigid => "Dorado — Semi-Rigid",
+        QuoteNoticeTarget.DoradoSpecialty => "Dorado — Specialty",
+        QuoteNoticeTarget.Apex => "Apex",
+        QuoteNoticeTarget.Bayside => "Bayside",
+        QuoteNoticeTarget.Cobalt => "Cobalt",
+        QuoteNoticeTarget.Ember => "Ember",
+        QuoteNoticeTarget.Falcon => "Falcon",
+        _ => target.ToString(),
+    };
+
+    private static string Truncate(string text, int max = 140) =>
+        text.Length <= max ? text : text.Substring(0, max) + "…";
+}

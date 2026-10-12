@@ -1,0 +1,169 @@
+@page "/waiting-quote"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+
+@using CsvHelper
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.External.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@inject IWebHostEnvironment Env
+@inject ScopeJobStore ScopeJobs
+@inject ScopeCustomerStore ScopeCustomers
+@inject WaitingQuoteJobLookup JobLookup
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    WaitingQuote — dashboard of per-company count cards.
+
+    The count queries come from WaitingQuoteReport (shared with the detail
+    page), so both pages apply the SAME ScopeJobStore exclusions (jobs,
+    companies, models — see src/Services/Jms/ScopeJobStore.cs). That's what
+    keeps the card counts equal to the number of rows on the detail page.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<h3>Waiting Quote</h3>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else if (_cards.Count == 0)
+{
+    <Callout Color="CalloutColor.Info" Heading="No scope customers configured">
+        Add customers on the <a href="/scope-customers">Scope Customer Manager</a> page.
+    </Callout>
+}
+else
+{
+    <TextInput @bind-Value="_filter" Placeholder="Filter companies..." Style="width:300px;" Class="mb-3" />
+
+    <div class="row row-cols-1 row-cols-md-2 row-cols-xl-3 g-3">
+        @foreach (var card in _cards.Where(c => string.IsNullOrWhiteSpace(_filter)
+        || c.DisplayName.Contains(_filter, StringComparison.OrdinalIgnoreCase)))
+        {
+            <div class="col">
+                @* The whole card is the link — a real <a>, so ctrl/middle-click opens it in a new tab. *@
+                <a class="quote-card d-block h-100 text-reset text-decoration-none" href="@DetailUrl(card)">
+                    <Card Class="h-100">
+                        <CardHeader>@card.DisplayName</CardHeader>
+                        <CardBody>
+                            <div class="d-flex flex-wrap gap-2 mb-3">
+                                <Badge Color="BadgeColor.Danger">@card.Urgent Urgent</Badge>
+                                <Badge Color="BadgeColor.Warning">@card.Medium Medium</Badge>
+                                <Badge Color="BadgeColor.Success">@card.InDate In Date</Badge>
+                                <Badge Color="BadgeColor.Secondary">@card.OpenRepairs Repairs</Badge>
+                            </div>
+                            <p class="text-muted small mb-0">
+                                @(card.Urgent + card.Medium + card.InDate) open quote@(card.Urgent + card.Medium + card.InDate == 1 ? "" : "s")
+                                &middot; @card.OpenRepairs open repair@(card.OpenRepairs == 1 ? "" : "s")
+                            </p>
+                        </CardBody>
+                    </Card>
+                </a>
+            </div>
+        }
+    </div>
+}
+
+@code {
+    private bool _loading = true;
+    private List<CompanyCard> _cards = new();
+    private string _filter = string.Empty;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+        await LoadDashboardAsync();
+    }
+
+    private async Task LoadDashboardAsync()
+    {
+        _loading = true;
+        StateHasChanged();
+
+        var scopeCustomers = await ScopeCustomers.LoadAsync();
+
+        if (scopeCustomers.Count == 0)
+        {
+            _loading = false;
+            StateHasChanged();
+            return;
+        }
+
+        var allIds = scopeCustomers.SelectMany(c => c.CompanyIds).Distinct().ToList();
+
+        // Same exclusion lists the detail page uses — applied inside the SQL,
+        // so the card counts can never disagree with the detail rows.
+        var exclusions = await ScopeJobs.LoadAsync();
+
+        var (quoteCountsByCompany, repairCountsByCompany) = await JobLookup.GetCountsAsync(allIds, exclusions);
+
+        // Build a card per scope customer by summing its companies' counts
+        _cards = scopeCustomers.Select(sc =>
+        {
+            var urgent = 0;
+            var medium = 0;
+            var inDate = 0;
+            var openRepairs = 0;
+
+            foreach (var id in sc.CompanyIds)
+            {
+                if (quoteCountsByCompany.TryGetValue(id, out var q))
+                {
+                    urgent += q.UrgentCount;
+                    medium += q.MediumCount;
+                    inDate += q.InDateCount;
+                }
+
+                if (repairCountsByCompany.TryGetValue(id, out var r))
+                    openRepairs += r;
+            }
+
+            return new CompanyCard
+            {
+                DisplayName = sc.DisplayName,
+                CompanyIds = sc.CompanyIds,
+                Urgent = urgent,
+                Medium = medium,
+                InDate = inDate,
+                OpenRepairs = openRepairs
+            };
+        }).ToList();
+
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private static string DetailUrl(CompanyCard card) =>
+        $"/waiting-quote/{Uri.EscapeDataString(card.DisplayName)}/{string.Join(",", card.CompanyIds)}";
+
+    // ── Models ────────────────────────────────────────────────────────────────
+
+    private class CompanyCard
+    {
+        public string DisplayName { get; set; } = "";
+        public List<int> CompanyIds { get; set; } = new();
+        public int Urgent { get; set; }
+        public int Medium { get; set; }
+        public int InDate { get; set; }
+        public int OpenRepairs { get; set; }
+    }
+}

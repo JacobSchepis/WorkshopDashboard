@@ -1,0 +1,205 @@
+@page "/timesheet-test"
+@rendermode InteractiveServer
+
+@inherits DevOnlyComponentBase
+
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@inject TimesheetLoggingService TimesheetLogging
+@inject TimesheetSettingsStore TimesheetSettings
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    TimesheetTest — scratchpad to verify TimesheetLoggingService actually
+    lands real entries on AddJobTimesheet against live jobs, before
+    anything else in the app calls it. Dev Tools only (see
+    DevOnlyComponentBase) — this fires real POSTs against JMS's production
+    database, always ADMIN labour type at $0 charge, resubmitting each job's
+    current status unchanged. Point it at throwaway/test jobs, not real ones,
+    until the field mapping's been eyeballed in JMS.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Timesheet Test</h1>
+</div>
+
+<div class="mb-3" style="max-width:520px;">
+    <span class="badge bg-primary" style="font-size:1rem;">
+        @_hoursLoggedToday.ToString("0.##") hour@(_hoursLoggedToday == 1 ? "" : "s") logged today
+    </span>
+</div>
+
+<div style="max-width:520px; margin-bottom:24px;">
+    <h5>Admin Job Id</h5>
+    <p class="text-muted" style="font-size:0.9rem;">The fixed JMS job that general/non-job-specific tasks log against.</p>
+    <div style="display:flex; gap:8px;">
+        <input class="form-control" type="number" @bind="_adminJobId" @bind:event="oninput" style="max-width:160px;" />
+        <Button Color="ButtonColor.Secondary" @onclick="SaveAdminJobId">Save</Button>
+    </div>
+    @if (!string.IsNullOrWhiteSpace(_adminJobIdStatus))
+    {
+        <div class="text-muted mt-1" style="font-size:0.85rem;">@_adminJobIdStatus</div>
+    }
+</div>
+
+<div style="display:flex; flex-direction:column; gap:12px; max-width:520px;">
+    <h5>Log Entry</h5>
+
+    <div class="btn-group" role="group">
+        <input type="radio" class="btn-check" name="mode" id="mode-job" checked="@(_mode == Mode.Job)" @onchange="() => _mode = Mode.Job" />
+        <label class="btn btn-outline-primary" for="mode-job" @onclick="() => _mode = Mode.Job">Against Job(s)</label>
+
+        <input type="radio" class="btn-check" name="mode" id="mode-admin" checked="@(_mode == Mode.Admin)" @onchange="() => _mode = Mode.Admin" />
+        <label class="btn btn-outline-primary" for="mode-admin" @onclick="() => _mode = Mode.Admin">Admin Task</label>
+    </div>
+
+    @if (_mode == Mode.Job)
+    {
+        <div>
+            <label class="form-label">Job Ids (comma separated — one or more)</label>
+            <input class="form-control" @bind="_jobIdsInput" @bind:event="oninput" placeholder="e.g. 140166, 140167" />
+        </div>
+    }
+
+    <div>
+        <label class="form-label">Estimated Minutes (how long this should have taken manually@(_mode == Mode.Job ? " — split evenly across the jobs above" : ""))</label>
+        <input class="form-control" type="number" step="1" @bind="_estimatedMinutes" @bind:event="oninput" />
+    </div>
+
+    <div>
+        <label class="form-label">Notes (goes entirely into JMS's internal notes field)</label>
+        <textarea class="form-control" rows="4" @bind="_notes" @bind:event="oninput"></textarea>
+    </div>
+
+    <div>
+        <label class="form-label">Task Key (optional — only logs once per technician per day for the same key)</label>
+        <input class="form-control" @bind="_taskKey" @bind:event="oninput" placeholder="e.g. waiting-workshop-tracking-check" />
+    </div>
+
+    <Button Color="ButtonColor.Primary" Loading="_submitting" @onclick="Submit">
+        Log Timesheet Entries
+    </Button>
+</div>
+
+@if (!string.IsNullOrWhiteSpace(_error))
+{
+    <Callout Color="CalloutColor.Danger" Class="mt-3" Style="max-width:520px;">
+        @_error
+    </Callout>
+}
+
+@if (_results is { Count: > 0 })
+{
+    <table class="table table-sm table-bordered mt-3" style="max-width:520px;">
+        <thead>
+            <tr>
+                <th>Job Id</th>
+                <th>Minutes Logged</th>
+                <th>Result</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var r in _results)
+            {
+                <tr>
+                    <td>@r.JobId</td>
+                    <td>@((r.EstimatedHours * 60).ToString("0.#"))</td>
+                    <td>@(r.AlreadyLoggedToday ? "⏭️ Already logged today" : r.Success ? "✅ Posted" : "❌ Failed")</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private enum Mode { Job, Admin }
+
+    private Mode _mode = Mode.Job;
+
+    private int? _adminJobId;
+    private string? _adminJobIdStatus;
+
+    private string _jobIdsInput = "";
+    private double _estimatedMinutes = 15;
+    private string _notes = "";
+    private string _taskKey = "";
+
+    private bool _submitting;
+    private string? _error;
+    private List<TimeSheetLogResult>? _results;
+    private double _hoursLoggedToday;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        if (!IsDevAuthorized) return;
+
+        _adminJobId = await TimesheetSettings.GetAdminJobIdAsync();
+        _hoursLoggedToday = await TimesheetLogging.GetHoursLoggedTodayAsync();
+    }
+
+    private async Task SaveAdminJobId()
+    {
+        await TimesheetSettings.SetAdminJobIdAsync(_adminJobId);
+        _adminJobIdStatus = _adminJobId is > 0
+            ? $"Saved — admin tasks will log against job {_adminJobId}."
+            : "Cleared — admin task logging is disabled until an id is set.";
+    }
+
+    private async Task Submit()
+    {
+        _error = null;
+        _results = null;
+
+        if (string.IsNullOrWhiteSpace(_notes))
+        {
+            _error = "Enter notes.";
+            return;
+        }
+
+        var taskKey = string.IsNullOrWhiteSpace(_taskKey) ? null : _taskKey.Trim();
+        var estimatedHours = _estimatedMinutes / 60.0;
+
+        _submitting = true;
+        try
+        {
+            if (_mode == Mode.Admin)
+            {
+                var result = await TimesheetLogging.LogAdminTaskAsync(estimatedHours, _notes, taskKey);
+                _results = new List<TimeSheetLogResult> { result };
+
+                if (!result.Success && !result.AlreadyLoggedToday)
+                    _error = "Failed — check the admin job id is set and check server console log for details.";
+            }
+            else
+            {
+                var jobIds = _jobIdsInput
+                    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Select(s => int.TryParse(s, out var id) ? id : (int?)null)
+                    .Where(id => id is > 0)
+                    .Select(id => id!.Value)
+                    .ToList();
+
+                if (jobIds.Count == 0)
+                {
+                    _error = "Enter at least one job id.";
+                    return;
+                }
+
+                _results = await TimesheetLogging.LogForJobsAsync(jobIds, estimatedHours, _notes, taskKey);
+
+                if (_results.Any(r => !r.Success && !r.AlreadyLoggedToday))
+                    _error = "One or more entries failed — check server console log for details (JMS session unavailable, user couldn't be resolved, or job status lookup failed).";
+            }
+        }
+        finally
+        {
+            _submitting = false;
+            _hoursLoggedToday = await TimesheetLogging.GetHoursLoggedTodayAsync();
+        }
+    }
+}

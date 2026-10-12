@@ -1,0 +1,618 @@
+@page "/bulk-create-jobs"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+
+@inherits JmsComponentBase
+@inject BulkJobCreationService BulkCreate
+@inject ScopeLookupService ScopeLookup
+@inject WorkshopDashboard.Services.Analytics.AnalyticsService Analytics
+@inject TimesheetLoggingService TimesheetLogging
+@inject IJSRuntime JS
+@inject ILogger<BulkJobCreate> Logger
+
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Components.Forms
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Jobs
+@using BlazorBootstrap
+
+<script>
+    window.downloadFileFromBase64 = (fileName, contentType, base64) => {
+        const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+        const blob = new Blob([bytes], { type: contentType });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = fileName;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+    };
+</script>
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    BulkJobCreate — creates N jobs in JMS for one owner/bill-to pair via
+    CreateJob (JMS has no bulk-create endpoint of its own).
+
+    Quantity picks how many DRAFT rows appear — notes and equipment are
+    entered per draft row before anything is created, so nothing exists in
+    JMS until "Create Jobs" is pressed. This also means each job's real notes
+    go straight into CreateJob's own instructions_and_fault_details
+    field, with no separate job-update round trip needed afterwards.
+
+    Owner/bill-to/contacts are picked once and shared by every job in the
+    batch; business type (6), priority (3), and the assigned user/contact
+    (whoever is logged in, via CurrentUserResolver) are fixed rather than
+    exposed as inputs since they never vary. Everything CreateJob's own
+    JS would normally auto-fill from the owner's company record — ship-to,
+    addresses, labour/travel/parts basis, standard labour rate — is pulled
+    from JMS directly by BulkJobCreationService.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Bulk Create Jobs</h1>
+    <p class="text-muted">
+        Set the owner/bill-to once, pick a quantity, then fill in each job's notes and
+        equipment below before creating anything — nothing is created in JMS until you
+        press "Create Jobs". Every job shares the same owner, bill-to, contacts, business
+        type (6), priority (3), and labour estimate (5 hrs). Required date defaults to the
+        last day of the month, rolling to next month if fewer than 7 days remain.
+    </p>
+</div>
+
+<Card Class="mb-4">
+    <CardBody>
+        <div class="row g-3">
+            <div class="col-md-6">
+                <label class="form-label d-block">Owner</label>
+                <CompanyPicker SelectedId="_ownerId" SelectedLabel="@_ownerLabel"
+                               Placeholder="Search company..." SearchAsync="SearchCompaniesAsync"
+                               OnSelect="OnOwnerSelected" OnClear="OnOwnerCleared" />
+            </div>
+            <div class="col-md-6">
+                <label class="form-label d-block">Owner Contact</label>
+                @if (_ownerId is null)
+                {
+                    <span class="text-muted small">Pick an owner first</span>
+                }
+                else
+                {
+                    <CompanyPicker SelectedId="_ownerContactId" SelectedLabel="@_ownerContactLabel"
+                                   Placeholder="Search contact..." SearchAsync="SearchOwnerContactsAsync"
+                                   OnSelect="OnOwnerContactSelected" OnClear="OnOwnerContactCleared" />
+                }
+            </div>
+
+            <div class="col-md-6">
+                <label class="form-label d-block">Bill To</label>
+                <CompanyPicker SelectedId="_billToId" SelectedLabel="@_billToLabel"
+                               Placeholder="Search company..." SearchAsync="SearchCompaniesAsync"
+                               OnSelect="OnBillToSelected" OnClear="OnBillToCleared" />
+            </div>
+            <div class="col-md-6">
+                <label class="form-label d-block">Bill To Contact</label>
+                @if (_billToId is null)
+                {
+                    <span class="text-muted small">Pick a bill-to company first</span>
+                }
+                else
+                {
+                    <CompanyPicker SelectedId="_billContactId" SelectedLabel="@_billContactLabel"
+                                   Placeholder="Search contact..." SearchAsync="SearchBillContactsAsync"
+                                   OnSelect="OnBillContactSelected" OnClear="OnBillContactCleared" />
+                }
+            </div>
+
+            <div class="col-md-3">
+                <label class="form-label">Quantity</label>
+                <input type="number" min="1" max="@MaxQuantity" class="form-control"
+                       @bind="_quantity" @bind:after="ResizeDraftJobs" />
+            </div>
+            <div class="col-md-6">
+                <label class="form-label">Required Date</label>
+                <input class="form-control" value="@_requiredDate.ToString("dd MMM yyyy")" disabled />
+            </div>
+        </div>
+
+        <p class="text-muted small mt-3 mb-0">
+            Every job is assigned to, and contacted via, your own logged-in JMS user.
+        </p>
+    </CardBody>
+</Card>
+
+@if (_draftJobs.Count > 0 && !_created)
+{
+    <Card class="mb-4">
+        <CardHeader>Draft Jobs — fill these in, then create</CardHeader>
+        <CardBody>
+            <table class="table table-striped align-middle mb-0">
+                <thead>
+                    <tr>
+                        <th style="width:4%">#</th>
+                        <th style="width:45%">Notes / Fault Details</th>
+                        <th>Equipment</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @for (var i = 0; i < _draftJobs.Count; i++)
+                    {
+                        var draft = _draftJobs[i];
+                        <tr>
+                            <td>@(i + 1)</td>
+                            <td>
+                                <textarea class="form-control form-control-sm" rows="2" @bind="draft.Notes"></textarea>
+                            </td>
+                            <td>
+                                <div class="position-relative">
+                                    <input class="form-control form-control-sm" placeholder="Search serial number..."
+                                           disabled="@(_ownerId is null)"
+                                           value="@draft.EquipmentTerm" @oninput="e => OnEquipmentInput(draft, e.Value?.ToString() ?? string.Empty)" />
+                                    @if (draft.EquipmentHits.Count > 0)
+                                    {
+                                        <div class="border rounded bg-body position-absolute w-100 mt-1 p-1" style="z-index:1050; max-height:220px; overflow-y:auto;">
+                                            @foreach (var hit in draft.EquipmentHits)
+                                            {
+                                                <button type="button" class="btn btn-sm btn-outline-secondary d-block w-100 text-start mb-1"
+                                                        @onclick="() => PickEquipment(draft, hit)">
+                                                    @hit.ModelNameNo <span class="text-muted">— SN: @hit.SerialNo</span>
+                                                </button>
+                                            }
+                                        </div>
+                                    }
+                                </div>
+                                @if (_ownerId is null)
+                                {
+                                    <div class="small text-muted mt-1">Pick an owner first</div>
+                                }
+                                @if (draft.SelectedEquipment.Count > 0)
+                                {
+                                    <ul class="small mb-0 mt-1 ps-3">
+                                        @foreach (var eq in draft.SelectedEquipment)
+                                        {
+                                            <li>
+                                                @eq.ModelNameNo — SN: @eq.SerialNo
+                                                <button type="button" class="btn btn-sm btn-link text-danger p-0 ms-1" title="Remove"
+                                                        @onclick="() => draft.SelectedEquipment.Remove(eq)">×</button>
+                                            </li>
+                                        }
+                                    </ul>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </CardBody>
+    </Card>
+
+    @if (!string.IsNullOrEmpty(_formError))
+    {
+        <Callout Color="CalloutColor.Danger" Class="mb-3">@_formError</Callout>
+    }
+
+    <button class="btn btn-primary mb-4" disabled="@(!CanSubmit || _creating)" @onclick="CreateJobsAsync">
+        @if (_creating)
+        {
+            <Spinner Size="SpinnerSize.Small" Class="me-2" />
+        }
+        Create @_quantity Job@(_quantity == 1 ? "" : "s")
+    </button>
+}
+
+@if (_results.Count > 0)
+{
+    <Card>
+        <CardHeader>Results — @_results.Count(r => r.Success) of @_results.Count created</CardHeader>
+        <CardBody>
+            <table class="table table-striped align-middle mb-0">
+                <thead>
+                    <tr>
+                        <th style="width:4%">#</th>
+                        <th style="width:8%">Job</th>
+                        <th style="width:8%">Status</th>
+                        <th style="width:8%">Sticker</th>
+                        <th style="width:32%">Notes</th>
+                        <th>Equipment</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var r in _results)
+                    {
+                        <tr>
+                            <td>@r.Attempt</td>
+                            <td>
+                                @if (r.Success)
+                                {
+                                    <a href="@JmsLinks.JobSummary(r.JobId)"
+                                       target="_blank" rel="noopener noreferrer">@r.JobId</a>
+                                }
+                                else
+                                {
+                                    <span class="text-muted">—</span>
+                                }
+                            </td>
+                            <td>
+                                @if (r.Success)
+                                {
+                                    <span class="badge bg-success">Created</span>
+                                }
+                                else
+                                {
+                                    <span class="badge bg-danger" title="@r.Error">Failed</span>
+                                }
+                            </td>
+                            @if (r.Success)
+                            {
+                                <td>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary"
+                                            disabled="@(_stickerDownloading.Contains(r.Attempt))"
+                                            @onclick="() => DownloadStickerAsync(r)">
+                                        @if (_stickerDownloading.Contains(r.Attempt))
+                                        {
+                                            <Spinner Size="SpinnerSize.Small" />
+                                        }
+                                        else
+                                        {
+                                            <span>Download</span>
+                                        }
+                                    </button>
+                                </td>
+                                <td class="small">@r.Request?.Instructions</td>
+                                <td>
+                                    @if (r.EquipmentResults is { Count: > 0 })
+                                    {
+                                        <ul class="small mb-0 ps-3">
+                                            @foreach (var eq in r.EquipmentResults)
+                                            {
+                                                <li class="@(eq.Success ? "" : "text-danger")" title="@eq.Error">
+                                                    @eq.Equipment.ModelNameNo — SN: @eq.Equipment.SerialNo
+                                                    @(eq.Success ? "" : " (failed)")
+                                                </li>
+                                            }
+                                        </ul>
+                                    }
+                                    else
+                                    {
+                                        <span class="text-muted small">—</span>
+                                    }
+                                </td>
+                            }
+                            else
+                            {
+                                <td colspan="3" class="text-muted small">@r.Error</td>
+                            }
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </CardBody>
+    </Card>
+}
+
+@code {
+    private const int MaxQuantity = 50;
+
+    // The exact filename a local print-watcher service is listening for — it auto-prints any
+    // download matching this literal name, so it can't be per-job or the watcher won't fire.
+    private const string StickerFileName = "Sticker|24|24|1|I.pdf";
+
+    private int? _ownerId;
+    private string? _ownerLabel;
+    private int? _ownerContactId;
+    private string? _ownerContactLabel;
+
+    private int? _billToId;
+    private string? _billToLabel;
+    private int? _billContactId;
+    private string? _billContactLabel;
+
+    private int _quantity = 1;
+    private readonly DateTime _requiredDate = BulkJobCreationService.ComputeRequiredDate(DateTime.Today);
+
+    private bool _creating;
+    private bool _created;
+    private string? _formError;
+    private List<DraftJob> _draftJobs = new() { new DraftJob() };
+    private List<BulkJobCreationResult> _results = new();
+    private HashSet<int> _stickerDownloading = new();
+
+    private class DraftJob
+    {
+        public string Notes { get; set; } = "";
+        public string EquipmentTerm { get; set; } = "";
+        public List<EquipmentSearchHit> EquipmentHits { get; set; } = new();
+        public List<EquipmentSearchHit> SelectedEquipment { get; set; } = new();
+        public CancellationTokenSource? EquipmentSearchCts { get; set; }
+    }
+
+    private bool CanSubmit =>
+        _ownerId is not null && _ownerContactId is not null &&
+        _billToId is not null && _billContactId is not null &&
+        _quantity is > 0 and <= MaxQuantity &&
+        _draftJobs.All(d => !string.IsNullOrWhiteSpace(d.Notes));
+
+    private void ResizeDraftJobs()
+    {
+        _quantity = Math.Clamp(_quantity, 1, MaxQuantity);
+        while (_draftJobs.Count < _quantity) _draftJobs.Add(new DraftJob());
+        while (_draftJobs.Count > _quantity) _draftJobs.RemoveAt(_draftJobs.Count - 1);
+    }
+
+    private void ClearDraftEquipment()
+    {
+        foreach (var draft in _draftJobs)
+        {
+            draft.SelectedEquipment.Clear();
+            draft.EquipmentHits.Clear();
+            draft.EquipmentTerm = "";
+        }
+    }
+
+    private async Task<List<(int Id, string Label)>> SearchCompaniesAsync(string term)
+    {
+        var rows = await ScopeLookup.SearchCompaniesAsync(term);
+        return rows.Select(r => (r.CompanyId, r.CompanyName ?? $"({r.CompanyId})")).ToList();
+    }
+
+    private async Task<List<(int Id, string Label)>> SearchOwnerContactsAsync(string term)
+    {
+        if (_ownerId is not int id)
+        {
+            Logger.LogDebug("Owner contact search before an owner was picked");
+            return new();
+        }
+        var rows = await ScopeLookup.SearchContactsAsync(term, new[] { id });
+        return rows.Select(r => (r.ContactId, r.FullName ?? $"({r.ContactId})")).ToList();
+    }
+
+    private async Task<List<(int Id, string Label)>> SearchBillContactsAsync(string term)
+    {
+        if (_billToId is not int id)
+        {
+            Logger.LogDebug("Bill-to contact search before a bill-to company was picked");
+            return new();
+        }
+        var rows = await ScopeLookup.SearchContactsAsync(term, new[] { id });
+        return rows.Select(r => (r.ContactId, r.FullName ?? $"({r.ContactId})")).ToList();
+    }
+
+    // Bill-to defaults to the owner (the common case — most jobs are billed to whoever
+    // owns the equipment) but stops following as soon as it's picked independently, so a
+    // deliberately different bill-to survives a later owner change.
+    private bool _billToFollowsOwner = true;
+
+    private void OnOwnerSelected((int Id, string Label) hit)
+    {
+        _ownerId = hit.Id;
+        _ownerLabel = hit.Label;
+        _ownerContactId = null;
+        _ownerContactLabel = null;
+        ClearDraftEquipment();
+
+        if (_billToFollowsOwner)
+        {
+            _billToId = hit.Id;
+            _billToLabel = hit.Label;
+            _billContactId = null;
+            _billContactLabel = null;
+        }
+    }
+
+    private void OnOwnerCleared()
+    {
+        _ownerId = null;
+        _ownerLabel = null;
+        _ownerContactId = null;
+        _ownerContactLabel = null;
+        ClearDraftEquipment();
+
+        if (_billToFollowsOwner)
+        {
+            _billToId = null;
+            _billToLabel = null;
+            _billContactId = null;
+            _billContactLabel = null;
+        }
+    }
+
+    private void OnOwnerContactSelected((int Id, string Label) hit)
+    {
+        _ownerContactId = hit.Id;
+        _ownerContactLabel = hit.Label;
+    }
+
+    private void OnOwnerContactCleared()
+    {
+        _ownerContactId = null;
+        _ownerContactLabel = null;
+    }
+
+    private void OnBillToSelected((int Id, string Label) hit)
+    {
+        _billToId = hit.Id;
+        _billToLabel = hit.Label;
+        _billContactId = null;
+        _billContactLabel = null;
+
+        // Still counts as "following" if they just re-picked the same company as owner.
+        _billToFollowsOwner = hit.Id == _ownerId;
+    }
+
+    private void OnBillToCleared()
+    {
+        _billToId = null;
+        _billToLabel = null;
+        _billContactId = null;
+        _billContactLabel = null;
+        _billToFollowsOwner = true;
+    }
+
+    private void OnBillContactSelected((int Id, string Label) hit)
+    {
+        _billContactId = hit.Id;
+        _billContactLabel = hit.Label;
+    }
+
+    private void OnBillContactCleared()
+    {
+        _billContactId = null;
+        _billContactLabel = null;
+    }
+
+    // Deliberately synchronous (not async) — the debounce+search runs detached in
+    // SearchEquipmentAfterDelayAsync rather than being awaited here. Awaiting it inline used to
+    // block Blazor Server's per-circuit event queue from processing the *next* keystroke until
+    // this one's 250ms delay + network search finished; that queued keystroke's eventual render
+    // then landed late, showing this handler's now-stale term and visibly deleting whatever had
+    // been typed since. Returning immediately keeps every keystroke processed in near real
+    // time, so EquipmentTerm is always current by the time any render actually happens.
+    private void OnEquipmentInput(DraftJob draft, string term)
+    {
+        draft.EquipmentTerm = term;
+        draft.EquipmentHits.Clear();
+
+        draft.EquipmentSearchCts?.Cancel();
+        var cts = new CancellationTokenSource();
+        draft.EquipmentSearchCts = cts;
+
+        if (term.Trim().Length < 2 || _ownerId is not int ownerId)
+        {
+            return;
+        }
+
+        _ = SearchEquipmentAfterDelayAsync(draft, ownerId, term.Trim(), cts);
+    }
+
+    private async Task SearchEquipmentAfterDelayAsync(DraftJob draft, int ownerId, string term, CancellationTokenSource cts)
+    {
+        try
+        {
+            await Task.Delay(250, cts.Token);
+            var hits = await BulkCreate.SearchEquipmentAsync(ownerId, term, cts.Token);
+            if (cts.Token.IsCancellationRequested) return;
+
+            draft.EquipmentHits = hits;
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (TaskCanceledException)
+        {
+            // superseded by a newer keystroke — ignore
+        }
+    }
+
+    private void PickEquipment(DraftJob draft, EquipmentSearchHit hit)
+    {
+        if (draft.SelectedEquipment.All(e => e.EquipmentId != hit.EquipmentId))
+            draft.SelectedEquipment.Add(hit);
+
+        draft.EquipmentHits.Clear();
+        draft.EquipmentTerm = "";
+    }
+
+    private async Task CreateJobsAsync()
+    {
+        if (!CanSubmit)
+        {
+            Logger.LogDebug("Create jobs clicked before the form was complete");
+            return;
+        }
+
+        _formError = null;
+        _creating = true;
+        _results = new();
+        StateHasChanged();
+
+        try
+        {
+            var plannedJobs = _draftJobs
+                .Select(d => new PlannedJob(d.Notes, d.SelectedEquipment))
+                .ToList();
+
+            var results = await BulkCreate.CreateJobsAsync(
+                _ownerId!.Value, _ownerLabel!,
+                _ownerContactId!.Value, _ownerContactLabel!,
+                _billToId!.Value, _billToLabel!,
+                _billContactId!.Value, _billContactLabel!,
+                plannedJobs);
+
+            Logger.LogInformation("Bulk create finished: {Created} of {Count} job(s) created", results.Count(r => r.Success), results.Count);
+
+            // Attempt 0 means the batch never started (auth/user/owner-lookup failure)
+            // rather than an individual job POST failing.
+            if (results.Count == 1 && results[0].Attempt == 0)
+            {
+                _formError = results[0].Error;
+            }
+            else
+            {
+                _results = results;
+                _created = true;
+
+                var createdCount = results.Count(r => r.Success);
+                await Analytics.TrackEventAsync("Bulk Create Jobs", detail: _ownerLabel, quantity: createdCount);
+
+                // Only a genuine bulk batch (2+) counts as "created in bulk" — a single job here
+                // is no different from creating one job any other way.
+                if (createdCount >= 2)
+                {
+                    var entries = results
+                        .Where(r => r.Success)
+                        .Select(r => (JobId: r.JobId!.Value, EstimatedHours: 2.0 / 60, Notes: BuildBulkCreateNotes(r, createdCount)))
+                        .ToList();
+
+                    await TimesheetLogging.LogVariableForJobsAsync(entries);
+                }
+            }
+        }
+        finally
+        {
+            _creating = false;
+            StateHasChanged();
+        }
+    }
+
+    // Only mentions equipment that actually attached — a failed attach attempt didn't happen.
+    private static string BuildBulkCreateNotes(BulkJobCreationResult r, int batchSize)
+    {
+        var notes = $"Job created in bulk batch of {batchSize}.";
+
+        var attached = r.EquipmentResults?.Where(e => e.Success).ToList();
+        if (attached is { Count: > 0 })
+        {
+            var items = attached.Select(e => $"{e.Equipment.ModelNameNo} (SN: {e.Equipment.SerialNo})");
+            notes += $" Equipment attached: {string.Join(", ", items)}.";
+        }
+
+        return notes;
+    }
+
+    private async Task DownloadStickerAsync(BulkJobCreationResult r)
+    {
+        if (r.JobId is not int jobId) return;
+
+        _stickerDownloading.Add(r.Attempt);
+        StateHasChanged();
+
+        try
+        {
+            var file = await BulkCreate.GetJobStickerPdfAsync(jobId);
+            if (file == null) return;
+
+            // Must be this exact name, unrelated to the job id — a local watcher service on the
+            // printing machine auto-prints any download matching this literal filename.
+            var base64 = Convert.ToBase64String(file.Bytes);
+            await JS.InvokeVoidAsync("downloadFileFromBase64", StickerFileName, "application/pdf", base64);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Downloading the sticker for job {JobId} failed", jobId);
+        }
+        finally
+        {
+            _stickerDownloading.Remove(r.Attempt);
+            StateHasChanged();
+        }
+    }
+}

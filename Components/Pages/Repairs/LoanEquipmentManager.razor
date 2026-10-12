@@ -1,0 +1,1383 @@
+@page "/loan-equipment"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+
+@inherits JmsComponentBase
+@inject LoanEquipmentOverlayStore Overlays
+@inject LoanEquipmentStatusStore StatusStore
+@inject LoanEquipmentLookup EquipmentLookup
+@inject ScopeLookupService ScopeLookup
+@inject ScopeCustomerStore ScopeCustomers
+@inject LoanModelSubstituteStore SubstituteStore
+@inject ScopeJobStore ScopeJobs
+@inject ILoanEquipmentExporter SheetExport
+@inject ManufacturerAbbreviationStore ManufacturerAbbreviations
+@inject ILogger<LoanEquipmentManager> Logger
+
+@using CsvHelper
+@using CsvHelper.Configuration
+@using System.Globalization
+@using System.Text.Json
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Components.Forms
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.External.Google
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using static WorkshopDashboard.Services.Admin.ScopeLabelFormatter
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    LoanEquipmentManager — the loan fleet, queried live from JMS
+    (JmsQueries.LoanEquipmentQuery: equipment tagged barcode_no = 'LOAN-UNIT'
+    under company 1), with local annotations (workflow status, company
+    links, buy price, covering jobs) layered on top via
+    LoanEquipmentOverlayStore — see
+    LoanEquipmentOverlay for exactly what's tracked locally vs. read from
+    JMS.
+
+    Status / Current Location / Loaned To / Covering For are edited inline,
+    directly in the table — each edit patches just that field and saves
+    immediately (SaveOverlayAsync), no separate form. The Edit panel is only
+    for a manual Original Owner + Buy Price, since those change far less often and
+    don't need to be one click away. Current Location/Loaned To/Original
+    Owner all use CompanyPicker (a compact single-company search-and-select
+    sized for a table cell) instead of ExclusionSection, which is built for
+    multi-id lists with a persistent Card — too heavy for inline use.
+
+    Original owners are mostly derived from JMS: every non-SC owner of a
+    job the unit was on — see JmsQueries.LoanEquipmentPreviousOwnersQuery —
+    so a unit can have several, or none ("No previous owner record", which
+    is fine and not flagged).
+    The manually-set OriginalOwnerCompanyId is added on top for units whose
+    history doesn't show it.
+
+    The "flag if from" filter exists because we won't loan a unit
+    back to the customer they originally bought it from — it marks (red row)
+    rather than hides any unit with an original owner in the picked
+    company's scope customer (so other sites of the same hospital count too).
+
+    There's no "add a unit" here — the equipment list itself always comes
+    from JMS. Model, serial, inspection date, Loan Job, loaned date, and
+    agreement-signed are all read live and shown read-only.
+
+    The "Customer Jobs" tab lists every loaned-out unit (Loaned To set) and,
+    under each, the Loaned To customer's open JMS jobs on units of the same
+    model — i.e. what the loan is (or could be) covering for. "Customer"
+    means every company id of the scope customer the Loaned To company
+    belongs to (ScopeCustomerStore), so other sites of the same customer
+    count. Loaded lazily the first time the tab is opened.
+
+    The "Model Substitutes" tab lists each loan fleet model and which other
+    (customer) models it can be loaned out for — e.g. a GIF-HQ190 loan for a
+    GIF-H190 — via LoanModelSubstituteStore. Customer Jobs matches on the
+    loan unit's own model plus those substitutes.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Loan Equipment</h1>
+    <p class="text-muted">
+        Tracks every unit on the loan fleet — where it is, who has it, and how long it's been
+        there. Model, serial, last inspection, Loan Job, loaned date, covering job status/quote
+        date, and agreement-signed are read live from JMS; everything else is tracked here.
+    </p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading from JMS...</span>
+    </div>
+}
+else if (_loadError is not null)
+{
+    <Callout Color="CalloutColor.Danger">@_loadError</Callout>
+}
+else
+{
+    <Tabs NavStyle="NavStyle.Pills" Class="mb-3">
+        <Tab Title="Loan Fleet" Active="@(_tab == PageTab.Fleet)" OnClick="@(() => SwitchTab(PageTab.Fleet))"><Content></Content></Tab>
+        <Tab Title="Customer Jobs" Active="@(_tab == PageTab.CustomerJobs)" OnClick="@(() => SwitchTab(PageTab.CustomerJobs))"><Content></Content></Tab>
+        <Tab Title="Model Substitutes" Active="@(_tab == PageTab.Substitutes)" OnClick="@(() => SwitchTab(PageTab.Substitutes))"><Content></Content></Tab>
+    </Tabs>
+}
+
+@if (!_loading && _loadError is null && _tab == PageTab.Substitutes)
+{
+    var fleetModels = FleetModels();
+    <Card>
+        <CardHeader>
+            <span class="fw-semibold">Loan Models (@fleetModels.Count)</span>
+            <div class="text-muted small">
+                Customer models each loan model can be loaned out for. Customer Jobs shows a customer's
+                open jobs on the loan unit's own model plus every model listed here.
+            </div>
+        </CardHeader>
+        <CardBody>
+            @if (fleetModels.Count == 0)
+            {
+                <p class="text-muted small mb-0">No loan fleet models found.</p>
+            }
+            else
+            {
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle mb-0">
+                        <thead>
+                            <tr>
+                                <th>Loan Model</th>
+                                <th>Units</th>
+                                <th>Can Be Loaned For</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var m in fleetModels)
+                            {
+                                <tr>
+                                    <td class="text-nowrap">@m.Label</td>
+                                    <td class="small">@m.UnitCount</td>
+                                    <td>
+                                        <div class="d-flex flex-wrap align-items-center gap-1">
+                                            @foreach (var subId in SubstitutesOf(m.ModelId))
+                                            {
+                                                <span class="badge bg-info text-dark d-inline-flex align-items-center gap-1">
+                                                    @ModelLabel(subId)
+                                                    <button type="button" class="btn btn-sm btn-link p-0 text-dark lh-1" title="Remove"
+                                                            @onclick="() => RemoveSubstituteAsync(m.ModelId, subId)">×</button>
+                                                </span>
+                                            }
+                                            <CompanyPicker SelectedId="null" EmptyLabel="+ Add model" ShowClear="false"
+                                                           Placeholder="Search model..." SearchAsync="SearchModelsAsync"
+                                                           OnSelect="@(sel => AddSubstituteAsync(m.ModelId, sel))" />
+                                        </div>
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </CardBody>
+    </Card>
+}
+
+@if (!_loading && _loadError is null && _tab == PageTab.CustomerJobs)
+{
+    var loanedOut = LoanedOutItems();
+    <Card>
+        <CardHeader>
+            <div class="d-flex flex-wrap align-items-center gap-2">
+                <span class="fw-semibold me-2">Loaned Out (@loanedOut.Count of @_items.Count(i => i.LoanedToCompanyId is not null))</span>
+                <input class="form-control form-control-sm" style="max-width: 240px;" placeholder="Search model, serial, customer, job..."
+                       value="@_customerSearch" @oninput="@(e => _customerSearch = e.Value?.ToString() ?? "")" />
+                <select class="form-select form-select-sm" style="max-width: 170px;"
+                        value="@(_customerStatusFilter ?? "")"
+                        @onchange="@(e => _customerStatusFilter = string.IsNullOrEmpty(e.Value?.ToString()) ? null : e.Value!.ToString())">
+                    <option value="">All Statuses</option>
+                    @foreach (var status in _statuses)
+                    {
+                        <option value="@status.Id">@status.Label</option>
+                    }
+                </select>
+                <div class="d-flex align-items-center gap-1">
+                    <span class="text-muted small text-nowrap">Loaned to:</span>
+                    <CompanyPicker SelectedId="_customerFilterCompanyId" SelectedLabel="@_customerFilterLabel"
+                                   Placeholder="Search scope customer..." SearchAsync="SearchScopeCustomersAsync"
+                                   OnSelect="@(sel => { _customerFilterCompanyId = sel.Id; _customerFilterLabel = sel.Label; })"
+                                   OnClear="@(() => { _customerFilterCompanyId = null; _customerFilterLabel = null; })" />
+                </div>
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="ms-auto"
+                        Disabled="_customerLoading" @onclick="LoadCustomerJobsAsync">
+                    Refresh
+                </Button>
+            </div>
+        </CardHeader>
+        <CardBody>
+            @if (_customerLoading)
+            {
+                <div class="d-flex align-items-center gap-2">
+                    <Spinner Color="SpinnerColor.Primary" />
+                    <span>Loading customer jobs from JMS...</span>
+                </div>
+            }
+            else if (_customerLoadError is not null)
+            {
+                <Callout Color="CalloutColor.Danger">@_customerLoadError</Callout>
+            }
+            else if (loanedOut.Count == 0)
+            {
+                <p class="text-muted small mb-0">
+                    @(_items.Any(i => i.LoanedToCompanyId is not null)
+                        ? "Nothing matches the current filters."
+                        : "No units have Loaned To set.")
+                </p>
+            }
+            else
+            {
+                foreach (var i in loanedOut)
+                {
+                    var jobs = CustomerJobsFor(i);
+                    var (statusLabel, statusCss) = StatusBadgeClass(StatusOf(i));
+                    <h6 class="mt-3 mb-1">
+                        <span class="badge @statusCss me-1">@statusLabel</span>
+                        @i.Model — @i.SerialNumber
+                        <span class="text-muted small fw-normal">
+                            · Loaned to <span class="text-info fw-semibold">@CompanyDisplayName(i.LoanedToCompanyId)</span>
+                            @if (i.LoanedDate is DateTime ld)
+                            {
+                                var loanDays = DaysSince(ld);
+                                <span> · @ld.ToString("dd MMM yyyy") (<span class="fw-semibold @LoanAgeCssClass(loanDays)">@(loanDays)d</span>)</span>
+                            }
+                            @if (i.JobId is int loanJobId)
+                            {
+                                <span> · Loan Job <a href="@JmsLinks.JobSummary(loanJobId)" target="_blank" rel="noopener noreferrer">@loanJobId</a></span>
+                            }
+                        </span>
+                    </h6>
+                    @if (jobs.Count == 0)
+                    {
+                        <p class="text-muted small mb-2">No open jobs on this model (or its substitutes) for @CompanyDisplayName(i.LoanedToCompanyId).</p>
+                    }
+                    else
+                    {
+                        <div class="table-responsive">
+                            <table class="table table-sm align-middle mb-2">
+                                <thead>
+                                    <tr>
+                                        <th>Job</th>
+                                        <th>Status</th>
+                                        <th>Customer</th>
+                                        <th>Equipment</th>
+                                        <th>Serial No.</th>
+                                        <th>Covering</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var j in jobs)
+                                    {
+                                        var info = new CoveringJobInfo
+                                        {
+                                            Status = j.JobStatus ?? "",
+                                            QuotedDate = DateTime.TryParse(j.QuotedDate, out var qd) ? qd : (DateTime?)null
+                                        };
+                                        <tr>
+                                            <td class="small">
+                                                <a href="@JmsLinks.JobSummary(j.JobId)" target="_blank" rel="noopener noreferrer">@j.JobId</a>
+                                            </td>
+                                            <td class="small">
+                                                @(string.IsNullOrEmpty(info.Status) ? "Unknown" : info.Status)@(IsWaitingQuoteConfirmation(info) ? $" ({DaysSince(info.QuotedDate)}d since quoted)" : "")
+                                            </td>
+                                            <td class="small">@(j.CompanyName ?? $"({j.CompanyId})")</td>
+                                            <td class="@(j.ModelId == i.ModelId ? "" : "text-info")"
+                                                title="@(j.ModelId == i.ModelId ? "Same model" : "Substitute model")">
+                                                @FormatModelLabel(j.ManufacturerId, j.ManufacturerName, j.ModelName, _manuAbbreviations)
+                                            </td>
+                                            <td>@j.SerialNo</td>
+                                            <td>@(i.CoveringForJobIds.Contains(j.JobId) ? "✓" : "")</td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    }
+                }
+            }
+        </CardBody>
+    </Card>
+}
+
+@if (!_loading && _loadError is null && _tab == PageTab.Fleet)
+{
+    <div class="d-flex flex-wrap gap-2 mb-4">
+        @foreach (var status in _statuses)
+        {
+            var (label, cssClass) = StatusBadgeClass(status);
+            var count = _items.Count(i => i.Status == status.Id);
+            var active = _statusFilter == status.Id;
+            <span class="badge @cssClass cursor-pointer @(active ? "border border-2 border-light" : "")"
+                  @onclick="() => ToggleStatusFilter(status.Id)">
+                @label: @count
+            </span>
+        }
+    </div>
+
+    @if (_editingEquipmentId is not null)
+    {
+        <Card Class="mb-4">
+            <CardHeader>Edit "@_editingLabel"</CardHeader>
+            <CardBody>
+                @if (!string.IsNullOrEmpty(_formError))
+                {
+                    <Callout Color="CalloutColor.Danger" Class="mb-3">@_formError</Callout>
+                }
+                <div class="row g-3">
+                    <div class="col-md-6">
+                        <label class="form-label d-block">Original Owner <span class="text-muted small">(manual — owners from JMS job history are added automatically)</span></label>
+                        <CompanyPicker SelectedId="_formOriginalOwnerId" SelectedLabel="@_formOriginalOwnerLabel"
+                                       Placeholder="Search client..." SearchAsync="SearchClientsAsync"
+                                       OnSelect="@(sel => { _formOriginalOwnerId = sel.Id; _formOriginalOwnerLabel = sel.Label; })"
+                                       OnClear="@(() => { _formOriginalOwnerId = null; _formOriginalOwnerLabel = null; })" />
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label">Buy Price</label>
+                        <div class="input-group">
+                            <span class="input-group-text">$</span>
+                            <input class="form-control" placeholder="0.00" @bind-value="_formBuyPrice" @bind-value:event="oninput" />
+                        </div>
+                    </div>
+                </div>
+
+                <div class="d-flex gap-2 mt-3">
+                    <Button Color="ButtonColor.Primary" Disabled="_saving" @onclick="SaveEditAsync">
+                        @(_saving ? "Saving..." : "Save Changes")
+                    </Button>
+                    <Button Color="ButtonColor.Secondary" Outline="true" Disabled="_saving" @onclick="CancelEdit">
+                        Cancel
+                    </Button>
+                </div>
+            </CardBody>
+        </Card>
+    }
+
+    @if (_managingStatuses)
+    {
+        <Card Class="mb-4">
+            <CardHeader>Manage Statuses</CardHeader>
+            <CardBody>
+                @if (!string.IsNullOrEmpty(_statusManageError))
+                {
+                    <Callout Color="CalloutColor.Danger" Class="mb-3">@_statusManageError</Callout>
+                }
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle mb-3">
+                        <thead>
+                            <tr>
+                                <th>Label</th>
+                                <th>Color</th>
+                                <th style="width:1%"></th>
+                                <th style="width:1%"></th>
+                                <th style="width:1%"></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var status in _statuses)
+                            {
+                                <tr>
+                                    <td style="min-width:180px;">
+                                        <input class="form-control form-control-sm" value="@status.Label"
+                                               @onchange="@(e => RenameStatusAsync(status, e.Value?.ToString() ?? status.Label))" />
+                                    </td>
+                                    <td style="min-width:140px;">
+                                        <select class="form-select form-select-sm" value="@status.Color"
+                                                @onchange="@(e => RecolorStatusAsync(status, e.Value?.ToString() ?? status.Color))">
+                                            @foreach (var color in BadgeColorNames)
+                                            {
+                                                <option value="@color">@color</option>
+                                            }
+                                        </select>
+                                    </td>
+                                    <td>
+                                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                                Disabled="@(status.Order == _statuses.Min(s => s.Order))" @onclick="() => MoveStatusAsync(status, -1)">
+                                            ↑
+                                        </Button>
+                                    </td>
+                                    <td>
+                                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                                Disabled="@(status.Order == _statuses.Max(s => s.Order))" @onclick="() => MoveStatusAsync(status, 1)">
+                                            ↓
+                                        </Button>
+                                    </td>
+                                    <td>
+                                        <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" @onclick="() => RemoveStatusAsync(status)">
+                                            Remove
+                                        </Button>
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="d-flex gap-2 align-items-end flex-wrap">
+                    <div>
+                        <label class="form-label small mb-1 d-block">New status</label>
+                        <input class="form-control form-control-sm" placeholder="Label" style="min-width:180px;"
+                               @bind-value="_newStatusLabel" @bind-value:event="oninput" />
+                    </div>
+                    <div>
+                        <label class="form-label small mb-1 d-block">Color</label>
+                        <select class="form-select form-select-sm" style="min-width:140px;" @bind="_newStatusColor">
+                            @foreach (var color in BadgeColorNames)
+                            {
+                                <option value="@color">@color</option>
+                            }
+                        </select>
+                    </div>
+                    <Button Size="ButtonSize.Small" Color="ButtonColor.Primary" Disabled="@string.IsNullOrWhiteSpace(_newStatusLabel)" @onclick="AddStatusAsync">
+                        Add
+                    </Button>
+                    <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="ms-auto" @onclick="@(() => _managingStatuses = false)">
+                        Close
+                    </Button>
+                </div>
+            </CardBody>
+        </Card>
+    }
+
+    <Card>
+        <CardHeader>
+            <div class="d-flex flex-wrap align-items-center gap-2">
+                <span class="fw-semibold me-2">Units (@FilteredItems().Count of @_items.Count)</span>
+                <input class="form-control form-control-sm" style="max-width: 240px;" placeholder="Search model, serial, location, owner..."
+                       value="@_search" @oninput="@(e => _search = e.Value?.ToString() ?? "")" />
+                <select class="form-select form-select-sm" style="max-width: 170px;"
+                        value="@(_statusFilter ?? "")" @onchange="OnStatusFilterChanged">
+                    <option value="">All Statuses</option>
+                    @foreach (var status in _statuses)
+                    {
+                        <option value="@status.Id">@status.Label</option>
+                    }
+                </select>
+                <select class="form-select form-select-sm" style="max-width: 170px;" @bind="_sortBy">
+                    <option value="model">Sort: Model</option>
+                    <option value="status">Sort: Status</option>
+                    <option value="inspected">Sort: Inspection Age</option>
+                    <option value="loaned">Sort: Loaned Date</option>
+                </select>
+                <div class="d-flex align-items-center gap-1">
+                    <span class="text-muted small text-nowrap">Flag if from:</span>
+                    <CompanyPicker SelectedId="_excludeOriginalOwnerCompanyId" SelectedLabel="@_excludeOriginalOwnerLabel"
+                                   Placeholder="Search client..." SearchAsync="SearchClientsAsync"
+                                   OnSelect="SetExcludeOriginalOwner" OnClear="ClearExcludeOriginalOwner" />
+                </div>
+                @if (!string.IsNullOrWhiteSpace(_search) || _statusFilter is not null || _excludeOriginalOwnerCompanyId is not null)
+                {
+                    <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" @onclick="ClearFilters">
+                        Clear Filters
+                    </Button>
+                }
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="ms-auto" @onclick="() => _managingStatuses = !_managingStatuses">
+                    Manage Statuses
+                </Button>
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Disabled="_loading" @onclick="ReloadAsync">
+                    Refresh
+                </Button>
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Loading="_exporting" @onclick="ExportToSheetAsync">
+                    Export to Sheet
+                </Button>
+            </div>
+            @if (!string.IsNullOrWhiteSpace(_exportStatus))
+            {
+                <div class="@(_exportSuccess ? "text-success" : "text-danger") small mt-1">@_exportStatus</div>
+            }
+        </CardHeader>
+        <CardBody>
+            @{ var filtered = FilteredItems(); }
+            @if (filtered.Count == 0)
+            {
+                <p class="text-muted small mb-0">
+                    @(_items.Count == 0 ? "No LOAN-UNIT equipment found for company 1 in JMS." : "Nothing matches the current filters.")
+                </p>
+            }
+            else
+            {
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead>
+                            <tr>
+                                <th>Model</th>
+                                <th>Serial No.</th>
+                                <th>Original Owner(s)</th>
+                                <th>Status</th>
+                                <th>Location</th>
+                                <th>Loaned To</th>
+                                <th>Loan Job</th>
+                                <th>Loaned</th>
+                                <th>Covering For</th>
+                                <th>Inspected</th>
+                                <th>Agreement</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var i in filtered)
+                            {
+                                var inspectedDays = DaysSince(i.InspectedDate);
+                                var owners = OriginalOwnerIds(i);
+                                var flagged = IsFromFlaggedCustomer(i);
+                                <tr class="@(flagged ? "table-danger" : "")" title="@(flagged ? $"Originally from {_excludeOriginalOwnerLabel} — don't loan back" : null)">
+                                    <td>
+                                        @i.Model
+                                    </td>
+                                    <td>@i.SerialNumber</td>
+                                    <td class="small">
+                                        @if (owners.Count == 0)
+                                        {
+                                            <span class="text-muted">No previous owner record</span>
+                                        }
+                                        @foreach (var ownerId in owners)
+                                        {
+                                            <div title="@(i.PreviousOwnerCompanyIds.Contains(ownerId) ? "From JMS job history" : "Set manually")">@CompanyDisplayName(ownerId)</div>
+                                        }
+                                    </td>
+                                    <td>
+                                        <select class="form-select form-select-sm @StatusSelectClass(StatusOf(i))" style="min-width:140px;"
+                                                value="@i.Status" @onchange="@(e => UpdateStatusAsync(i, e))">
+                                            @foreach (var status in _statuses)
+                                            {
+                                                <option value="@status.Id">@status.Label</option>
+                                            }
+                                        </select>
+                                    </td>
+                                    <td class="small">
+                                        <CompanyPicker SelectedId="i.CurrentLocationCompanyId" SelectedLabel="@CompanyDisplayName(i.CurrentLocationCompanyId)"
+                                                       Placeholder="Search..." SearchAsync="SearchClientsAsync"
+                                                       OnSelect="@(sel => SetLocationAsync(i, sel))" OnClear="@(() => ClearLocationAsync(i))" />
+                                    </td>
+                                    <td class="small">
+                                        <CompanyPicker SelectedId="i.LoanedToCompanyId" SelectedLabel="@CompanyDisplayName(i.LoanedToCompanyId)"
+                                                       Placeholder="Search scope customer..." SearchAsync="SearchScopeCustomersAsync"
+                                                       OnSelect="@(sel => SetLoanedToAsync(i, sel))" OnClear="@(() => ClearLoanedToAsync(i))" />
+                                    </td>
+                                    <td class="small">
+                                        @if (i.JobId is int jobId)
+                                        {
+                                            <a href="@JmsLinks.JobSummary(jobId)" target="_blank" rel="noopener noreferrer">@jobId</a>
+                                        }
+                                        else
+                                        {
+                                            <span>—</span>
+                                        }
+                                    </td>
+                                    <td class="small">
+                                        @(i.LoanedDate is DateTime ld ? $"{ld:dd MMM yyyy} ({DaysSince(ld)}d)" : "—")
+                                    </td>
+                                    <td class="small" style="min-width:200px;">
+                                        @foreach (var coveringJobId in i.CoveringForJobIds)
+                                        {
+                                            var info = _coveringJobs.GetValueOrDefault(coveringJobId);
+                                            <div class="d-flex align-items-center gap-1">
+                                                <a href="@JmsLinks.JobSummary(coveringJobId)" target="_blank" rel="noopener noreferrer">@coveringJobId</a>
+                                                <span>— @(info?.Status ?? "Unknown")@(IsWaitingQuoteConfirmation(info) ? $" ({DaysSince(info!.QuotedDate)}d since quoted)" : "")</span>
+                                                <button type="button" class="btn btn-sm btn-link p-0 text-danger" title="Remove" @onclick="() => RemoveCoveringForAsync(i, coveringJobId)">×</button>
+                                            </div>
+                                        }
+                                        <div class="input-group input-group-sm mt-1" style="max-width:130px;">
+                                            <input type="number" class="form-control form-control-sm" placeholder="Job ID"
+                                                   value="@_coveringForInput.GetValueOrDefault(i.EquipmentId, "")"
+                                                   @onchange="@(e => _coveringForInput[i.EquipmentId] = e.Value?.ToString() ?? "")" />
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" @onclick="() => SubmitCoveringForAsync(i)">+</Button>
+                                        </div>
+                                    </td>
+                                    <td class="small @InspectionCssClass(inspectedDays)">
+                                        @(inspectedDays is int d ? $"{i.InspectedDate:dd MMM yyyy} ({d}d)" : "Not inspected")
+                                    </td>
+                                    <td>@(i.AgreementSigned ? "✓" : "")</td>
+                                    <td class="text-end" style="white-space: nowrap;">
+                                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" @onclick="() => StartEdit(i)">
+                                            Edit
+                                        </Button>
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </CardBody>
+    </Card>
+}
+
+@code {
+    private bool _loading = true;
+    private string? _loadError;
+    private List<LoanEquipmentView> _items = new();
+    private Dictionary<int, string> _companyNames = new();
+    private Dictionary<int, CoveringJobInfo> _coveringJobs = new();
+    private Dictionary<int, string> _coveringForInput = new();
+    private List<LoanEquipmentStatusOption> _statuses = new();
+    private List<(int Id, string Label)> _scopeCustomerCompanies = new();
+
+    private string _search = "";
+    private string? _statusFilter;
+    private string _sortBy = "model";
+    private int? _excludeOriginalOwnerCompanyId;
+    private string? _excludeOriginalOwnerLabel;
+
+    private int? _editingEquipmentId;
+    private string _editingLabel = "";
+    private int? _formOriginalOwnerId;
+    private string? _formOriginalOwnerLabel;
+    private string _formBuyPrice = "";
+    private string? _formError;
+    private bool _saving;
+
+    private bool _managingStatuses;
+    private string? _statusManageError;
+    private string _newStatusLabel = "";
+    private string _newStatusColor = "Secondary";
+
+    private enum PageTab { Fleet, CustomerJobs, Substitutes }
+
+    // Model Substitutes tab — loan model_id -> customer model_ids it can be loaned for.
+    private Dictionary<int, List<int>> _substitutes = new();
+    private Dictionary<int, string> _modelLabels = new();
+
+    // Manufacturer company_id -> short name, kept from the last reload so Customer Jobs' equipment
+    // labels use the same abbreviations as the fleet's Model column.
+    private Dictionary<string, string> _manuAbbreviations = new();
+    private PageTab _tab = PageTab.Fleet;
+
+    // Customer Jobs tab — null until first loaded (lazily, on first switch to the tab), and reset
+    // to null whenever the fleet reloads or a Loaned To changes so it's re-queried.
+    private List<CustomerModelJobRow>? _customerJobs;
+    private bool _customerLoading;
+    private string? _customerLoadError;
+    // company id -> every company id of the scope customer it belongs to (itself included).
+    private Dictionary<int, List<int>> _scopeCustomerSiblings = new();
+    private string _customerSearch = "";
+    private string? _customerStatusFilter;
+    private int? _customerFilterCompanyId;
+    private string? _customerFilterLabel;
+
+    private static readonly string[] BadgeColorNames = { "Success", "Info", "Primary", "Warning", "Danger", "Secondary" };
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        await ReloadAsync();
+    }
+
+    // ── Data loading ─────────────────────────────────────────────────────────
+
+    private async Task ReloadAsync()
+    {
+        _loading = true;
+        _loadError = null;
+        StateHasChanged();
+
+        var rows = await EquipmentLookup.GetLoanEquipmentAsync();
+        if (rows is null)
+        {
+            _loadError = "Failed to load loan equipment from JMS.";
+            _loading = false;
+            StateHasChanged();
+            return;
+        }
+
+        var overlaysByEquipmentId = (await Overlays.LoadAsync()).ToDictionary(o => o.EquipmentId);
+        _manuAbbreviations = await LoadManufacturerAbbreviationsAsync();
+        _statuses = await StatusStore.LoadAsync();
+        var defaultStatusId = _statuses.OrderBy(s => s.Order).FirstOrDefault()?.Id ?? "";
+
+        var scopeCustomers = await ScopeCustomers.LoadAsync();
+        _scopeCustomerSiblings = scopeCustomers
+            .SelectMany(c => c.CompanyIds.Select(id => (Id: id, Siblings: c.CompanyIds)))
+            .GroupBy(c => c.Id)
+            .ToDictionary(g => g.Key, g => g.SelectMany(c => c.Siblings).Distinct().ToList());
+        _scopeCustomerCompanies = scopeCustomers
+            .SelectMany(c => c.CompanyIds.Select(id => (Id: id, Label: FormatCompanyLabel(id, c.DisplayName))))
+            .OrderBy(c => c.Label, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        _items = rows.Select(r =>
+        {
+            overlaysByEquipmentId.TryGetValue(r.EquipmentId, out var overlay);
+            overlay ??= new LoanEquipmentOverlay { EquipmentId = r.EquipmentId };
+            return new LoanEquipmentView
+            {
+                EquipmentId = r.EquipmentId,
+                ModelId = r.ModelId,
+                Model = FormatModelLabel(r.ManufacturerId, r.ManufacturerName, r.ModelNameNo, _manuAbbreviations),
+                SerialNumber = r.SerialNo ?? "",
+                InspectedDate = DateTime.TryParse(r.LastInspectedDate, out var insp) ? insp : (DateTime?)null,
+                JobId = r.LoanJobId,
+                LoanedDate = DateTime.TryParse(r.LoanedDate, out var loaned) ? loaned : (DateTime?)null,
+                AgreementSigned = r.AgreementCount > 0,
+                Status = string.IsNullOrEmpty(overlay.Status) ? defaultStatusId : overlay.Status,
+                CurrentLocationCompanyId = overlay.CurrentLocationCompanyId,
+                LoanedToCompanyId = overlay.LoanedToCompanyId,
+                OriginalOwnerCompanyId = overlay.OriginalOwnerCompanyId,
+                BuyPrice = overlay.BuyPrice,
+                CoveringForJobIds = new List<int>(overlay.CoveringForJobIds)
+            };
+        }).ToList();
+
+        var companyIds = _items
+            .SelectMany(i => new[] { i.CurrentLocationCompanyId, i.LoanedToCompanyId, i.OriginalOwnerCompanyId })
+            .Where(id => id is not null)
+            .Select(id => id!.Value)
+            .Distinct()
+            .ToList();
+        _companyNames = await LoadCompanyNamesAsync(companyIds);
+
+        var previousOwners = await EquipmentLookup.GetPreviousOwnersAsync(_items.Select(i => i.EquipmentId).ToList());
+        var itemsById = _items.ToDictionary(i => i.EquipmentId);
+        foreach (var o in previousOwners)
+        {
+            if (itemsById.TryGetValue(o.EquipmentId, out var item))
+                item.PreviousOwnerCompanyIds.Add(o.CompanyId);
+            _companyNames.TryAdd(o.CompanyId, FormatCompanyLabel(o.CompanyId, o.CompanyName));
+        }
+
+        var coveringJobIds = _items.SelectMany(i => i.CoveringForJobIds).Distinct().ToList();
+        _coveringJobs = await LoadCoveringJobsAsync(coveringJobIds);
+
+        _substitutes = (await SubstituteStore.LoadAsync())
+            .ToDictionary(s => s.LoanModelId, s => s.SubstituteModelIds);
+        var substituteModelIds = _substitutes.Values.SelectMany(ids => ids).Distinct().ToList();
+        _modelLabels = (await ScopeLookup.GetModelLabelsAsync(substituteModelIds))
+            .ToDictionary(r => r.ModelId, r => r.Label ?? $"({r.ModelId})");
+
+        // The fleet may have changed — drop the cached customer jobs so they're re-queried.
+        _customerJobs = null;
+
+        _loading = false;
+        StateHasChanged();
+
+        if (_tab == PageTab.CustomerJobs)
+            await LoadCustomerJobsAsync();
+    }
+
+    // ── Customer Jobs tab ────────────────────────────────────────────────────
+
+    private async Task SwitchTab(PageTab tab)
+    {
+        _tab = tab;
+        if (tab == PageTab.CustomerJobs && _customerJobs is null && !_customerLoading)
+            await LoadCustomerJobsAsync();
+    }
+
+    private List<int> CustomerCompanyIds(int companyId) =>
+        _scopeCustomerSiblings.TryGetValue(companyId, out var ids) ? ids : new List<int> { companyId };
+
+    // One query for every loaned-out unit at once — all their models × all their customers'
+    // company ids — then CustomerJobsFor narrows the result back down per unit.
+    private async Task LoadCustomerJobsAsync()
+    {
+        _customerLoading = true;
+        _customerLoadError = null;
+        StateHasChanged();
+
+        var loanedOut = _items.Where(i => i.LoanedToCompanyId is not null && i.ModelId is not null).ToList();
+        var modelIds = loanedOut.SelectMany(i => MatchingModelIds(i.ModelId!.Value)).Distinct().ToList();
+        var companyIds = loanedOut.SelectMany(i => CustomerCompanyIds(i.LoanedToCompanyId!.Value)).Distinct().ToList();
+
+        var exclusions = await ScopeJobs.LoadAsync();
+        var rows = await EquipmentLookup.GetCustomerModelJobsAsync(modelIds, companyIds, exclusions);
+        if (rows is null)
+            _customerLoadError = "Failed to load customer jobs from JMS.";
+        _customerJobs = rows ?? new();
+
+        _customerLoading = false;
+        StateHasChanged();
+    }
+
+    private List<CustomerModelJobRow> CustomerJobsFor(LoanEquipmentView item)
+    {
+        if (_customerJobs is null || item.LoanedToCompanyId is not int loanedTo || item.ModelId is not int modelId)
+            return new();
+
+        var companyIds = CustomerCompanyIds(loanedTo);
+        var modelIds = MatchingModelIds(modelId);
+        return _customerJobs
+            .Where(j => modelIds.Contains(j.ModelId) && companyIds.Contains(j.CompanyId))
+            .GroupBy(j => j.JobId)
+            .Select(g => g.First())
+            .ToList();
+    }
+
+    // A loan model covers its own model plus whatever's been set on the Model Substitutes tab.
+    private List<int> MatchingModelIds(int loanModelId) =>
+        new[] { loanModelId }.Concat(SubstitutesOf(loanModelId)).Distinct().ToList();
+
+    // ── Model Substitutes tab ────────────────────────────────────────────────
+
+    private IReadOnlyList<int> SubstitutesOf(int loanModelId) =>
+        _substitutes.TryGetValue(loanModelId, out var ids) ? ids : Array.Empty<int>();
+
+    private string ModelLabel(int modelId) =>
+        _modelLabels.TryGetValue(modelId, out var label) ? label : $"({modelId})";
+
+    private List<(int ModelId, string Label, int UnitCount)> FleetModels() => _items
+        .Where(i => i.ModelId is not null)
+        .GroupBy(i => i.ModelId!.Value)
+        .Select(g => (g.Key, g.First().Model, g.Count()))
+        .OrderBy(m => m.Item2, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    private async Task<List<(int Id, string Label)>> SearchModelsAsync(string term)
+    {
+        var rows = await ScopeLookup.SearchModelsAsync(term);
+        return rows.Select(r => (r.ModelId, r.Label ?? $"({r.ModelId})")).ToList();
+    }
+
+    private async Task AddSubstituteAsync(int loanModelId, (int Id, string Label) selection)
+    {
+        if (selection.Id == loanModelId) return;
+        await SubstituteStore.AddAsync(loanModelId, selection.Id);
+        _modelLabels[selection.Id] = selection.Label;
+        if (!_substitutes.TryGetValue(loanModelId, out var ids))
+            _substitutes[loanModelId] = ids = new List<int>();
+        if (!ids.Contains(selection.Id)) ids.Add(selection.Id);
+        _customerJobs = null;
+        StateHasChanged();
+    }
+
+    private async Task RemoveSubstituteAsync(int loanModelId, int substituteModelId)
+    {
+        await SubstituteStore.RemoveAsync(loanModelId, substituteModelId);
+        if (_substitutes.TryGetValue(loanModelId, out var ids))
+        {
+            ids.Remove(substituteModelId);
+            if (ids.Count == 0) _substitutes.Remove(loanModelId);
+        }
+        _customerJobs = null;
+        StateHasChanged();
+    }
+
+    // Loaned-out units only (Loaned To set), in the same model/serial order as the Loan Fleet
+    // tab's default sort. The search also matches the jobs listed under a unit.
+    private List<LoanEquipmentView> LoanedOutItems()
+    {
+        IEnumerable<LoanEquipmentView> q = _items.Where(i => i.LoanedToCompanyId is not null);
+
+        if (_customerStatusFilter is string status)
+            q = q.Where(i => i.Status == status);
+
+        if (_customerFilterCompanyId is int companyId)
+            q = q.Where(i => CustomerCompanyIds(i.LoanedToCompanyId!.Value).Contains(companyId));
+
+        if (!string.IsNullOrWhiteSpace(_customerSearch))
+        {
+            var term = _customerSearch.Trim();
+            q = q.Where(i =>
+                i.Model.Contains(term, StringComparison.OrdinalIgnoreCase) ||
+                i.SerialNumber.Contains(term, StringComparison.OrdinalIgnoreCase) ||
+                CompanyLabel(i.LoanedToCompanyId).Contains(term, StringComparison.OrdinalIgnoreCase) ||
+                CustomerJobsFor(i).Any(j =>
+                    j.JobId.ToString().Contains(term) ||
+                    (j.SerialNo ?? "").Contains(term, StringComparison.OrdinalIgnoreCase) ||
+                    (j.CompanyName ?? "").Contains(term, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        return q
+            .OrderBy(i => i.Model, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(i => i.SerialNumber, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private async Task<Dictionary<int, string>> LoadCompanyNamesAsync(IReadOnlyCollection<int> companyIds)
+    {
+        var rows = await ScopeLookup.GetCompanyNamesAsync(companyIds);
+        return rows.ToDictionary(r => r.CompanyId, r => FormatCompanyLabel(r.CompanyId, r.CompanyName));
+    }
+
+    private async Task<List<(int Id, string Label)>> SearchClientsAsync(string term)
+    {
+        var rows = await ScopeLookup.SearchClientsAsync(term);
+        return rows.Select(r => (r.CompanyId, FormatCompanyLabel(r.CompanyId, r.CompanyName))).ToList();
+    }
+
+    // "Loaned To" is restricted to scope customers (ScopeCustomerManager's curated list) rather
+    // than any JMS company — a loan should only ever go out to a customer we actually track.
+    // Filters the already-loaded scope customer list locally rather than querying JMS again.
+    private Task<List<(int Id, string Label)>> SearchScopeCustomersAsync(string term) =>
+        Task.FromResult(_scopeCustomerCompanies
+            .Where(c => c.Label.Contains(term, StringComparison.OrdinalIgnoreCase))
+            .Take(20)
+            .ToList());
+
+    private async Task<Dictionary<int, CoveringJobInfo>> LoadCoveringJobsAsync(IReadOnlyCollection<int> jobIds)
+    {
+        var rows = await EquipmentLookup.GetCoveringJobsAsync(jobIds);
+        return rows.ToDictionary(r => r.JobId, r => new CoveringJobInfo
+        {
+            Status = r.JobStatus ?? "",
+            QuotedDate = DateTime.TryParse(r.QuotedDate, out var qd) ? qd : (DateTime?)null
+        });
+    }
+
+    // ── Filtering / sorting ──────────────────────────────────────────────────
+
+    private List<LoanEquipmentView> FilteredItems()
+    {
+        IEnumerable<LoanEquipmentView> q = _items;
+
+        if (_statusFilter is string status)
+            q = q.Where(i => i.Status == status);
+
+        if (!string.IsNullOrWhiteSpace(_search))
+        {
+            var term = _search.Trim();
+            q = q.Where(i =>
+                i.Model.Contains(term, StringComparison.OrdinalIgnoreCase) ||
+                i.SerialNumber.Contains(term, StringComparison.OrdinalIgnoreCase) ||
+                CompanyLabel(i.CurrentLocationCompanyId).Contains(term, StringComparison.OrdinalIgnoreCase) ||
+                CompanyLabel(i.LoanedToCompanyId).Contains(term, StringComparison.OrdinalIgnoreCase) ||
+                OriginalOwnerIds(i).Any(id => CompanyLabel(id).Contains(term, StringComparison.OrdinalIgnoreCase)) ||
+                (i.JobId is int jobId && jobId.ToString().Contains(term)) ||
+                i.CoveringForJobIds.Any(id => id.ToString().Contains(term)));
+        }
+
+        var statusOrder = _statuses.ToDictionary(s => s.Id, s => s.Order);
+        q = _sortBy switch
+        {
+            "status" => q.OrderBy(i => statusOrder.GetValueOrDefault(i.Status, int.MaxValue)).ThenBy(i => i.Model, StringComparer.OrdinalIgnoreCase),
+            "inspected" => q.OrderByDescending(i => DaysSince(i.InspectedDate) ?? int.MaxValue),
+            "loaned" => q.OrderByDescending(i => i.LoanedDate ?? DateTime.MinValue),
+            _ => q.OrderBy(i => i.Model, StringComparer.OrdinalIgnoreCase).ThenBy(i => i.SerialNumber, StringComparer.OrdinalIgnoreCase)
+        };
+
+        return q.ToList();
+    }
+
+    // Manual owner (if set) plus every owner derived from JMS job history.
+    private static List<int> OriginalOwnerIds(LoanEquipmentView item) =>
+        (item.OriginalOwnerCompanyId is int manual ? new[] { manual } : Array.Empty<int>())
+            .Concat(item.PreviousOwnerCompanyIds)
+            .Distinct()
+            .ToList();
+
+    // Matches any site of the flagged company's scope customer, not just the exact company id.
+    private bool IsFromFlaggedCustomer(LoanEquipmentView item)
+    {
+        if (_excludeOriginalOwnerCompanyId is not int flaggedId) return false;
+        var customerIds = CustomerCompanyIds(flaggedId);
+        return OriginalOwnerIds(item).Any(customerIds.Contains);
+    }
+
+    private void ToggleStatusFilter(string statusId) =>
+        _statusFilter = _statusFilter == statusId ? null : statusId;
+
+    private void OnStatusFilterChanged(ChangeEventArgs e)
+    {
+        var value = e.Value?.ToString();
+        _statusFilter = string.IsNullOrEmpty(value) ? null : value;
+    }
+
+    private void SetExcludeOriginalOwner((int Id, string Label) sel)
+    {
+        _excludeOriginalOwnerCompanyId = sel.Id;
+        _excludeOriginalOwnerLabel = sel.Label;
+    }
+
+    private void ClearExcludeOriginalOwner()
+    {
+        _excludeOriginalOwnerCompanyId = null;
+        _excludeOriginalOwnerLabel = null;
+    }
+
+    private void ClearFilters()
+    {
+        _search = "";
+        _statusFilter = null;
+        ClearExcludeOriginalOwner();
+    }
+
+    // ── Inline table edits — each patches one field on the row and saves immediately ───────
+
+    private async Task UpdateStatusAsync(LoanEquipmentView item, ChangeEventArgs e)
+    {
+        var statusId = e.Value?.ToString();
+        if (string.IsNullOrEmpty(statusId)) return;
+        item.Status = statusId;
+        await SaveOverlayAsync(item);
+    }
+
+    private async Task SetLocationAsync(LoanEquipmentView item, (int Id, string Label) selection)
+    {
+        item.CurrentLocationCompanyId = selection.Id;
+        _companyNames[selection.Id] = selection.Label;
+        await SaveOverlayAsync(item);
+    }
+
+    private async Task ClearLocationAsync(LoanEquipmentView item)
+    {
+        item.CurrentLocationCompanyId = null;
+        await SaveOverlayAsync(item);
+    }
+
+    private async Task SetLoanedToAsync(LoanEquipmentView item, (int Id, string Label) selection)
+    {
+        item.LoanedToCompanyId = selection.Id;
+        _companyNames[selection.Id] = selection.Label;
+        _customerJobs = null;
+        await SaveOverlayAsync(item);
+    }
+
+    private async Task ClearLoanedToAsync(LoanEquipmentView item)
+    {
+        item.LoanedToCompanyId = null;
+        _customerJobs = null;
+        await SaveOverlayAsync(item);
+    }
+
+    private async Task SubmitCoveringForAsync(LoanEquipmentView item)
+    {
+        if (!_coveringForInput.TryGetValue(item.EquipmentId, out var raw) || !int.TryParse(raw, out var jobId))
+            return;
+
+        _coveringForInput[item.EquipmentId] = "";
+
+        if (!item.CoveringForJobIds.Contains(jobId))
+            item.CoveringForJobIds.Add(jobId);
+
+        if (!_coveringJobs.ContainsKey(jobId))
+        {
+            var info = await LoadCoveringJobsAsync(new[] { jobId });
+            foreach (var kv in info) _coveringJobs[kv.Key] = kv.Value;
+        }
+
+        await SaveOverlayAsync(item);
+    }
+
+    private async Task RemoveCoveringForAsync(LoanEquipmentView item, int jobId)
+    {
+        item.CoveringForJobIds.Remove(jobId);
+        await SaveOverlayAsync(item);
+    }
+
+    private async Task SaveOverlayAsync(LoanEquipmentView item)
+    {
+        var overlay = new LoanEquipmentOverlay
+        {
+            EquipmentId = item.EquipmentId,
+            Status = item.Status,
+            CurrentLocationCompanyId = item.CurrentLocationCompanyId,
+            LoanedToCompanyId = item.LoanedToCompanyId,
+            OriginalOwnerCompanyId = item.OriginalOwnerCompanyId,
+            BuyPrice = item.BuyPrice,
+            CoveringForJobIds = new List<int>(item.CoveringForJobIds)
+        };
+        await Overlays.UpsertAsync(overlay);
+        StateHasChanged();
+    }
+
+    // ── Edit panel — Original Owner + Buy Price only ────────────────────────────────────────
+
+    private void StartEdit(LoanEquipmentView i)
+    {
+        _editingEquipmentId = i.EquipmentId;
+        _editingLabel = $"{i.Model} — {i.SerialNumber}";
+        _formOriginalOwnerId = i.OriginalOwnerCompanyId;
+        _formOriginalOwnerLabel = CompanyLabelOrNull(i.OriginalOwnerCompanyId);
+        _formBuyPrice = i.BuyPrice?.ToString(CultureInfo.InvariantCulture) ?? "";
+        _formError = null;
+    }
+
+    private void CancelEdit()
+    {
+        _editingEquipmentId = null;
+        _editingLabel = "";
+        _formOriginalOwnerId = null;
+        _formOriginalOwnerLabel = null;
+        _formBuyPrice = "";
+        _formError = null;
+    }
+
+    private async Task SaveEditAsync()
+    {
+        if (_editingEquipmentId is not int equipmentId) return;
+        var item = _items.FirstOrDefault(x => x.EquipmentId == equipmentId);
+        if (item is null)
+        {
+            CancelEdit();
+            return;
+        }
+
+        decimal? buyPrice = null;
+        if (!string.IsNullOrWhiteSpace(_formBuyPrice))
+        {
+            if (!decimal.TryParse(_formBuyPrice, NumberStyles.Number, CultureInfo.InvariantCulture, out var parsed))
+            {
+                _formError = "Buy price must be a number.";
+                return;
+            }
+            buyPrice = parsed;
+        }
+
+        item.OriginalOwnerCompanyId = _formOriginalOwnerId;
+        item.BuyPrice = buyPrice;
+
+        _saving = true;
+        StateHasChanged();
+
+        try
+        {
+            await SaveOverlayAsync(item);
+            CancelEdit();
+        }
+        finally
+        {
+            _saving = false;
+            StateHasChanged();
+        }
+    }
+
+    // ── Export ────────────────────────────────────────────────────────────────
+    // Exports every unit (not just what's currently filtered/searched on screen) — the sheet
+    // is meant to be a full read-only mirror of the data, not a snapshot of whatever filter
+    // happened to be active when someone clicked the button.
+
+    private bool _exporting;
+    private bool _exportSuccess;
+    private string? _exportStatus;
+
+    private async Task ExportToSheetAsync()
+    {
+        _exportStatus = null;
+        _exporting = true;
+        StateHasChanged();
+
+        try
+        {
+            var rows = _items.Select(BuildExportRow).ToList();
+            await SheetExport.ExportAsync(rows);
+
+            _exportSuccess = true;
+            _exportStatus = $"Exported {rows.Count} unit(s) to the sheet.";
+        }
+        catch (Exception ex)
+        {
+            _exportSuccess = false;
+            _exportStatus = $"Export failed: {ex.Message}";
+            Logger.LogError(ex, "Loan equipment export to the sheet failed");
+        }
+        finally
+        {
+            _exporting = false;
+            StateHasChanged();
+        }
+    }
+
+    private LoanEquipmentExportRow BuildExportRow(LoanEquipmentView i) => new(
+        Model: i.Model,
+        SerialNumber: i.SerialNumber,
+        Status: StatusOf(i).Label,
+        Location: CompanyLabel(i.CurrentLocationCompanyId),
+        LoanedTo: CompanyLabel(i.LoanedToCompanyId),
+        OriginalOwner: string.Join(", ", OriginalOwnerIds(i).Select(id => CompanyLabel(id))),
+        Job: i.JobId?.ToString() ?? "",
+        LoanedDate: i.LoanedDate?.ToString("dd MMM yyyy") ?? "",
+        CoveringFor: string.Join(", ", i.CoveringForJobIds),
+        InspectedDate: i.InspectedDate?.ToString("dd MMM yyyy") ?? "",
+        AgreementSigned: i.AgreementSigned ? "Yes" : "No",
+        BuyPrice: i.BuyPrice?.ToString("0.00") ?? "");
+
+    // ── Display / formatting helpers ────────────────────────────────────────
+
+    private string CompanyLabel(int? companyId)
+    {
+        if (companyId is not int id) return "—";
+        return _companyNames.TryGetValue(id, out var label) ? label : $"({id})";
+    }
+
+    private string? CompanyLabelOrNull(int? companyId) => companyId is int ? CompanyLabel(companyId) : null;
+
+    // Location/Loaned To show just the plain company name, no "(id)" suffix — disambiguating
+    // same-named companies isn't worth the extra text there. CompanyLabel/CompanyLabelOrNull
+    // (with the id) are still used for Original Owner and the exclude filter, where it is.
+    private string CompanyDisplayName(int? companyId)
+    {
+        if (companyId is not int id) return "—";
+        if (!_companyNames.TryGetValue(id, out var label)) return "—";
+        var idx = label.LastIndexOf(" (", StringComparison.Ordinal);
+        return idx > 0 ? label[..idx] : label;
+    }
+
+    private static int? DaysSince(DateTime? date) =>
+        date.HasValue ? (int)(DateTime.Today - date.Value.Date).TotalDays : null;
+
+    // Green within 30 days, red past 90, and no colour override (the theme's normal text)
+    // in between.
+    private static string InspectionCssClass(int? days) => days switch
+    {
+        null => "text-stale-danger",
+        <= 30 => "text-success",
+        > 90 => "text-stale-danger",
+        _ => ""
+    };
+
+    // How long a unit's been out on loan: green for the first 30 days, amber up to 60, red past that.
+    private static string LoanAgeCssClass(int? days) => days switch
+    {
+        null => "",
+        <= 30 => "text-success",
+        <= 60 => "text-warning",
+        _ => "text-stale-danger"
+    };
+
+    // Covering-for jobs only need a duration shown while they're actually the reason the loan is
+    // outstanding — job_status_id 10, "Waiting Quote Confirmation" — not for jobs already quoted
+    // and moved on (job_status_history still remembers a quote date for those, which isn't
+    // relevant once the job's left that status).
+    private static bool IsWaitingQuoteConfirmation(CoveringJobInfo? info) =>
+        info is not null
+        && string.Equals(info.Status, "Waiting Quote Confirmation", StringComparison.OrdinalIgnoreCase)
+        && info.QuotedDate is not null;
+
+    // Plain bootstrap badge classes (not the <Badge> component) for the clickable filter chips —
+    // BlazorBootstrap's <Badge> isn't guaranteed to forward @onclick to its rendered element.
+    // Color is now a free-text field on LoanEquipmentStatusOption (set via Manage Statuses)
+    // rather than a fixed enum switch, so an unrecognised value just falls back to secondary.
+    private static (string Label, string CssClass) StatusBadgeClass(LoanEquipmentStatusOption status)
+    {
+        var cssClass = status.Color switch
+        {
+            "Success" => "bg-success",
+            "Info" => "bg-info text-dark",
+            "Primary" => "bg-primary",
+            "Warning" => "bg-warning text-dark",
+            "Danger" => "bg-danger",
+            _ => "bg-secondary"
+        };
+        return (status.Label, cssClass);
+    }
+
+    // Same colour as the filter chips, applied as the inline status <select>'s own background —
+    // bg-* utilities are !important in Bootstrap 5 so they win over .form-select's default fill.
+    // Bootstrap's badge/chip text already reads fine without an explicit colour, but a <select>
+    // has no such default, so this adds text-white everywhere StatusBadgeClass didn't already
+    // add text-dark (info/warning), to keep the label readable against the coloured background.
+    private static string StatusSelectClass(LoanEquipmentStatusOption status)
+    {
+        var (_, cssClass) = StatusBadgeClass(status);
+        return cssClass.Contains("text-dark") ? cssClass : $"{cssClass} text-white";
+    }
+
+    // A row's Status is just the configured status's Id — resolve it back to the option for
+    // display. Falls back to a plain secondary badge showing the raw id if a unit's status was
+    // ever removed by hand-editing the database rather than through Manage Statuses (removal via the
+    // panel is blocked while any unit still uses the status, so this should be rare).
+    private LoanEquipmentStatusOption StatusOf(LoanEquipmentView item) =>
+        _statuses.FirstOrDefault(s => s.Id == item.Status)
+        ?? new LoanEquipmentStatusOption { Id = item.Status, Label = item.Status, Color = "Secondary" };
+
+    // ── Manage Statuses panel ────────────────────────────────────────────────
+
+    private async Task AddStatusAsync()
+    {
+        var label = _newStatusLabel.Trim();
+        if (string.IsNullOrWhiteSpace(label)) return;
+
+        try
+        {
+            await StatusStore.AddAsync(label, _newStatusColor);
+            _newStatusLabel = "";
+            _statusManageError = null;
+        }
+        catch (InvalidOperationException ex)
+        {
+            _statusManageError = ex.Message;
+        }
+
+        _statuses = await StatusStore.LoadAsync();
+        StateHasChanged();
+    }
+
+    private async Task RenameStatusAsync(LoanEquipmentStatusOption status, string newLabel)
+    {
+        newLabel = newLabel.Trim();
+        if (string.IsNullOrWhiteSpace(newLabel) || newLabel == status.Label) return;
+
+        try
+        {
+            await StatusStore.UpdateAsync(status.Id, newLabel, status.Color);
+            _statusManageError = null;
+        }
+        catch (InvalidOperationException ex)
+        {
+            _statusManageError = ex.Message;
+        }
+
+        _statuses = await StatusStore.LoadAsync();
+        StateHasChanged();
+    }
+
+    private async Task RecolorStatusAsync(LoanEquipmentStatusOption status, string newColor)
+    {
+        await StatusStore.UpdateAsync(status.Id, status.Label, newColor);
+        _statuses = await StatusStore.LoadAsync();
+        StateHasChanged();
+    }
+
+    private async Task RemoveStatusAsync(LoanEquipmentStatusOption status)
+    {
+        var inUse = _items.Count(i => i.Status == status.Id);
+        if (inUse > 0)
+        {
+            _statusManageError = $"Cannot remove \"{status.Label}\" — {inUse} unit(s) still use this status.";
+            return;
+        }
+
+        _statusManageError = null;
+        await StatusStore.RemoveAsync(status.Id);
+        _statuses = await StatusStore.LoadAsync();
+        StateHasChanged();
+    }
+
+    private async Task MoveStatusAsync(LoanEquipmentStatusOption status, int direction)
+    {
+        await StatusStore.MoveAsync(status.Id, direction);
+        _statuses = await StatusStore.LoadAsync();
+        StateHasChanged();
+    }
+
+
+    // Same manufacturer abbreviations (manufacturer company_id -> preferred short name)
+    // WaitingQuoteDetail.razor uses via WaitingQuoteReport.AbbreviateEquipment — read fresh on
+    // every reload so an edit shows up without a restart.
+    private async Task<Dictionary<string, string>> LoadManufacturerAbbreviationsAsync()
+    {
+        try
+        {
+            return await ManufacturerAbbreviations.LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning("Could not load manufacturer abbreviations: {Error}", ex.Message);
+            return new();
+        }
+    }
+
+    private static string FormatModelLabel(int? manufacturerId, string? manufacturerName, string? modelName, Dictionary<string, string> abbreviations)
+    {
+        var manuLabel = manufacturerId is int id && abbreviations.TryGetValue(id.ToString(), out var abbrev)
+            ? abbrev
+            : manufacturerName ?? "";
+        return string.IsNullOrWhiteSpace(manuLabel) ? (modelName ?? "") : $"{manuLabel} {modelName}".Trim();
+    }
+
+    private class LoanEquipmentView
+    {
+        public int EquipmentId { get; set; }
+        public int? ModelId { get; set; }
+        public string Model { get; set; } = "";
+        public string SerialNumber { get; set; } = "";
+        public DateTime? InspectedDate { get; set; }
+        public int? JobId { get; set; }
+        public DateTime? LoanedDate { get; set; }
+        public bool AgreementSigned { get; set; }
+        public string Status { get; set; } = "";
+        public int? CurrentLocationCompanyId { get; set; }
+        public int? LoanedToCompanyId { get; set; }
+        public int? OriginalOwnerCompanyId { get; set; }
+        // Derived from JMS job history on each reload — never saved to the overlay.
+        public List<int> PreviousOwnerCompanyIds { get; set; } = new();
+        public decimal? BuyPrice { get; set; }
+        public List<int> CoveringForJobIds { get; set; } = new();
+    }
+
+
+    private class CoveringJobInfo
+    {
+        public string Status { get; set; } = "";
+        public DateTime? QuotedDate { get; set; }
+    }
+}

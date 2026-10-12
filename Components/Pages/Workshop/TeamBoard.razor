@@ -1,0 +1,259 @@
+@page "/team-board"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject TeamNoticeStore Notices
+@inject WorkshopTaskStore Tasks
+@inject Microsoft.AspNetCore.Components.Authorization.AuthenticationStateProvider AuthStateProvider
+
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    TeamBoard — the two lists shown on the workshop notifications monitor:
+    free-text notices and a daily/weekly/monthly checklist.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      Notices — TeamNoticeStore: notices, stamped with the logged-in user
+                as Author
+      Tasks   — WorkshopTaskStore: the checklist items, grouped by
+                TaskFrequency and each independently toggleable
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      OnInitializedAsync resolves the username (for notice authorship) then
+      ReloadAsync loads both lists. Each add/toggle/remove action calls its
+      store directly and reloads — no local-only state to reconcile.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Team Board</h1>
+    <p class="text-muted">
+        Notices and the daily/weekly/monthly task list shown on the
+        <a href="/workshop-notifications">workshop notifications monitor</a>.
+    </p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else
+{
+    <div class="row g-4">
+        <div class="col-12 col-lg-6">
+            <Card Class="mb-4">
+                <CardHeader>Add a notice</CardHeader>
+                <CardBody>
+                    @if (!string.IsNullOrEmpty(_noticeError))
+                    {
+                        <Callout Color="CalloutColor.Danger" Class="mb-3">@_noticeError</Callout>
+                    }
+                    <div class="mb-3">
+                        <textarea class="form-control" rows="2" placeholder="e.g. Forklift out of service, use the spare"
+                                  value="@_noticeText" @oninput="@(e => _noticeText = e.Value?.ToString() ?? "")"></textarea>
+                    </div>
+                    <Button Color="ButtonColor.Primary" Disabled="_savingNotice" @onclick="AddNoticeAsync">
+                        @(_savingNotice ? "Adding..." : "Add notice")
+                    </Button>
+                </CardBody>
+            </Card>
+
+            <Card>
+                <CardHeader>Notices (@_notices.Count)</CardHeader>
+                <CardBody>
+                    @if (_notices.Count == 0)
+                    {
+                        <p class="text-muted small mb-0">No notices yet — add one above.</p>
+                    }
+                    else
+                    {
+                        @foreach (var n in _notices)
+                        {
+                            <div class="d-flex justify-content-between align-items-start py-2 border-bottom">
+                                <div>
+                                    <div>@n.Text</div>
+                                    <div class="text-muted small">@n.Author &middot; @n.CreatedAt.ToString("d MMM, HH:mm")</div>
+                                </div>
+                                <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" @onclick="() => RemoveNoticeAsync(n.Id)">
+                                    Delete
+                                </Button>
+                            </div>
+                        }
+                    }
+                </CardBody>
+            </Card>
+        </div>
+
+        <div class="col-12 col-lg-6">
+            <Card Class="mb-4">
+                <CardHeader>Add a task</CardHeader>
+                <CardBody>
+                    @if (!string.IsNullOrEmpty(_taskError))
+                    {
+                        <Callout Color="CalloutColor.Danger" Class="mb-3">@_taskError</Callout>
+                    }
+                    <div class="row g-3 mb-3">
+                        <div class="col-8">
+                            <input class="form-control" placeholder="e.g. Empty bins"
+                                   value="@_taskLabel" @oninput="@(e => _taskLabel = e.Value?.ToString() ?? "")" />
+                        </div>
+                        <div class="col-4">
+                            <select class="form-select" value="@_taskFrequency" @onchange="@(e => _taskFrequency = Enum.Parse<TaskFrequency>(e.Value?.ToString() ?? nameof(TaskFrequency.Daily)))">
+                                @foreach (var freq in Enum.GetValues<TaskFrequency>())
+                                {
+                                    <option value="@freq">@freq</option>
+                                }
+                            </select>
+                        </div>
+                    </div>
+                    <Button Color="ButtonColor.Primary" Disabled="_savingTask" @onclick="AddTaskAsync">
+                        @(_savingTask ? "Adding..." : "Add task")
+                    </Button>
+                </CardBody>
+            </Card>
+
+            <Card>
+                <CardHeader>Tasks (@_tasks.Count)</CardHeader>
+                <CardBody>
+                    @if (_tasks.Count == 0)
+                    {
+                        <p class="text-muted small mb-0">No tasks yet — add one above.</p>
+                    }
+                    else
+                    {
+                        @foreach (var group in _tasks.GroupBy(t => t.Frequency).OrderBy(g => g.Key))
+                        {
+                            <div class="text-muted small text-uppercase mb-1 mt-2">@group.Key</div>
+                            @foreach (var t in group)
+                            {
+                                <div class="d-flex align-items-center justify-content-between py-1">
+                                    <div class="form-check">
+                                        <input class="form-check-input" type="checkbox" id="@t.Id"
+                                               checked="@t.Done" @onchange="@(e => ToggleTaskAsync(t.Id, (bool)(e.Value ?? false)))" />
+                                        <label class="form-check-label @(t.Done ? "text-muted text-decoration-line-through" : "")" for="@t.Id">
+                                            @t.Label
+                                        </label>
+                                    </div>
+                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" @onclick="() => RemoveTaskAsync(t.Id)">
+                                        Delete
+                                    </Button>
+                                </div>
+                            }
+                        }
+                    }
+                </CardBody>
+            </Card>
+        </div>
+    </div>
+}
+
+@code {
+    private bool _loading = true;
+    private List<TeamNotice> _notices = new();
+    private List<WorkshopTask> _tasks = new();
+    private string _username = "unknown";
+
+    private string _noticeText = "";
+    private string? _noticeError;
+    private bool _savingNotice;
+
+    private string _taskLabel = "";
+    private TaskFrequency _taskFrequency = TaskFrequency.Daily;
+    private string? _taskError;
+    private bool _savingTask;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        var auth = await AuthStateProvider.GetAuthenticationStateAsync();
+        _username = auth.User.Identity?.Name ?? "unknown";
+        await ReloadAsync();
+    }
+
+    private async Task ReloadAsync()
+    {
+        _notices = await Notices.LoadAsync();
+        _tasks = await Tasks.LoadAsync();
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private async Task AddNoticeAsync()
+    {
+        _noticeError = null;
+        var text = _noticeText.Trim();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            _noticeError = "Enter a notice.";
+            return;
+        }
+
+        _savingNotice = true;
+        StateHasChanged();
+        try
+        {
+            await Notices.AddAsync(new TeamNotice { Text = text, Author = _username });
+            _noticeText = "";
+            await ReloadAsync();
+        }
+        finally
+        {
+            _savingNotice = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task RemoveNoticeAsync(Guid id)
+    {
+        await Notices.RemoveAsync(id);
+        await ReloadAsync();
+    }
+
+    private async Task AddTaskAsync()
+    {
+        _taskError = null;
+        var label = _taskLabel.Trim();
+        if (string.IsNullOrWhiteSpace(label))
+        {
+            _taskError = "Enter a task.";
+            return;
+        }
+
+        _savingTask = true;
+        StateHasChanged();
+        try
+        {
+            await Tasks.AddAsync(new WorkshopTask { Label = label, Frequency = _taskFrequency });
+            _taskLabel = "";
+            await ReloadAsync();
+        }
+        finally
+        {
+            _savingTask = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task ToggleTaskAsync(Guid id, bool done)
+    {
+        await Tasks.SetDoneAsync(id, done);
+        await ReloadAsync();
+    }
+
+    private async Task RemoveTaskAsync(Guid id)
+    {
+        await Tasks.RemoveAsync(id);
+        await ReloadAsync();
+    }
+}

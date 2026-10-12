@@ -1,0 +1,36 @@
+﻿@using System.Globalization
+@using Microsoft.AspNetCore.Components.Forms
+
+@* CostPriceSection — a labeled decimal input with a SetError-driven
+   validation message, matching the other Form/*Section fields' shape
+   (Value getter, SetError setter) so a parent form can validate them all
+   the same way. *@
+
+@if (_isMissing)
+{
+    <div class="text-danger">
+        cost price is required
+    </div>
+}
+
+<label>
+    @Heading
+    <InputNumber TValue="decimal"
+                 class="form-control"
+                 @bind-Value="_value" />
+</label>
+
+@code {
+    [Parameter] public string Heading { get; set; } = "Cost Price";
+
+    private decimal _value = 0m;
+    private bool _isMissing = false;
+
+    public decimal Value => _value;
+
+    public void SetError(bool isMissing)
+    {
+        _isMissing = isMissing;
+        StateHasChanged();
+    }
+}

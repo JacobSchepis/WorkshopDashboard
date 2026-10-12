@@ -1,0 +1,47 @@
+﻿@* JobIdsSection — free-text bulk job-id entry: one textarea accepting
+   newline/comma/space/tab/semicolon-separated ids, deduplicated and
+   order-preserved via ParseMany. Used wherever a page needs "paste a list
+   of job numbers" rather than picking them one at a time. *@
+
+@if (_isMissing)
+{
+    <div class="text-danger">
+        No jobs provided
+    </div>
+}
+<textarea class="form-control" rows="5" @bind="_jobIdsRaw" placeholder="Example:
+        140001
+        140002
+        140003
+    (or comma/space separated)">
+</textarea>
+<div class="form-text">Accepts newline, comma, space, or tab separated.</div>
+
+@code {
+    private String _jobIdsRaw = "";
+
+    private bool _isMissing = false;
+
+    public List<int> JobIds => ParseMany(_jobIdsRaw);
+
+    private List<int> ParseMany(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return [];
+
+        var parts = raw.Split(new[] { '\r', '\n', ',', ' ', '\t', ';' },
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        var result = new List<int>(parts.Length);
+        foreach (var p in parts)
+            if (int.TryParse(p, out var id) && id > 0)
+                result.Add(id);
+
+        return result.Distinct().ToList();
+    }
+
+    public void SetError(bool isMissing)
+    {
+        _isMissing = isMissing;
+        StateHasChanged();
+    }
+}

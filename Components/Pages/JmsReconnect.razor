@@ -1,0 +1,84 @@
+@page "/jms-reconnect"
+@rendermode InteractiveServer
+
+@using BlazorBootstrap
+@using WorkshopDashboard.Services.Accounts
+@using WorkshopDashboard.Services.External.Jms
+
+@inject UserAccountService Accounts
+@inject AuthenticationStateProvider AuthStateProvider
+@inject NavigationManager Nav
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    JmsReconnect — where the nav bar's "JMS login needed" badge sends you.
+    The app keeps your JMS password (encrypted) to log you back into JMS
+    whenever your session expires; this page re-saves it when JMS has
+    stopped accepting the saved one (you changed it in JMS) or it can't be
+    read any more. Checked against JMS before it's saved — see
+    UserAccountService.ReconnectAsync.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Reconnect to JMS</h1>
+    <p class="text-muted">JMS didn't accept the password saved for <strong>@_username</strong> — usually because it was changed in JMS. Enter your current JMS password to reconnect.</p>
+</div>
+
+<div class="row">
+    <div class="col-lg-4">
+        <EditForm Model="@this" OnSubmit="ReconnectAsync">
+            <div class="mb-3">
+                <label class="form-label">JMS password</label>
+                <input type="password" class="form-control" value="@_password"
+                       @oninput="e => _password = e.Value?.ToString() ?? string.Empty" />
+            </div>
+
+            @if (_message is not null)
+            {
+                <Callout Color="CalloutColor.Danger" Class="mb-3">@_message</Callout>
+            }
+
+            <Button Color="ButtonColor.Primary" Type="ButtonType.Submit" Disabled="_busy">
+                @if (_busy) { <Spinner Size="SpinnerSize.Small" Class="me-2" /> }
+                Reconnect
+            </Button>
+        </EditForm>
+    </div>
+</div>
+
+@code {
+    private string? _username;
+    private string _password = string.Empty;
+    private string? _message;
+    private bool _busy;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var auth = await AuthStateProvider.GetAuthenticationStateAsync();
+        _username = auth.User.Identity?.Name;
+    }
+
+    private async Task ReconnectAsync()
+    {
+        if (string.IsNullOrEmpty(_username) || string.IsNullOrEmpty(_password)) return;
+
+        _busy = true;
+        _message = null;
+
+        var result = await Accounts.ReconnectAsync(_username, _password);
+        if (result == JmsAuthResult.Success)
+        {
+            // Full reload so the nav bar's badge re-checks straight away.
+            Nav.NavigateTo("/", forceLoad: true);
+            return;
+        }
+
+        _message = result == JmsAuthResult.Rejected
+            ? "JMS didn't accept that password."
+            : "JMS can't be reached right now. Try again once it's back.";
+
+        _password = string.Empty;
+        _busy = false;
+    }
+}

@@ -1,0 +1,620 @@
+@page "/scope-customers"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject ScopeCustomerStore Customers
+@inject ScopeLookupService ScopeLookup
+
+@using CsvHelper
+@using CsvHelper.Configuration
+@using System.Globalization
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Components.Forms
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using static WorkshopDashboard.Services.Admin.ScopeLabelFormatter
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    ScopeCustomerManager — the source of truth for ScopeCustomer records:
+    company ids (a customer can be a group of several JMS companies under
+    one display name), contacts, state, equipment tags, and optional
+    departments (see ScopeDepartment). Consumed by the Waiting Quote
+    dashboard and detail page, Send Email To All, and Scope Reporting.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      Customers   — ScopeCustomerStore: LoadAsync/AddAsync/UpdateAsync/RemoveAsync
+      ScopeLookup — ScopeLookupService: company name resolution/search, and
+                    contact search/details (JMS's company_people records —
+                    a contact must already exist there to be picked)
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      One form doubles as add/edit (StartEdit/CancelEdit, keyed by
+      _editingOriginalName since display names can be renamed). Each
+      ExclusionSection (company ids, primary/secondary contacts) does its
+      own live SearchAsync against ScopeLookup. SaveAsync surfaces
+      InvalidOperationException from the store (e.g. duplicate name) as a
+      form error rather than throwing.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Scope Customer Manager</h1>
+    <p class="text-muted">
+        The source of truth for scope customer data — company ids, contacts, state, and equipment
+        tags — used by the Waiting Quote dashboard, Send Email To All, and anything else that needs
+        to know who a scope customer is. Each customer groups the (sometimes duplicate) company ids
+        that belong to it under one display name.
+    </p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else
+{
+    <Card Class="mb-4">
+        <CardHeader>@(_editingOriginalName is null ? "Add Customer" : $"Edit \"{_editingOriginalName}\"")</CardHeader>
+        <CardBody>
+            @if (!string.IsNullOrEmpty(_formError))
+            {
+                <Callout Color="CalloutColor.Danger" Class="mb-3">@_formError</Callout>
+            }
+
+            <div class="row g-3 mb-3">
+                <div class="col-md-6">
+                    <label class="form-label">Customer name</label>
+                    <input class="form-control" placeholder="e.g. Kestrelvale Hospital"
+                           value="@_formName" @oninput="@(e => _formName = e.Value?.ToString() ?? "")" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">State</label>
+                    <select class="form-select" value="@_formState" @onchange="@(e => _formState = e.Value?.ToString() ?? "")">
+                        <option value="">— Unset —</option>
+                        @foreach (var state in AuStates)
+                        {
+                            <option value="@state">@state</option>
+                        }
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">Credit sheet tab</label>
+                    <input class="form-control" placeholder="Exact tab title, e.g. Kestrelvale Hospital"
+                           value="@_formCreditSheetTabName" @oninput="@(e => _formCreditSheetTabName = e.Value?.ToString() ?? "")" />
+                    <span class="text-muted small">Leave blank if this customer isn't tracked in the credit sheet.</span>
+                </div>
+            </div>
+
+            <div class="mb-3" style="max-width: 480px;">
+                <ExclusionSection Title="Company IDs"
+                                   Placeholder="Search company name..."
+                                   Ids="_formCompanyIds.OrderBy(id => id).ToList()"
+                                   Labels="_companyNames"
+                                   SearchAsync="SearchCompaniesAsync"
+                                   OnAdd="AddFormCompanyId"
+                                   OnRemove="RemoveFormCompanyId" />
+            </div>
+
+            @if (_formCompanyIds.Count == 0)
+            {
+                <p class="text-muted small mb-3">Add at least one company id above to search for contacts.</p>
+            }
+            else
+            {
+                <div class="row g-3 mb-3">
+                    <div class="col-md-6">
+                        <ExclusionSection Title="Primary Contacts"
+                                           Placeholder="Search contact name or email..."
+                                           Ids="_formPrimaryContactIds"
+                                           Labels="_contacts"
+                                           SearchAsync="SearchContactsAsync"
+                                           OnAdd="AddFormPrimaryContact"
+                                           OnRemove="RemoveFormPrimaryContact" />
+                    </div>
+                    <div class="col-md-6">
+                        <ExclusionSection Title="Secondary Contacts"
+                                           Placeholder="Search contact name or email..."
+                                           Ids="_formSecondaryContactIds"
+                                           Labels="_contacts"
+                                           SearchAsync="SearchContactsAsync"
+                                           OnAdd="AddFormSecondaryContact"
+                                           OnRemove="RemoveFormSecondaryContact" />
+                    </div>
+                </div>
+                <p class="text-muted small mb-3">
+                    Picked from JMS's company_people records — a contact must already exist there. Primary
+                    contacts are emailed directly on Send Email To All; secondary contacts are CC'd.
+                </p>
+
+                <div class="mb-3">
+                    <div class="d-flex align-items-center gap-2 mb-1">
+                        <label class="form-label mb-0">Departments</label>
+                        <Button Size="ButtonSize.Small" Color="ButtonColor.Primary" Outline="true" @onclick="AddFormDepartment">+ Add department</Button>
+                    </div>
+                    <p class="text-muted small mb-2">
+                        Optional. Splits this customer's jobs on the Quotes Pending page so each department gets
+                        its own summary. A job goes to the department listing its JMS job contact; a department
+                        with no job contacts takes every job no other department claims.
+                    </p>
+
+                    @foreach (var dept in _formDepartments)
+                    {
+                        <div class="border rounded p-3 mb-3">
+                            <div class="row g-3 mb-3 align-items-end">
+                                <div class="col-md-5">
+                                    <label class="form-label">Department name</label>
+                                    <input class="form-control" placeholder="e.g. Flex Scopes"
+                                           value="@dept.Name" @oninput="@(e => dept.Name = e.Value?.ToString() ?? "")" />
+                                </div>
+                                <div class="col-md-5">
+                                    <label class="form-label">Credit sheet tab <span class="text-muted small">(optional)</span></label>
+                                    <input class="form-control" placeholder="Blank = use the customer's tab"
+                                           value="@dept.CreditSheetTabName" @oninput="@(e => dept.CreditSheetTabName = e.Value?.ToString())" />
+                                </div>
+                                <div class="col-md-2 text-end">
+                                    <Button Color="ButtonColor.Danger" Outline="true" @onclick="() => _formDepartments.Remove(dept)">Remove</Button>
+                                </div>
+                            </div>
+
+                            <div class="row g-3">
+                                <div class="col-md-6 col-xxl-3">
+                                    <ExclusionSection Title="@(dept.IsCatchAll ? "Job Contacts (none — takes all jobs)" : "Job Contacts")"
+                                                       Placeholder="Search contact name or email..."
+                                                       Ids="dept.JobContactIds" Labels="_contacts"
+                                                       SearchAsync="SearchContactsAsync"
+                                                       OnAdd="@(id => AddUnique(dept.JobContactIds, id))"
+                                                       OnRemove="@(id => dept.JobContactIds.Remove(id))" />
+                                </div>
+                                <div class="col-md-6 col-xxl-3">
+                                    <ExclusionSection Title="Primary Contacts (To)"
+                                                       Placeholder="Search contact name or email..."
+                                                       Ids="dept.PrimaryContactIds" Labels="_contacts"
+                                                       SearchAsync="SearchContactsAsync"
+                                                       OnAdd="@(id => AddUnique(dept.PrimaryContactIds, id))"
+                                                       OnRemove="@(id => dept.PrimaryContactIds.Remove(id))" />
+                                </div>
+                                <div class="col-md-6 col-xxl-3">
+                                    <ExclusionSection Title="Secondary Contacts (CC)"
+                                                       Placeholder="Search contact name or email..."
+                                                       Ids="dept.SecondaryContactIds" Labels="_contacts"
+                                                       SearchAsync="SearchContactsAsync"
+                                                       OnAdd="@(id => AddUnique(dept.SecondaryContactIds, id))"
+                                                       OnRemove="@(id => dept.SecondaryContactIds.Remove(id))" />
+                                </div>
+                                <div class="col-md-6 col-xxl-3">
+                                    <ExclusionSection Title="Our Contact (CC)"
+                                                       Placeholder="Search any JMS contact..."
+                                                       Ids="dept.OurContactIds" Labels="_contacts"
+                                                       SearchAsync="SearchAnyContactAsync"
+                                                       OnAdd="@(id => AddUnique(dept.OurContactIds, id))"
+                                                       OnRemove="@(id => dept.OurContactIds.Remove(id))" />
+                                </div>
+                            </div>
+                        </div>
+                    }
+                </div>
+            }
+
+            <div class="mb-3" style="max-width: 480px;">
+                <label class="form-label">Tags <span class="text-muted small">— equipment types this customer sends in</span></label>
+                <div class="d-flex flex-wrap gap-2 mb-2">
+                    @foreach (var tag in CommonTags.Where(t => !_formTags.Contains(t)))
+                    {
+                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" @onclick="() => AddFormTag(tag)">
+                            + @tag
+                        </Button>
+                    }
+                </div>
+                <div class="input-group mb-2">
+                    <input class="form-control" placeholder="Custom tag..."
+                           value="@_tagInput" @oninput="@(e => _tagInput = e.Value?.ToString() ?? "")"
+                           @onkeydown="@(e => { if (e.Key == "Enter") AddFormTag(_tagInput); })" />
+                    <Button Color="ButtonColor.Primary" Outline="true" @onclick="() => AddFormTag(_tagInput)">Add</Button>
+                </div>
+                @if (_formTags.Count == 0)
+                {
+                    <p class="text-muted small mb-0">No tags.</p>
+                }
+                else
+                {
+                    <div class="d-flex flex-wrap gap-2">
+                        @foreach (var tag in _formTags)
+                        {
+                            <span class="badge text-bg-secondary d-flex align-items-center gap-1">
+                                @tag
+                                <button type="button" class="btn-close btn-close-white" style="font-size:0.6rem;"
+                                        @onclick="() => RemoveFormTag(tag)" aria-label="Remove"></button>
+                            </span>
+                        }
+                    </div>
+                }
+            </div>
+
+            <div class="d-flex gap-2">
+                <Button Color="ButtonColor.Primary" Disabled="_saving" @onclick="SaveAsync">
+                    @(_saving ? "Saving..." : _editingOriginalName is null ? "Add Customer" : "Save Changes")
+                </Button>
+                @if (_editingOriginalName is not null)
+                {
+                    <Button Color="ButtonColor.Secondary" Outline="true" Disabled="_saving" @onclick="CancelEdit">
+                        Cancel
+                    </Button>
+                }
+            </div>
+        </CardBody>
+    </Card>
+
+    <Card>
+        <CardHeader>Customers (@_customers.Count)</CardHeader>
+        <CardBody>
+            <input class="form-control mb-3" style="max-width: 320px;" placeholder="Filter by name..."
+                   value="@_filter" @oninput="@(e => _filter = e.Value?.ToString() ?? "")" />
+
+            @if (_customers.Count == 0)
+            {
+                <p class="text-muted small mb-0">No customers yet — add one above.</p>
+            }
+            else
+            {
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>State</th>
+                                <th>Company IDs</th>
+                                <th>Primary Contacts</th>
+                                <th>Secondary Contacts</th>
+                                <th>Tags</th>
+                                <th>Departments</th>
+                                <th>Credit Sheet Tab</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var c in _customers
+                                .Where(c => string.IsNullOrWhiteSpace(_filter) || c.DisplayName.Contains(_filter, StringComparison.OrdinalIgnoreCase))
+                                .OrderBy(c => c.DisplayName, StringComparer.OrdinalIgnoreCase))
+                            {
+                                <tr>
+                                    <td>@c.DisplayName</td>
+                                    <td>@(string.IsNullOrWhiteSpace(c.State) ? "—" : c.State)</td>
+                                    <td class="small">@string.Join(", ", c.CompanyIds.Select(id => FormatCompanyLabel(id)))</td>
+                                    <td class="small">
+                                        @if (c.PrimaryContactIds.Count == 0)
+                                        {
+                                            <span class="text-muted">—</span>
+                                        }
+                                        else
+                                        {
+                                            @foreach (var id in c.PrimaryContactIds)
+                                            {
+                                                <div>@FormatContactLabel(id)</div>
+                                            }
+                                        }
+                                    </td>
+                                    <td class="small">
+                                        @if (c.SecondaryContactIds.Count == 0)
+                                        {
+                                            <span class="text-muted">—</span>
+                                        }
+                                        else
+                                        {
+                                            @foreach (var id in c.SecondaryContactIds)
+                                            {
+                                                <div>@FormatContactLabel(id)</div>
+                                            }
+                                        }
+                                    </td>
+                                    <td class="small">
+                                        @if (c.Tags.Count == 0)
+                                        {
+                                            <span class="text-muted">—</span>
+                                        }
+                                        else
+                                        {
+                                            @foreach (var tag in c.Tags)
+                                            {
+                                                <span class="badge text-bg-secondary me-1">@tag</span>
+                                            }
+                                        }
+                                    </td>
+                                    <td class="small">
+                                        @if (c.Departments.Count == 0)
+                                        {
+                                            <span class="text-muted">—</span>
+                                        }
+                                        @foreach (var d in c.Departments)
+                                        {
+                                            <div>@d.Name</div>
+                                        }
+                                    </td>
+                                    <td class="small">
+                                        @(string.IsNullOrWhiteSpace(c.CreditSheetTabName) ? "—" : c.CreditSheetTabName)
+                                    </td>
+                                    <td class="text-end" style="white-space: nowrap;">
+                                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="me-2" @onclick="() => StartEdit(c)">
+                                            Edit
+                                        </Button>
+                                        @if (_pendingDeleteName == c.DisplayName)
+                                        {
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" @onclick="() => DeleteAsync(c.DisplayName)">
+                                                Confirm?
+                                            </Button>
+                                        }
+                                        else
+                                        {
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" @onclick="() => RequestDelete(c.DisplayName)">
+                                                Delete
+                                            </Button>
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </CardBody>
+    </Card>
+}
+
+@code {
+    private static readonly string[] AuStates = { "NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT" };
+    private static readonly string[] CommonTags = { "Flex", "Rigid", "Surg", "Probes" };
+
+    private bool _loading = true;
+    private List<ScopeCustomer> _customers = new();
+    private Dictionary<int, string> _companyNames = new();
+    private Dictionary<int, string> _contacts = new();
+    private string _filter = "";
+
+    private string? _editingOriginalName;
+    private string _formName = "";
+    private string _formState = "";
+    private string _formCreditSheetTabName = "";
+    private List<int> _formPrimaryContactIds = new();
+    private List<int> _formSecondaryContactIds = new();
+    private List<string> _formTags = new();
+    private string _tagInput = "";
+    private List<int> _formCompanyIds = new();
+    // Edited in place by the department blocks; copies, so Cancel leaves the saved customer alone.
+    private List<ScopeDepartment> _formDepartments = new();
+    private string? _formError;
+    private bool _saving;
+
+    private string? _pendingDeleteName;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        await ReloadAsync();
+    }
+
+    private async Task ReloadAsync()
+    {
+        _customers = await Customers.LoadAsync();
+
+        var namesTask = LoadCompanyNamesAsync(_customers.SelectMany(c => c.CompanyIds).Distinct().ToList());
+        var contactsTask = LoadContactsAsync(_customers
+            .SelectMany(c => c.PrimaryContactIds.Concat(c.SecondaryContactIds)
+                .Concat(c.Departments.SelectMany(d => d.JobContactIds.Concat(d.PrimaryContactIds)
+                    .Concat(d.SecondaryContactIds).Concat(d.OurContactIds))))
+            .Distinct().ToList());
+        await Task.WhenAll(namesTask, contactsTask);
+        _companyNames = namesTask.Result;
+        _contacts = contactsTask.Result;
+
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private async Task<Dictionary<int, string>> LoadCompanyNamesAsync(IReadOnlyCollection<int> companyIds)
+    {
+        var rows = await ScopeLookup.GetCompanyNamesAsync(companyIds);
+        return rows.ToDictionary(r => r.CompanyId, r => ScopeLabelFormatter.FormatCompanyLabel(r.CompanyId, r.CompanyName));
+    }
+
+    private async Task<List<(int Id, string Label)>> SearchCompaniesAsync(string term)
+    {
+        var rows = await ScopeLookup.SearchCompaniesAsync(term);
+        return rows.Select(r => (r.CompanyId, ScopeLabelFormatter.FormatCompanyLabel(r.CompanyId, r.CompanyName))).ToList();
+    }
+
+    private async Task<Dictionary<int, string>> LoadContactsAsync(IReadOnlyCollection<int> contactIds)
+    {
+        var rows = await ScopeLookup.GetContactDetailsAsync(contactIds);
+        return rows.ToDictionary(r => r.ContactId, r => FormatContactDetails(r.FullName, r.Email, r.PhoneNo ?? r.Mobile));
+    }
+
+    private Task<List<(int Id, string Label)>> SearchContactsAsync(string term) =>
+        SearchContactsInAsync(term, _formCompanyIds);
+
+    // "Our contact" is our own staff, not the customer's own people — so no company filter.
+    private Task<List<(int Id, string Label)>> SearchAnyContactAsync(string term) =>
+        SearchContactsInAsync(term, Array.Empty<int>());
+
+    private async Task<List<(int Id, string Label)>> SearchContactsInAsync(string term, IEnumerable<int> companyIds)
+    {
+        var rows = await ScopeLookup.SearchContactsAsync(term, companyIds);
+        return rows
+            .Select(r =>
+            {
+                var label = FormatContactDetails(r.FullName, r.Email, r.PhoneNo ?? r.Mobile);
+                _contacts[r.ContactId] = label; // resolve immediately so the chip shows a name, not "Contact #id"
+                return (r.ContactId, Label: label + (string.IsNullOrWhiteSpace(r.CompanyName) ? "" : $" — {r.CompanyName}"));
+            })
+            .ToList();
+    }
+
+    private string FormatContactLabel(int contactId) =>
+        _contacts.TryGetValue(contactId, out var label) ? label : $"Contact #{contactId}";
+
+    private void StartEdit(ScopeCustomer c)
+    {
+        _editingOriginalName = c.DisplayName;
+        _formName = c.DisplayName;
+        _formState = c.State ?? "";
+        _formCreditSheetTabName = c.CreditSheetTabName ?? "";
+        _formPrimaryContactIds = new List<int>(c.PrimaryContactIds);
+        _formSecondaryContactIds = new List<int>(c.SecondaryContactIds);
+        _formTags = new List<string>(c.Tags);
+        _tagInput = "";
+        _formCompanyIds = new List<int>(c.CompanyIds);
+        _formDepartments = c.Departments.Select(CopyDepartment).ToList();
+        _formError = null;
+    }
+
+    private void CancelEdit()
+    {
+        _editingOriginalName = null;
+        _formName = "";
+        _formState = "";
+        _formCreditSheetTabName = "";
+        _formPrimaryContactIds = new();
+        _formSecondaryContactIds = new();
+        _formTags = new();
+        _tagInput = "";
+        _formCompanyIds = new();
+        _formDepartments = new();
+        _formError = null;
+    }
+
+    private void AddFormCompanyId(int id)
+    {
+        if (!_formCompanyIds.Contains(id)) _formCompanyIds.Add(id);
+    }
+
+    private void RemoveFormCompanyId(int id) => _formCompanyIds.Remove(id);
+
+    private void AddFormPrimaryContact(int id)
+    {
+        if (!_formPrimaryContactIds.Contains(id)) _formPrimaryContactIds.Add(id);
+    }
+
+    private void RemoveFormPrimaryContact(int id) => _formPrimaryContactIds.Remove(id);
+
+    private void AddFormSecondaryContact(int id)
+    {
+        if (!_formSecondaryContactIds.Contains(id)) _formSecondaryContactIds.Add(id);
+    }
+
+    private void RemoveFormSecondaryContact(int id) => _formSecondaryContactIds.Remove(id);
+
+    private void AddFormDepartment() => _formDepartments.Add(new ScopeDepartment());
+
+    private static void AddUnique(List<int> ids, int id)
+    {
+        if (!ids.Contains(id)) ids.Add(id);
+    }
+
+    private static ScopeDepartment CopyDepartment(ScopeDepartment d) => new()
+    {
+        Name = d.Name.Trim(),
+        JobContactIds = d.JobContactIds.OrderBy(id => id).ToList(),
+        PrimaryContactIds = d.PrimaryContactIds.OrderBy(id => id).ToList(),
+        SecondaryContactIds = d.SecondaryContactIds.OrderBy(id => id).ToList(),
+        OurContactIds = d.OurContactIds.OrderBy(id => id).ToList(),
+        CreditSheetTabName = string.IsNullOrWhiteSpace(d.CreditSheetTabName) ? null : d.CreditSheetTabName.Trim(),
+    };
+
+    private void AddFormTag(string tag)
+    {
+        var trimmed = tag.Trim();
+        if (trimmed.Length == 0) return;
+        if (!_formTags.Contains(trimmed, StringComparer.OrdinalIgnoreCase)) _formTags.Add(trimmed);
+        _tagInput = "";
+    }
+
+    private void RemoveFormTag(string tag) =>
+        _formTags.RemoveAll(t => string.Equals(t, tag, StringComparison.OrdinalIgnoreCase));
+
+    private async Task SaveAsync()
+    {
+        _formError = null;
+
+        var name = _formName.Trim();
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            _formError = "Enter a customer name.";
+            return;
+        }
+
+        var departments = _formDepartments.Select(CopyDepartment).ToList();
+        if (departments.Any(d => d.Name.Length == 0))
+        {
+            _formError = "Every department needs a name.";
+            return;
+        }
+        if (departments.GroupBy(d => d.Name, StringComparer.OrdinalIgnoreCase).Any(g => g.Count() > 1))
+        {
+            _formError = "Two departments have the same name.";
+            return;
+        }
+        var claimedTwice = departments.SelectMany(d => d.JobContactIds).GroupBy(id => id).Where(g => g.Count() > 1).Select(g => g.Key).ToList();
+        if (claimedTwice.Count > 0)
+        {
+            _formError = $"A job contact can only be in one department: {string.Join(", ", claimedTwice.Select(FormatContactLabel))}.";
+            return;
+        }
+
+        var customer = new ScopeCustomer
+        {
+            DisplayName = name,
+            State = string.IsNullOrWhiteSpace(_formState) ? null : _formState,
+            CreditSheetTabName = string.IsNullOrWhiteSpace(_formCreditSheetTabName) ? null : _formCreditSheetTabName.Trim(),
+            PrimaryContactIds = _formPrimaryContactIds.OrderBy(id => id).ToList(),
+            SecondaryContactIds = _formSecondaryContactIds.OrderBy(id => id).ToList(),
+            Tags = _formTags.OrderBy(t => t, StringComparer.OrdinalIgnoreCase).ToList(),
+            CompanyIds = _formCompanyIds.OrderBy(id => id).ToList(),
+            Departments = departments
+        };
+
+        _saving = true;
+        StateHasChanged();
+
+        try
+        {
+            if (_editingOriginalName is null)
+                await Customers.AddAsync(customer);
+            else
+                await Customers.UpdateAsync(_editingOriginalName, customer);
+
+            CancelEdit();
+            await ReloadAsync();
+        }
+        catch (InvalidOperationException ex)
+        {
+            _formError = ex.Message;
+        }
+        finally
+        {
+            _saving = false;
+            StateHasChanged();
+        }
+    }
+
+    private void RequestDelete(string name) => _pendingDeleteName = name;
+
+    private async Task DeleteAsync(string name)
+    {
+        _pendingDeleteName = null;
+        await Customers.RemoveAsync(name);
+        if (_editingOriginalName == name) CancelEdit();
+        await ReloadAsync();
+    }
+
+    private string FormatCompanyLabel(int id) =>
+        _companyNames.TryGetValue(id, out var label) && !string.IsNullOrWhiteSpace(label) ? label : $"({id})";
+
+
+}

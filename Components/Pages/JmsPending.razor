@@ -1,0 +1,121 @@
+@page "/jms-pending"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+@implements IDisposable
+
+@using BlazorBootstrap
+@using WorkshopDashboard.Data
+@using WorkshopDashboard.Services.External.Jms
+
+@inject JmsWriteQueue Queue
+@inject AuthenticationStateProvider AuthStateProvider
+@inject ILogger<JmsPending> Logger
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    JmsPending — your JMS changes that haven't gone through yet (see
+    JmsWriteQueue). Pending ones are sent automatically, in order, as soon
+    as JMS can take them; failed ones (JMS refused them, or they ran out of
+    attempts) wait here until you retry or discard them. Updates live via
+    JmsWriteQueue.Changed, so items disappear as they're sent.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Pending JMS changes</h1>
+    <p class="text-muted">Changes you made while JMS couldn't take them. They're sent automatically, in order, once it's back.</p>
+</div>
+
+@if (_items is null)
+{
+    <Spinner Color="SpinnerColor.Primary" />
+}
+else if (_items.Count == 0)
+{
+    <Callout Color="CalloutColor.Success">Nothing waiting — all your changes are in JMS.</Callout>
+}
+else
+{
+    <table class="table table-sm align-middle">
+        <thead>
+            <tr>
+                <th>Change</th>
+                <th>Queued</th>
+                <th>Status</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var item in _items)
+            {
+                <tr>
+                    <td>@item.Description</td>
+                    <td class="text-nowrap">@item.CreatedAtUtc.ToLocalTime().ToString("d MMM h:mm tt")</td>
+                    <td>
+                        @if (item.State == JmsOutboxState.Failed)
+                        {
+                            <Badge Color="BadgeColor.Danger">Failed</Badge>
+                        }
+                        else
+                        {
+                            <Badge Color="BadgeColor.Warning">Waiting</Badge>
+                            @if (item.Attempts > 0)
+                            {
+                                <span class="small text-muted ms-1">@item.Attempts attempt@(item.Attempts == 1 ? "" : "s")</span>
+                            }
+                        }
+                        @if (!string.IsNullOrEmpty(item.LastError))
+                        {
+                            <div class="small text-muted">@item.LastError</div>
+                        }
+                    </td>
+                    <td class="text-end text-nowrap">
+                        @if (item.State == JmsOutboxState.Failed)
+                        {
+                            <Button Color="ButtonColor.Primary" Size="ButtonSize.Small" Outline="true" @onclick="() => RetryAsync(item.Id)">Retry</Button>
+                        }
+                        <Button Color="ButtonColor.Danger" Size="ButtonSize.Small" Outline="true" Class="ms-1" @onclick="() => DiscardAsync(item.Id)">Discard</Button>
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private string? _username;
+    private List<JmsOutboxItem>? _items;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var auth = await AuthStateProvider.GetAuthenticationStateAsync();
+        _username = auth.User.Identity?.Name;
+        Queue.Changed += OnQueueChanged;
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync() =>
+        _items = _username is null ? new() : await Queue.ListAsync(_username);
+
+    private async void OnQueueChanged(string username)
+    {
+        if (!string.Equals(username, _username, StringComparison.OrdinalIgnoreCase)) return;
+        try
+        {
+            await InvokeAsync(async () =>
+            {
+                await LoadAsync();
+                StateHasChanged();
+            });
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Pending changes refresh failed");
+        }
+    }
+
+    private Task RetryAsync(int id) => _username is null ? Task.CompletedTask : Queue.RetryAsync(_username, id);
+
+    private Task DiscardAsync(int id) => _username is null ? Task.CompletedTask : Queue.DiscardAsync(_username, id);
+
+    public void Dispose() => Queue.Changed -= OnQueueChanged;
+}

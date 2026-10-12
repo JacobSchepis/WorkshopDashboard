@@ -1,0 +1,491 @@
+﻿@page "/quote-inhouse-rigid"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+
+@using WorkshopDashboard.Services.Quoting.Dorado
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Quoting
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Analytics
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+@using WorkshopDashboard.Components.Pages.Quoting.Cards
+
+@inject CompanyGroupStore CompanyGroups
+@inject QuoteNoticeStore Notices
+@inject JobLookupService JobLookup
+@inject JobEquipmentLookup EquipmentLookup
+@inject QuoteSubmissionService QuoteSubmission
+@inject AnalyticsService Analytics
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    QuoteInHouseRigid — quotes for rigid scope repairs we do ourselves. No
+    repairer PDF: the operator reads the rigid technician's latest timesheet
+    note, types the observations, picks the level and adds any extras. It
+    prices exactly like a Dorado rigid quote (DoradoPricingCalculator.CalculateLevel)
+    and shares Dorado's pricing groups, notices (QuoteNoticeTarget.DoradoRigid) and
+    line text, except the specialty surcharge is our own flat $200. No
+    freight: the scope never leaves the workshop. It also offers our own
+    Level 0 (exterior clean, scope not opened — flat DoradoPricingGroup.Level0,
+    no rod lenses), which Dorado never quotes.
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      LoadJob -> company, Dorado group, equipment, notices, latest timesheet.
+      Any level/extra change -> Recalculate. SubmitServices posts the level
+      line, the extras, the ETA line, then the ticked notices.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="container py-4" style="max-width: 860px;">
+    <div class="page-header">
+        <h1>In-house - Rigid</h1>
+        <p class="text-muted">Quote a rigid scope repair we're doing ourselves, priced like a Dorado rigid quote.</p>
+    </div>
+
+    @* ── Job ── *@
+    <Card Class="mb-3">
+        <CardBody Class="d-flex gap-4 flex-wrap align-items-end">
+            <div>
+                <div class="text-muted small mb-1">Job Number</div>
+                <div class="d-flex gap-2 align-items-center">
+                    <input type="text" class="form-control form-control-sm" style="width: 120px;"
+                           @bind="_jobNumber" @bind:event="oninput"
+                           @onkeydown="@(e => e.Key == "Enter" ? LoadJob() : Task.CompletedTask)" />
+                    <Button Size="ButtonSize.Small" Color="ButtonColor.Primary"
+                            Disabled="@(_jobLoading || string.IsNullOrWhiteSpace(_jobNumber))"
+                            Loading="_jobLoading" @onclick="LoadJob">
+                        Load
+                    </Button>
+                </div>
+            </div>
+            @if (_jobId != null)
+            {
+                <div>
+                    <div class="text-muted small">Total</div>
+                    <div class="fw-semibold text-success">@(_calc != null ? _calc.Total.ToString("C") : "—")</div>
+                </div>
+            }
+        </CardBody>
+    </Card>
+
+    @if (_error != null)
+    {
+        <Callout Color="CalloutColor.Danger" Class="mb-3">@_error</Callout>
+    }
+
+    @if (_jobId != null)
+    {
+        @* ── Equipment selector ── *@
+        <EquipmentSelectorCard Equipment="_jobEquipment" Loading="_equipmentLoading" @bind-SelectedEquipmentId="_selectedEquipmentId" />
+
+        @* ── Latest timesheet (reference only) ── *@
+        <Card Class="mb-3">
+            <CardHeader>
+                Latest Timesheet
+                @if (_timesheet?.Date != null)
+                {
+                    <span class="text-muted small ms-2">@_timesheet.Date.Value.ToString("d MMM yyyy")</span>
+                }
+            </CardHeader>
+            <CardBody>
+                @if (_timesheet == null)
+                {
+                    <p class="text-muted mb-0">No timesheet notes on this job yet.</p>
+                }
+                else
+                {
+                    <p class="small mb-2" style="white-space: pre-wrap;">@_timesheet.Text.Trim()</p>
+                    <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" @onclick="CopyTimesheetToObservations">
+                        Copy into observations
+                    </Button>
+                }
+            </CardBody>
+        </Card>
+
+        @* ── Pricing group (only when the company has none yet) ── *@
+        @if (_group == null)
+        {
+            <Card Class="mb-3 border-warning">
+                <CardHeader Class="bg-warning bg-opacity-25">Unknown Pricing — Company ID @_companyId</CardHeader>
+                <CardBody>
+                    <p class="text-muted small mb-3">This company isn't in the Dorado pricing config yet. Select a pricing group to continue. The selection will be saved for next time (shared with Dorado quotes).</p>
+                    <div class="d-flex gap-2 flex-wrap">
+                        @foreach (var (groupId, group) in DoradoPricingConfig.Groups)
+                        {
+                            <div class="card flex-fill" style="cursor:pointer" @onclick="() => SelectGroup(groupId)">
+                                <div class="card-body p-3">
+                                    <span class="fw-semibold">Group @groupId</span>
+                                    <div class="small text-muted mt-1">
+                                        L0 @DoradoPricingGroup.Level0.ToString("C0") · L1 @group.Level1.ToString("C0") · L2 @group.Level2.ToString("C0") · L3 @group.Level3.ToString("C0") · Max @group.MaxPrice.ToString("C0")
+                                    </div>
+                                </div>
+                            </div>
+                        }
+                    </div>
+                </CardBody>
+            </Card>
+        }
+
+        @* ── Technical Observations ── *@
+        <Card Class="mb-3">
+            <CardHeader>Technical Observations</CardHeader>
+            <CardBody>
+                @for (int i = 0; i < _observations.Count; i++)
+                {
+                    var idx = i;
+                    <div class="d-flex gap-2 mb-2">
+                        <textarea class="form-control form-control-sm" rows="2" style="font-size:0.85rem; resize:vertical;"
+                                  value="@_observations[idx]"
+                                  @oninput="e => _observations[idx] = e.Value?.ToString() ?? string.Empty"></textarea>
+                        <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" Class="align-self-start"
+                                @onclick="() => _observations.RemoveAt(idx)">✕</Button>
+                    </div>
+                }
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="mt-1"
+                        @onclick="() => _observations.Add(string.Empty)">+ Add</Button>
+            </CardBody>
+        </Card>
+
+        @* ── Repair: level + extras ── *@
+        <Card Class="mb-3">
+            <CardHeader>Repair</CardHeader>
+            <CardBody>
+                <div class="d-flex gap-4 flex-wrap align-items-end mb-3">
+                    <div>
+                        <label class="text-muted small mb-1 d-block">Repair Level</label>
+                        <select class="form-select form-select-sm" style="width: 175px;"
+                                value="@_level" @onchange="e => SetLevel(e.Value?.ToString())">
+                            <option value="">Choose...</option>
+                            @foreach (var lvl in DoradoLevels.InHouse)
+                            {
+                                <option value="@lvl">@lvl</option>
+                            }
+                        </select>
+                    </div>
+                    <div>
+                        <label class="text-muted small mb-1 d-block">Additional Rod Lenses</label>
+                        <input type="number" class="form-control form-control-sm" style="width: 90px;" min="0" step="1"
+                               disabled="@NoRodLenses" value="@_rodLenses" @oninput="e => { _rodLenses = ParseCount(e.Value); Recalculate(); }" />
+                    </div>
+                    <div>
+                        <label class="text-muted small mb-1 d-block">Additional 4K Rod Lenses</label>
+                        <input type="number" class="form-control form-control-sm" style="width: 90px;" min="0" step="1"
+                               disabled="@NoRodLenses" value="@_rodLenses4k" @oninput="e => { _rodLenses4k = ParseCount(e.Value); Recalculate(); }" />
+                    </div>
+                </div>
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="specialtyScope"
+                           checked="@_isSpecialty" @onchange="e => { _isSpecialty = e.Value is true; Recalculate(); }" />
+                    <label class="form-check-label" for="specialtyScope">
+                        Specialty scope (+@SpecialtySurcharge.ToString("C0"), no max price cap)
+                    </label>
+                </div>
+
+                @if (_calc != null)
+                {
+                    <table class="table table-sm mb-0 mt-3">
+                        <tbody>
+                            <tr>
+                                <td>@_calc.LevelName</td>
+                                <td class="text-end">@_calc.BaseServicePrice.ToString("C")</td>
+                            </tr>
+                            @if (_calc.SpecialtySurcharge > 0)
+                            {
+                                <tr><td>Specialty Scope Surcharge</td><td class="text-end">@_calc.SpecialtySurcharge.ToString("C")</td></tr>
+                            }
+                            @if (_rodLenses > 0)
+                            {
+                                <tr>
+                                    <td>Rod Lenses (@_rodLenses x @DoradoPricingCalculator.RodLensUnitPrice.ToString("C"))</td>
+                                    <td class="text-end">@_calc.RodLensesFullPrice.ToString("C")</td>
+                                </tr>
+                                @if (_calc.RodLensDiscount > 0)
+                                {
+                                    <tr class="text-danger">
+                                        <td>Max Price Discount</td>
+                                        <td class="text-end">-@_calc.RodLensDiscount.ToString("C")</td>
+                                    </tr>
+                                }
+                            }
+                            @if (_rodLenses4k > 0)
+                            {
+                                <tr>
+                                    <td>4K Rod Lenses (@_rodLenses4k x @DoradoPricingCalculator.RodLens4kUnitPrice.ToString("C"))</td>
+                                    <td class="text-end">@_calc.RodLenses4kFullPrice.ToString("C")</td>
+                                </tr>
+                            }
+                            <tr class="fw-semibold table-light">
+                                <td>Total</td>
+                                <td class="text-end">@_calc.Total.ToString("C")</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                }
+            </CardBody>
+        </Card>
+
+        @* ── Work Order Notes ── *@
+        <Card Class="mb-3">
+            <CardHeader>Work Order Notes</CardHeader>
+            <CardBody>
+                <div class="d-flex align-items-center gap-2 small">
+                    <span>Estimated completion:</span>
+                    <input type="number" class="form-control form-control-sm" style="width: 80px;" min="1" step="1"
+                           value="@_completionDays"
+                           @oninput="e => _completionDays = int.TryParse(e.Value?.ToString(), out var v) && v > 0 ? v : null" />
+                    <span>working days</span>
+                </div>
+            </CardBody>
+        </Card>
+
+        @* ── Notices ── *@
+        <QuoteNoticesCard Notices="_applicableNotices" SelectedIds="_selectedNoticeIds" />
+
+        @* ── Submit ── *@
+        <Card Class="mb-3">
+            <CardBody>
+                @if (_submitSuccess)
+                {
+                    <Callout Color="CalloutColor.Success" Class="mb-3">Services created on job @_jobId.</Callout>
+                }
+                @if (MissingForSubmit is { } missing)
+                {
+                    <p class="text-muted small mb-2">Still needed: @missing</p>
+                }
+                <Button Color="ButtonColor.Success" Disabled="@(_submitting || MissingForSubmit != null)"
+                        Loading="_submitting" @onclick="SubmitServices">
+                    Create Services
+                </Button>
+            </CardBody>
+        </Card>
+    }
+</div>
+
+@code {
+    /// <summary>Our own flat specialty scope charge (Dorado's is double their quoted price).</summary>
+    private const decimal SpecialtySurcharge = 200m;
+
+    // Shared with QuoteDorado on purpose — a company's Dorado group applies to in-house rigid quotes too.
+    private const string CompanyGroupsScope = "dorado_company_groups";
+
+    private string _jobNumber = string.Empty;
+    private int? _jobId;
+    private int _companyId;
+    private bool _jobLoading;
+    private string? _error;
+
+    private List<JobEquipmentInfo> _jobEquipment = new();
+    private string? _selectedEquipmentId;
+    private bool _equipmentLoading;
+
+    private TimesheetNote? _timesheet;
+
+    private List<string> _observations = new();
+    private string _level = string.Empty;
+    private int _rodLenses;
+    private int _rodLenses4k;
+    private bool _isSpecialty;
+    private int? _completionDays;
+
+    private DoradoPricingGroup? _group;
+    private DoradoQuoteCalculation? _calc;
+
+    private List<QuoteNotice> _applicableNotices = new();
+    private HashSet<Guid> _selectedNoticeIds = new();
+
+    private bool _submitting;
+    private bool _submitSuccess;
+
+    private string? MissingForSubmit
+    {
+        get
+        {
+            var missing = new List<string>();
+            if (string.IsNullOrEmpty(_selectedEquipmentId)) missing.Add("equipment");
+            if (_group == null) missing.Add("pricing group");
+            if (!DoradoLevels.IsKnownInHouse(_level)) missing.Add("repair level");
+            if (_completionDays == null) missing.Add("completion days");
+            return missing.Count == 0 ? null : string.Join(", ", missing);
+        }
+    }
+
+    private bool NoRodLenses => DoradoLevels.IsLevel0(_level);
+
+    private void SetLevel(string? level)
+    {
+        _level = level ?? string.Empty;
+        if (NoRodLenses)
+        {
+            _rodLenses = 0;
+            _rodLenses4k = 0;
+        }
+        Recalculate();
+    }
+
+    private static int ParseCount(object? value) =>
+        int.TryParse(value?.ToString(), out var n) && n > 0 ? n : 0;
+
+    private async Task LoadJob()
+    {
+        if (!int.TryParse(_jobNumber.Trim(), out var jobId))
+        {
+            _error = "Enter a job number.";
+            return;
+        }
+
+        ResetQuote();
+        _jobLoading = true;
+        StateHasChanged();
+
+        try
+        {
+            var companyId = await JobLookup.GetOwnerCompanyIdAsync(jobId);
+            if (companyId is null)
+            {
+                _error = "Could not retrieve company ID for job " + jobId;
+                return;
+            }
+
+            _jobId = jobId;
+            _companyId = companyId.Value;
+            _group = LookUpGroup(_companyId);
+
+            _applicableNotices = await Notices.GetApplicableAsync(QuoteNoticeTarget.DoradoRigid);
+            _selectedNoticeIds = _applicableNotices.Select(n => n.Id).ToHashSet();
+
+            _equipmentLoading = true;
+            StateHasChanged();
+            _jobEquipment = await EquipmentLookup.LoadAsync(jobId);
+            if (_jobEquipment.Count == 1)
+                _selectedEquipmentId = _jobEquipment[0].EquipmentId;
+            _equipmentLoading = false;
+
+            _timesheet = await JobLookup.GetLatestTimesheetNoteAsync(jobId);
+        }
+        catch (Exception ex)
+        {
+            _error = "Job lookup failed: " + ex.Message;
+        }
+        finally
+        {
+            _jobLoading = false;
+            _equipmentLoading = false;
+        }
+    }
+
+    private void ResetQuote()
+    {
+        _error = null;
+        _jobId = null;
+        _jobEquipment = new();
+        _selectedEquipmentId = null;
+        _timesheet = null;
+        _observations = new();
+        _level = string.Empty;
+        _rodLenses = 0;
+        _rodLenses4k = 0;
+        _isSpecialty = false;
+        _completionDays = null;
+        _group = null;
+        _calc = null;
+        _applicableNotices = new();
+        _selectedNoticeIds = new();
+        _submitSuccess = false;
+    }
+
+    /// <summary>Same order as QuoteDorado: the hardcoded config first, then a saved choice.</summary>
+    private DoradoPricingGroup? LookUpGroup(int companyId)
+    {
+        var group = DoradoPricingConfig.GetGroupForCompany(companyId);
+        if (group != null) return group;
+
+        return CompanyGroups.LoadSaved(CompanyGroupsScope).TryGetValue(companyId, out var savedId)
+            ? DoradoPricingConfig.Groups.GetValueOrDefault(savedId)
+            : null;
+    }
+
+    private void SelectGroup(int groupId)
+    {
+        _group = DoradoPricingConfig.Groups.GetValueOrDefault(groupId);
+        try
+        {
+            CompanyGroups.Save(CompanyGroupsScope, _companyId, groupId);
+        }
+        catch (Exception ex) { _error = "Failed to save pricing group: " + ex.Message; }
+        Recalculate();
+    }
+
+    private void CopyTimesheetToObservations()
+    {
+        var lines = (_timesheet?.Text ?? "")
+            .Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        _observations.RemoveAll(string.IsNullOrWhiteSpace);
+        _observations.AddRange(lines);
+    }
+
+    private void Recalculate()
+    {
+        _submitSuccess = false;
+        _calc = _group != null && DoradoLevels.IsKnownInHouse(_level)
+            ? DoradoPricingCalculator.CalculateLevel(
+                _level, _group, _isSpecialty ? SpecialtySurcharge : null, _rodLenses, _rodLenses4k)
+            : null;
+    }
+
+    private List<(string, decimal)> BuildLineItems()
+    {
+        var calc = _calc!;
+        var observations = _observations.Select(o => o.Trim()).Where(o => o.Length > 0);
+        var lineItems = new List<(string, decimal)>
+        {
+            (DoradoServiceDescriptions.GetTechServiceDescription(_level, observations), calc.BaseServicePrice),
+        };
+
+        if (calc.SpecialtySurcharge > 0)
+            lineItems.Add((DoradoServiceDescriptions.GetSpecialtySurchargeDescription("", calc.SpecialtySurcharge), calc.SpecialtySurcharge));
+
+        if (_rodLenses > 0)
+            lineItems.Add((DoradoServiceDescriptions.GetRodLensDescription(_rodLenses, calc.RodLensesFullPrice, calc.RodLensDiscount),
+                calc.RodLensesChargedPrice));
+
+        if (_rodLenses4k > 0)
+            lineItems.Add((DoradoServiceDescriptions.GetRodLens4kDescription(_rodLenses4k, DoradoPricingCalculator.RodLens4kUnitPrice,
+                calc.RodLenses4kFullPrice, calc.RodLenses4kDiscount), calc.RodLenses4kChargedPrice));
+
+        lineItems.Add((QuoteServiceText.WorkOrderNotes(_completionDays!.Value), 0m));
+        return lineItems;
+    }
+
+    private async Task SubmitServices()
+    {
+        if (_jobId == null || _calc == null || MissingForSubmit != null) return;
+
+        _submitting = true;
+        _error = null;
+        _submitSuccess = false;
+        StateHasChanged();
+
+        try
+        {
+            var selectedNotices = _applicableNotices.Where(n => _selectedNoticeIds.Contains(n.Id));
+
+            await QuoteSubmission.SubmitAsync(
+                _jobId.Value, _selectedEquipmentId!,
+                BuildLineItems(), selectedNotices);
+
+            _submitSuccess = true;
+            await Analytics.TrackEventAsync("Quote services created — In-house Rigid");
+        }
+        catch (Exception ex)
+        {
+            _error = "Submission failed: " + ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+}

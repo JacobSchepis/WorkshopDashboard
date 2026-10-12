@@ -1,0 +1,36 @@
+﻿@* TextSection — a labeled single-line text field with a SetError-driven
+   validation message and a SetText setter for pre-filling a default
+   (e.g. UploadDocument's "Proof of arrival" title). *@
+
+@if (_isMissing)
+{
+    <div class="text-danger">
+        item missing
+    </div>
+}
+<label>
+    @Heading
+    <input class="form-control" @bind=_text />
+</label>
+
+@code {
+    [Parameter] public string Heading { get; set; } = "";
+    private string _text = "";
+    
+    private bool _isMissing = false;
+
+    public string Text => _text;
+
+    public void SetText(string text)
+    {
+        _text = text;
+        StateHasChanged();
+    }
+   
+    public void SetError(bool isMissing)
+    {
+        _isMissing = isMissing;
+        StateHasChanged();
+    }
+
+}

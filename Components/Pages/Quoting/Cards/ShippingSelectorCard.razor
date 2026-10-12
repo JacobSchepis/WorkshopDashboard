@@ -1,0 +1,72 @@
+@using WorkshopDashboard.Services.Quoting.Shipping
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    ShippingSelectorCard — shared shipping-zone tile grid for the quote pages
+    that charge freight (Apex flex scopes, Ember probes). The zone's price
+    (ShippingConfig.FreightFor) is folded into the quote's repair line. The
+    company's picked zone is saved and reused next time (SaveSuccess shows
+    the confirmation).
+
+    ── Parameters ───────────────────────────────────────────────────────────
+      SelectedShippingGroupId/OnSelect — the picked zone
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<Card Class="@("mb-3" + (SelectedShippingGroupId == null ? " border-warning" : ""))">
+    <CardHeader Class="@("d-flex justify-content-between align-items-center" + (SelectedShippingGroupId == null ? " bg-warning bg-opacity-25" : ""))">
+        <span>Shipping</span>
+        @if (SelectedShippingGroupId != null && ShippingConfig.Groups.TryGetValue(SelectedShippingGroupId.Value, out var selectedShipping))
+        {
+            <span class="text-muted fw-normal small">
+                @selectedShipping.Label — Freight @ShippingConfig.FreightFor(SelectedShippingGroupId).ToString("C")
+            </span>
+        }
+    </CardHeader>
+    <CardBody>
+        @if (SelectedShippingGroupId == null)
+        {
+            <p class="text-muted small mb-3">Select a shipping zone. The selection will be saved for this company and used next time.</p>
+        }
+
+        <div class="row g-2">
+            @foreach (var (sgId, sg) in ShippingConfig.Groups)
+            {
+                var sgSelected = SelectedShippingGroupId == sgId;
+                <div class="col-6 col-md-3">
+                    <div class="card h-100 @(sgSelected ? "border-primary" : "")"
+                         style="cursor: pointer;"
+                         @onclick="() => Select(sgId)">
+                        <div class="card-body p-2">
+                            <div class="d-flex justify-content-between align-items-start mb-1">
+                                <span class="small fw-semibold">@sg.Label</span>
+                                @if (sgSelected)
+                                {
+                                    <i class="bi bi-check-circle-fill text-primary ms-1"></i>
+                                }
+                            </div>
+                            <div class="small text-muted">Freight <span class="text-dark fw-semibold">@ShippingConfig.FreightFor(sgId).ToString("C0")</span></div>
+                        </div>
+                    </div>
+                </div>
+            }
+        </div>
+
+        @if (SaveSuccess)
+        {
+            <Callout Color="CalloutColor.Success" Class="mb-0 mt-3">
+                Shipping zone saved for company @CompanyId.
+            </Callout>
+        }
+    </CardBody>
+</Card>
+
+@code {
+    [Parameter] public int? SelectedShippingGroupId { get; set; }
+    [Parameter] public EventCallback<int> OnSelect { get; set; }
+    [Parameter] public bool SaveSuccess { get; set; }
+    [Parameter] public int CompanyId { get; set; }
+
+    private Task Select(int shippingGroupId) => OnSelect.InvokeAsync(shippingGroupId);
+}

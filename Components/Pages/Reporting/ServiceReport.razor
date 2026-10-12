@@ -1,0 +1,723 @@
+@page "/inspection-equipment-report"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+
+@using CsvHelper
+@using CsvHelper.Configuration
+@using System.Globalization
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Components.Forms
+@using Microsoft.AspNetCore.Components.Authorization
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+@inject AuthenticationStateProvider AuthStateProvider
+@inject InspectionReportLookup ReportLookup
+@inject InspectionDocumentBuilder DocumentBuilder
+@inject GeneratedDocumentStore DocumentStore
+@inject WorkshopDashboard.Services.Analytics.AnalyticsService Analytics
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    ServiceReport — "Service Report". Pre-flight checks for a job's
+    inspections, then generates the service report PDF for that job. Checks:
+      - every result whose test type needs test equipment
+        (EquipmentRequiredTypeIds — earth/RCD/voltage/light meter/electrical
+        safety/power) has one assigned
+      - every assigned test equipment item was operational at its most recent
+        inspection
+      - inspections whose comments say the unit was tested by the OEM or a
+        third party (ExternalTestPattern) have a report uploaded to the
+        inspection's resources
+
+    ── Services ─────────────────────────────────────────────────────────────
+      ReportLookup    — InspectionReportLookup: inspection ids for the job,
+                        per-inspection equipment info (incl. comments and
+                        resource count), job meta (owner company/report id),
+                        the raw test_script_results, and the latest
+                        operational status of each test equipment item used
+      DocumentBuilder — InspectionDocumentBuilder: renders the PDF given the
+                        job/report/company id and the picked-owner user id
+      DocumentStore   — GeneratedDocumentStore: holds the finished PDF so the
+                        preview iframe and Download link fetch it over plain
+                        HTTP (/generated-documents/{id}) instead of it being
+                        pushed through the circuit as base64
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      RunReport loads inspections -> equipment info -> job meta -> test
+      results, computing Compliant client-side from EquipmentRequiredTypeIds
+      -> test equipment status for every equipment id the results reference
+      -> GenerateDocumentAsync (needs an OwnerSection pick first) builds the
+      PDF and parks it in DocumentStore; the preview iframe and Download
+      link both point at its /generated-documents URL. Re-running for a new job clears all the
+      doc-generation state up front so a stale PDF from the previous job
+      can't linger on screen.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Service Report</h1>
+    <p class="text-muted">Check a job's inspections, then generate its service report.</p>
+</div>
+
+<OwnerSection @ref="_ownerSection" />
+
+<Card Class="mb-4">
+    <CardBody>
+        <label class="form-label fw-semibold">Job ID</label>
+        <div class="d-flex gap-2">
+            <input type="number" class="form-control" style="max-width: 200px;"
+                   @bind="_jobId" @bind:event="oninput"
+                   placeholder="e.g. 140049" />
+            <Button Color="ButtonColor.Primary" Disabled="@(_jobId == null || _loading)" @onclick="RunReport">
+                @(_loading ? "..." : "Run Report")
+            </Button>
+        </div>
+
+        @if (!string.IsNullOrWhiteSpace(_error))
+        {
+            <Callout Color="CalloutColor.Danger" Class="mb-0 mt-3">@_error</Callout>
+        }
+    </CardBody>
+</Card>
+
+@if (_results.Any())
+{
+    @* ── Summary ── *@
+    <Card Class="mb-3">
+        <CardBody>
+            <div class="d-flex gap-4 flex-wrap">
+                <div>
+                    <div class="text-muted small">Job ID</div>
+                    <div class="fw-semibold">@_jobId</div>
+                </div>
+                <div>
+                    <div class="text-muted small">Inspections</div>
+                    <div class="fw-semibold">@_results.Select(r => r.InspectionId).Distinct().Count()</div>
+                </div>
+                <div>
+                    <div class="text-muted small">Require Equipment</div>
+                    <div class="fw-semibold">@_results.GroupBy(r => r.InspectionId).Count(g => g.Any(r => r.EquipmentRequired))</div>
+                </div>
+                <div>
+                    <div class="text-muted small">Missing Equipment</div>
+                    <div class="fw-semibold @(MissingEquipmentCount > 0 ? "text-danger" : "text-success")">
+                        @MissingEquipmentCount
+                    </div>
+                </div>
+                <div>
+                    <div class="text-muted small">Missing OEM/3rd-Party Report</div>
+                    <div class="fw-semibold @(MissingExternalReportCount > 0 ? "text-danger" : "text-success")">
+                        @MissingExternalReportCount
+                    </div>
+                </div>
+                <div>
+                    <div class="text-muted small">Non-Operational Test Equipment</div>
+                    <div class="fw-semibold @(NonOperationalTestEquipment.Count > 0 ? "text-danger" : "text-success")">
+                        @NonOperationalTestEquipment.Count
+                    </div>
+                </div>
+                <div>
+                    <div class="text-muted small">Out of Calibration</div>
+                    <div class="fw-semibold @(UncalibratedTestEquipment.Count > 0 ? "text-danger" : "text-success")">
+                        @UncalibratedTestEquipment.Count
+                    </div>
+                </div>
+            </div>
+        </CardBody>
+    </Card>
+
+    @* ── Issue Alerts ── *@
+    @if (MissingEquipmentCount > 0)
+    {
+        <Callout Color="CalloutColor.Danger" Heading="Test equipment missing" Class="mb-3">
+            @MissingEquipmentCount inspection@(MissingEquipmentCount == 1 ? "" : "s") require test equipment that has not been assigned.
+        </Callout>
+    }
+    @if (MissingExternalReportCount > 0)
+    {
+        <Callout Color="CalloutColor.Danger" Heading="OEM / third-party report missing" Class="mb-3">
+            @MissingExternalReportCount inspection@(MissingExternalReportCount == 1 ? "" : "s") mention OEM or third-party testing but have no report uploaded to the inspection's resources.
+        </Callout>
+    }
+    @if (NonOperationalTestEquipment.Count > 0)
+    {
+        <Callout Color="CalloutColor.Danger" Heading="Test equipment not operational" Class="mb-3">
+            @NonOperationalTestEquipment.Count test equipment item@(NonOperationalTestEquipment.Count == 1 ? " was" : "s were") not operational at @(NonOperationalTestEquipment.Count == 1 ? "its" : "their") last inspection.
+        </Callout>
+    }
+    @if (UncalibratedTestEquipment.Count > 0)
+    {
+        <Callout Color="CalloutColor.Danger" Heading="Test equipment out of calibration" Class="mb-3">
+            @UncalibratedTestEquipment.Count test equipment item@(UncalibratedTestEquipment.Count == 1 ? " has" : "s have") an expired or missing calibration certificate.
+        </Callout>
+    }
+    @if (MissingEquipmentCount == 0 && MissingExternalReportCount == 0 && NonOperationalTestEquipment.Count == 0 && UncalibratedTestEquipment.Count == 0)
+    {
+        <Callout Color="CalloutColor.Success" Heading="All good" Class="mb-3">
+            Test equipment is assigned, operational and in calibration, and every OEM/third-party test has its report attached.
+        </Callout>
+    }
+
+    @* ── Per-Inspection Summary ── *@
+    <Card Class="mb-3">
+        <CardHeader>Summary by Inspection</CardHeader>
+        <CardBody Class="p-0">
+            <table class="table table-sm mb-0">
+                <thead class="table-light">
+                    <tr>
+                        <th>Inspection ID</th>
+                        <th>Serial No</th>
+                        <th>Asset No</th>
+                        <th>Model</th>
+                        <th>Test Equipment</th>
+                        <th>OEM/3rd-Party Report</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var grp in _results.GroupBy(r => r.InspectionId))
+                    {
+                        var missing = grp.Count(r => !r.Compliant);
+                        var nonOperational = grp.Any(r => r.TestEquipmentId != 0 && !IsTestEquipmentOperational(r.TestEquipmentId));
+                        _equipmentInfo.TryGetValue(grp.Key, out var eq);
+                        var externalReport = ExternalReportState(eq);
+                        <tr class="@(missing > 0 || nonOperational || externalReport == false ? "table-danger" : "")">
+                            <td>@grp.Key</td>
+                            <td>@(eq?.SerialNo ?? "—")</td>
+                            <td>@(eq?.AssetNo ?? "—")</td>
+                            <td>@(eq?.ModelId.ToString() ?? "—")</td>
+                            <td>
+                                @if (!grp.Any(r => r.EquipmentRequired))
+                                {
+                                    <Badge Color="BadgeColor.Secondary">Not required</Badge>
+                                }
+                                else if (missing > 0)
+                                {
+                                    <Badge Color="BadgeColor.Danger">Missing</Badge>
+                                }
+                                else if (nonOperational)
+                                {
+                                    <Badge Color="BadgeColor.Danger">Not operational</Badge>
+                                }
+                                else
+                                {
+                                    <Badge Color="BadgeColor.Success">Assigned</Badge>
+                                }
+                            </td>
+                            <td>
+                                @if (externalReport == null)
+                                {
+                                    <Badge Color="BadgeColor.Secondary">Not required</Badge>
+                                }
+                                else if (externalReport == true)
+                                {
+                                    <Badge Color="BadgeColor.Success">Attached</Badge>
+                                }
+                                else
+                                {
+                                    <span title="@eq?.Comments"><Badge Color="BadgeColor.Danger">Missing</Badge></span>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </CardBody>
+    </Card>
+
+    @* ── Test Equipment Used ── *@
+    @if (_testEquipment.Any())
+    {
+        <Card Class="mb-3">
+            <CardHeader>Test Equipment Used</CardHeader>
+            <CardBody Class="p-0">
+                <table class="table table-sm mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th>Equipment ID</th>
+                            <th>Serial No</th>
+                            <th>Model</th>
+                            <th>Last Inspected</th>
+                            <th>Status at Last Inspection</th>
+                            <th>Calibration</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var te in _testEquipment.Values.OrderBy(t => t.EquipmentId))
+                        {
+                            var operational = IsOperational(te.OperationalStatus);
+                            <tr class="@(operational && te.InCalibration ? "" : "table-danger")">
+                                <td>@te.EquipmentId</td>
+                                <td>@(te.SerialNo ?? "—")</td>
+                                <td>@(te.ModelName ?? "—")</td>
+                                <td>@(te.LastInspectionDate?.ToString("dd MMM yyyy") ?? "Never")</td>
+                                <td>
+                                    <Badge Color="@(operational ? BadgeColor.Success : BadgeColor.Danger)">
+                                        @(te.OperationalStatus ?? "No inspection")
+                                    </Badge>
+                                </td>
+                                <td>
+                                    @if (te.CalibrationExpiry == null)
+                                    {
+                                        <Badge Color="BadgeColor.Danger">No certificate</Badge>
+                                    }
+                                    else if (te.InCalibration)
+                                    {
+                                        <Badge Color="BadgeColor.Success">Valid to @te.CalibrationExpiry.Value.ToString("dd MMM yyyy")</Badge>
+                                    }
+                                    else
+                                    {
+                                        <Badge Color="BadgeColor.Danger">Expired @te.CalibrationExpiry.Value.ToString("dd MMM yyyy")</Badge>
+                                    }
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </CardBody>
+        </Card>
+    }
+
+    @* ── Full Detail ── *@
+    <Card Class="mb-3">
+        <CardHeader>
+            <div class="d-flex justify-content-between align-items-center">
+                <span>All Results</span>
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" @onclick="ToggleDetail">
+                    @(_showDetail ? "Hide" : "Show")
+                </Button>
+            </div>
+        </CardHeader>
+        @if (_showDetail)
+        {
+            <CardBody Class="p-0">
+                <table class="table table-sm mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th>Inspection ID</th>
+                            <th>Result ID</th>
+                            <th>Script Item ID</th>
+                            <th>Test Type</th>
+                            <th>Equipment Required</th>
+                            <th>Equipment ID</th>
+                            <th>Compliant</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var r in _results)
+                        {
+                            <tr class="@(!r.Compliant ? "table-danger" : "")">
+                                <td>@r.InspectionId</td>
+                                <td>@r.ResultId</td>
+                                <td>@r.TestScriptItemId</td>
+                                <td>@r.TestTypeId</td>
+                                <td>
+                                    @if (r.EquipmentRequired)
+                                    {
+                                        <Badge Color="BadgeColor.Warning">Yes</Badge>
+                                    }
+                                    else
+                                    {
+                                        <Badge Color="BadgeColor.Secondary">No</Badge>
+                                    }
+                                </td>
+                                <td>@(r.TestEquipmentId == 0 ? "—" : r.TestEquipmentId.ToString())</td>
+                                <td>
+                                    @if (!r.EquipmentRequired)
+                                    {
+                                        <Badge Color="BadgeColor.Secondary">N/A</Badge>
+                                    }
+                                    else if (r.Compliant)
+                                    {
+                                        <Badge Color="BadgeColor.Success">Yes</Badge>
+                                    }
+                                    else
+                                    {
+                                        <Badge Color="BadgeColor.Danger">No</Badge>
+                                    }
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </CardBody>
+        }
+    </Card>
+}
+else if (_hasRun && !_loading)
+{
+    <Callout Color="CalloutColor.Warning">No inspections found for job @_jobId with a non-null asset condition.</Callout>
+}
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2 mb-3">
+        <Spinner Color="SpinnerColor.Primary" Size="SpinnerSize.Small" />
+        <span class="text-muted">Loading...</span>
+    </div>
+}
+
+@* ── Document Generation ── *@
+@if (_hasRun && _results.Any())
+{
+    <hr class="my-4" />
+    <h5 class="mb-3">Generate Document</h5>
+
+    @if (_docReportId == null || _docCompanyId == null)
+    {
+        <Callout Color="CalloutColor.Warning" Class="mb-3">Could not load report or company ID for job @_jobId.</Callout>
+    }
+
+    <Card Class="mb-3">
+        <CardHeader>Cover Page</CardHeader>
+        <CardBody>
+            <div class="row g-3">
+                <div class="col-md-4">
+                    <label class="form-label fw-semibold">Report Type</label>
+                    <select class="form-select" @bind="_coverType">
+                        <option value="@ServiceReportType.MedicalDevice">Medical Device (AS3551:2012)</option>
+                        <option value="@ServiceReportType.ClassWiring">Class Wiring (AS/NZS3003:2018)</option>
+                        <option value="@ServiceReportType.MedicalGas">Medical Gas (AS/NZS2896:2021)</option>
+                    </select>
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label fw-semibold">Routine Service Job</label>
+                    <input class="form-control" @bind="_coverRsJobNo" @bind:event="oninput" placeholder="e.g. 2026-39" />
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label fw-semibold">Area</label>
+                    <textarea class="form-control" rows="2" @bind="_coverArea" @bind:event="oninput" placeholder="e.g. Theatres (one line each)"></textarea>
+                </div>
+            </div>
+        </CardBody>
+    </Card>
+
+    <div class="d-flex align-items-center gap-3 mb-3">
+        <Button Color="ButtonColor.Success" Disabled="@(_docGenerating || _docReportId == null || _docCompanyId == null)" @onclick="GenerateDocumentAsync">
+            @(_docGenerating ? _docStatus : "Generate Document")
+        </Button>
+
+        @if (_docGenerating)
+        {
+            <Spinner Color="SpinnerColor.Secondary" Size="SpinnerSize.Small" />
+        }
+
+        @if (_docId != null && !_docGenerating)
+        {
+            <a class="btn btn-outline-primary" href="@($"generated-documents/{_docId}?download=true")">
+                Download PDF
+            </a>
+        }
+    </div>
+
+    @if (!string.IsNullOrWhiteSpace(_docError))
+    {
+        <Callout Color="CalloutColor.Danger" Class="mb-3">@_docError</Callout>
+    }
+
+    @if (_docWarnings.Any())
+    {
+        <Callout Color="CalloutColor.Warning" Heading="Calibration certificates" Class="mb-3">
+            <ul class="mb-0">
+                @foreach (var warning in _docWarnings)
+                {
+                    <li>@warning</li>
+                }
+            </ul>
+        </Callout>
+    }
+
+    @* ── PDF Preview ── *@
+    @if (_docId != null)
+    {
+        <Card>
+            <CardHeader>
+                <div class="d-flex justify-content-between align-items-center">
+                    <span>Document Preview</span>
+                    <span class="text-muted small">@_docPageCount page@(_docPageCount == 1 ? "" : "s")</span>
+                </div>
+            </CardHeader>
+            <CardBody Class="p-0">
+                <iframe src="@($"generated-documents/{_docId}")" style="width:100%; height:800px; border:none;"></iframe>
+            </CardBody>
+        </Card>
+    }
+}
+
+@code {
+
+    // ── Config: manually define which test_type_ids require equipment ──
+    private static readonly HashSet<int> EquipmentRequiredTypeIds = new()
+    {   1, // earth
+        2, // rcd
+        3, // voltage
+        11, // light metre
+        13, // electrical safety
+        21, // power
+
+    };
+
+    // Inspection comments matching this mean the unit was tested by the OEM or a
+    // third party, so their report must be uploaded to the inspection's resources.
+    private static readonly System.Text.RegularExpressions.Regex ExternalTestPattern = new(
+        @"\bOEM\b|\b(third|3rd)[\s-]*party\b",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    private record InspectionResult(
+        int InspectionId,
+        int ResultId,
+        int TestScriptItemId,
+        int TestTypeId,
+        int TestEquipmentId,
+        bool EquipmentRequired,
+        bool Compliant
+    );
+
+    private int? _jobId;
+    private bool _loading = false;
+    private bool _hasRun = false;
+    private bool _showDetail = false;
+    private string? _error;
+    private List<InspectionResult> _results = new();
+    private Dictionary<int, InspectionEquipmentInfo> _equipmentInfo = new();
+    private Dictionary<int, TestEquipmentStatus> _testEquipment = new();
+
+    private int MissingEquipmentCount =>
+        _results.GroupBy(r => r.InspectionId).Count(g => g.Any(r => !r.Compliant));
+
+    private int MissingExternalReportCount =>
+        _results.Select(r => r.InspectionId).Distinct()
+            .Count(id => ExternalReportState(_equipmentInfo.GetValueOrDefault(id)) == false);
+
+    private List<TestEquipmentStatus> UncalibratedTestEquipment =>
+        _testEquipment.Values.Where(t => !t.InCalibration).ToList();
+
+    private List<TestEquipmentStatus> NonOperationalTestEquipment =>
+        _testEquipment.Values.Where(t => !IsOperational(t.OperationalStatus)).ToList();
+
+    // null = no OEM/third-party testing mentioned; true/false = report attached or not.
+    private static bool? ExternalReportState(InspectionEquipmentInfo? info)
+    {
+        if (info?.Comments is null || !ExternalTestPattern.IsMatch(info.Comments)) return null;
+        return info.ResourceCount > 0;
+    }
+
+    // Matches "Operational" but not "Not Operational" / "Non-Operational".
+    private static bool IsOperational(string? status) =>
+        status != null && status.Trim().StartsWith("Operational", StringComparison.OrdinalIgnoreCase);
+
+    private bool IsTestEquipmentOperational(int equipmentId) =>
+        !_testEquipment.TryGetValue(equipmentId, out var te) || IsOperational(te.OperationalStatus);
+
+    // ── Document generation ──
+    private int? _docReportId;  // fetched from job query
+    private int? _docCompanyId; // fetched from job query
+    private bool _docGenerating = false;
+    private string _docStatus = "";
+    private string? _docError;
+    private List<string> _docWarnings = new(); // certificates that couldn't be included
+    private Guid? _docId; // GeneratedDocumentStore key for the finished PDF
+    private int _docPageCount;
+
+    // ── Cover page ──
+    private ServiceReportType _coverType = ServiceReportType.MedicalDevice;
+    // Both pre-filled from the job notes ("Routine Service Job - 2026-39 --- Theatres")
+    private string _coverRsJobNo = "";
+    private string _coverArea = "";
+    private DateTime? _coverDate; // job's last worked date; today if the job has none
+
+    private OwnerSection? _ownerSection;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        var auth = await AuthStateProvider.GetAuthenticationStateAsync();
+        var user = auth.User.Identity?.Name;
+
+        if (user is null) return;
+
+        _ownerSection?.PrefillOwnerFromUsernameAsync(user);
+    }
+
+    private void ToggleDetail() => _showDetail = !_showDetail;
+
+    private async Task RunReport()
+    {
+        if (_jobId == null) return;
+
+        _loading = true;
+        _error = null;
+        _hasRun = false;
+        _results = new();
+        _equipmentInfo = new();
+        _testEquipment = new();
+        _showDetail = false;
+
+        // Document state must be cleared here too — otherwise looking up a new
+        // job while a previous job's PDF/report/company id are still set leaves
+        // a stale preview (and a "Generate Document" button that would build the
+        // wrong job's document) visible until the user notices and regenerates.
+        _docReportId = null;
+        _docCompanyId = null;
+        _docGenerating = false;
+        _docStatus = "";
+        _docError = null;
+        _docWarnings = new();
+        ClearDocument();
+        _docPageCount = 0;
+        _coverRsJobNo = "";
+        _coverArea = "";
+        _coverDate = null;
+
+        StateHasChanged();
+
+        try
+        {
+            await Analytics.TrackEventAsync("Service report looked up", detail: $"Job {_jobId}");
+
+            // Step 1: load all inspections for the job
+            var inspections = await ReportLookup.GetInspectionIdsForJobAsync(_jobId.Value);
+
+            if (!inspections.Any())
+            {
+                _hasRun = true;
+                return;
+            }
+
+            // Step 2: load equipment info (serial_no, asset_no, model_id) for each inspection
+            _equipmentInfo = await ReportLookup.GetEquipmentInfoAsync(inspections);
+
+            // Step 3: job meta (owner company / report id) for document generation
+            var jobMeta = await ReportLookup.GetJobMetaAsync(_jobId.Value);
+            if (jobMeta != null)
+            {
+                _docCompanyId = jobMeta.OwnerCompanyId;
+                _docReportId = jobMeta.ReportId;
+                _coverRsJobNo = jobMeta.RsJobNo ?? "";
+                _coverArea = jobMeta.Area ?? "";
+                _coverDate = jobMeta.LastWorkedDate;
+            }
+
+            // Step 4: for each inspection, load test_script_results joined to test_script_item
+            var resultRows = await ReportLookup.GetTestResultsAsync(inspections);
+
+            _results = resultRows
+                .Where(r => !string.IsNullOrWhiteSpace(r.ResultValue)) // skip if result_value is null
+                .Select(r =>
+                {
+                    var testTypeId = r.TestTypeId ?? 0;
+                    var equipmentId = r.TestEquipmentId ?? 0;
+                    var required = EquipmentRequiredTypeIds.Contains(testTypeId);
+                    var compliant = !required || equipmentId != 0;
+
+                    return new InspectionResult(
+                        InspectionId: r.InspectionId ?? 0,
+                        ResultId: r.ResultId ?? 0,
+                        TestScriptItemId: r.TestScriptItemId ?? 0,
+                        TestTypeId: testTypeId,
+                        TestEquipmentId: equipmentId,
+                        EquipmentRequired: required,
+                        Compliant: compliant
+                    );
+                })
+                .Where(r => r.InspectionId != 0)
+                .OrderBy(r => r.InspectionId)
+                .ThenBy(r => r.ResultId)
+                .ToList();
+
+            // Step 5: latest operational status of every test equipment item used
+            _testEquipment = await ReportLookup.GetTestEquipmentStatusAsync(
+                _results.Where(r => r.TestEquipmentId != 0).Select(r => r.TestEquipmentId));
+
+            _hasRun = true;
+        }
+        catch (Exception ex)
+        {
+            _error = "Report failed: " + ex.Message;
+        }
+        finally
+        {
+            _loading = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task GenerateDocumentAsync()
+    {
+        if (_jobId == null || _docReportId == null || _docCompanyId == null) return;
+
+        if (_ownerSection is null || _ownerSection.User == default)
+        {
+            _ownerSection?.SetError(true);
+            _docError = "Pick an owner before generating the document.";
+            return;
+        }
+        _ownerSection.SetError(false);
+
+        if (string.IsNullOrWhiteSpace(_coverRsJobNo) || string.IsNullOrWhiteSpace(_coverArea))
+        {
+            _docError = "Fill in the Routine Service Job and Area for the cover page.";
+            return;
+        }
+
+        _docGenerating = true;
+        _docError = null;
+        _docWarnings = new();
+        ClearDocument();
+        _docStatus = "Starting...";
+        StateHasChanged();
+
+        try
+        {
+            var progress = new Progress<string>(msg =>
+            {
+                _docStatus = msg;
+                InvokeAsync(StateHasChanged);
+            });
+
+            var bytes = await DocumentBuilder.BuildAsync(
+                jobId: _jobId.Value,
+                reportId: _docReportId.Value,
+                companyId: _docCompanyId.Value,
+                progress: progress,
+                userId: _ownerSection.User.UserId,
+                coverDetails: new CoverPageDetails(_coverType, _coverRsJobNo, _coverArea, _coverDate ?? DateTime.Today),
+                testEquipment: _testEquipment.Values.ToList(),
+                warnings: _docWarnings);
+
+            _docId = DocumentStore.Add(bytes, $"ServiceReport_Job{_jobId}_{DateTime.Now:yyyyMMdd_HHmm}.pdf");
+
+            // Count pages for the header
+            using var ms = new MemoryStream(bytes);
+            using var doc = PdfSharpCore.Pdf.IO.PdfReader.Open(ms, PdfSharpCore.Pdf.IO.PdfDocumentOpenMode.InformationOnly);
+            _docPageCount = doc.PageCount;
+
+            await Analytics.TrackEventAsync("Service report generated", detail: $"Job {_jobId}", quantity: _docPageCount);
+        }
+        catch (Exception ex)
+        {
+            _docError = "Document generation failed: " + ex.Message;
+        }
+        finally
+        {
+            _docGenerating = false;
+            _docStatus = "";
+        }
+    }
+
+    private void ClearDocument()
+    {
+        if (_docId != null) DocumentStore.Remove(_docId.Value);
+        _docId = null;
+    }
+}

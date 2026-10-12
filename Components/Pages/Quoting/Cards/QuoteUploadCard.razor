@@ -1,0 +1,71 @@
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    QuoteUploadCard — shared upload-PDF card used by every repairer quote
+    page: file picker, error/success callouts, Extract and Create-Services
+    buttons.
+
+    ── Parameters ───────────────────────────────────────────────────────────
+      HasFile/HasResult/Loading/Submitting/SubmitSuccess/CanSubmit/Error —
+        drives which buttons are enabled and which callouts show
+      OnFileSelected/OnExtract/OnSubmit — the three actions
+      ExtraActions — repairer-specific controls rendered next to the
+        buttons, e.g. Falcon's "Consolidate by item" checkbox
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<Card Class="mb-4">
+    <CardBody>
+        <label class="form-label fw-semibold">Upload PDF Quote</label>
+        <InputFile class="form-control mb-3" OnChange="OnFileSelected" accept=".pdf" />
+
+        @if (!string.IsNullOrWhiteSpace(Error))
+        {
+            <Callout Color="CalloutColor.Danger" Class="mb-3">@Error</Callout>
+        }
+
+        @if (SubmitSuccess)
+        {
+            <Callout Color="CalloutColor.Success" Class="mb-3">Services created successfully.</Callout>
+        }
+
+        <div class="d-flex gap-2">
+            <Button Color="ButtonColor.Primary" Disabled="@(!HasFile || Loading)"
+                    Loading="Loading" LoadingText="Extracting..." @onclick="OnExtract">
+                Extract Quote
+            </Button>
+
+            @if (HasResult)
+            {
+                <Button Color="ButtonColor.Success" Disabled="@(!CanSubmit)"
+                        Loading="Submitting" LoadingText="Submitting..." @onclick="OnSubmit">
+                    Create Services
+                </Button>
+
+                @if (ExtraActions != null)
+                {
+                    @ExtraActions
+                }
+            }
+        </div>
+    </CardBody>
+</Card>
+
+@code {
+    [Parameter] public bool HasFile { get; set; }
+    [Parameter] public bool HasResult { get; set; }
+    [Parameter] public bool Loading { get; set; }
+    [Parameter] public bool Submitting { get; set; }
+    [Parameter] public bool SubmitSuccess { get; set; }
+    [Parameter] public bool CanSubmit { get; set; }
+    [Parameter] public string? Error { get; set; }
+
+    [Parameter] public EventCallback<InputFileChangeEventArgs> OnFileSelected { get; set; }
+    [Parameter] public EventCallback OnExtract { get; set; }
+    [Parameter] public EventCallback OnSubmit { get; set; }
+
+    /// <summary>Repairer-specific controls rendered next to the buttons, e.g. Falcon's
+    /// "Consolidate by item" checkbox.</summary>
+    [Parameter] public RenderFragment? ExtraActions { get; set; }
+}

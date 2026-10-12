@@ -1,0 +1,44 @@
+﻿
+@inherits LayoutComponentBase
+
+@inject NavigationManager Nav
+@inject WorkshopDashboard.Services.Analytics.AnalyticsService Analytics
+
+<div class="page">
+    <div class="sidebar">
+        <NavMenu />
+    </div>
+
+    <main>
+        <article class="content px-4">
+            <AuthorizeView>
+                <Authorized>
+                    <JmsOfflineBanner />
+                </Authorized>
+            </AuthorizeView>
+            @* Brings the sidebar back once NavMenu's ☰ has hidden it — App.razor's __toggleNav.
+               Floated, so the page's title sits on the same line beside it. *@
+            <button type="button" class="nav-show-btn" title="Show menu" aria-label="Show menu"
+                    onclick="window.__toggleNav()"><i class="bi bi-list"></i></button>
+            @Body
+        </article>
+    </main>
+</div>
+
+<div id="blazor-error-ui">
+    An unhandled error has occurred.
+    <a href="" class="reload">Reload</a>
+    <a class="dismiss">🗙</a>
+</div>
+
+@code {
+    // MainLayout has no @rendermode of its own, so it re-renders fresh on
+    // every navigation (full reload or enhanced nav) rather than living
+    // inside an interactive circuit — one OnInitializedAsync per page view,
+    // no double-prerender counting risk. See AnalyticsService's doc comment.
+    protected override async Task OnInitializedAsync()
+    {
+        var path = Nav.ToBaseRelativePath(Nav.Uri).Split('?')[0];
+        await Analytics.TrackPageViewAsync(string.IsNullOrEmpty(path) ? "(home)" : path);
+    }
+}

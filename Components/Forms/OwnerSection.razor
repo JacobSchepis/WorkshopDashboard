@@ -1,0 +1,213 @@
+@using WorkshopDashboard.Abstract
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.External.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+
+@inject JmsReadSession JmsRead
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    OwnerSection — search-and-pick a JMS user to attribute a submission to
+    (e.g. "author"/"owner" on document/quote/report submissions). Used by
+    every page that needs to say "on behalf of whom" without requiring the
+    caller to already know their JMS user id.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      JmsRead — JmsReadSession: GetClientAsync().SearchUsersAsync
+
+    ── Public surface ───────────────────────────────────────────────────────
+      User/GetJmsUser() — the picked JmsUser, default until Select() runs
+      PrefillOwnerFromUsernameAsync(username) — tries to auto-select the
+      logged-in user by progressively shortening their login
+      ("alex.example" -> "alex example" -> "alex" -> "ale" -> ...)
+      against SearchUsersAsync until exactly one hit is found, or shows the
+      remaining candidates for the caller to pick from
+      SetError(bool) — shows/hides the "Pick an owner" validation message
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+@if (_isMissing)
+{
+    <div class="text-danger">
+        Pick an owner
+    </div>
+}
+<label>
+    Owner (search)
+    <input class="form-control"
+           value="@_query"
+           @oninput="OnInput"
+           placeholder="firstname.lastname or name..." />
+</label>
+
+@if (_hits.Count > 0)
+{
+    <div style="border:1px solid #444; border-radius:8px; padding:8px;">
+        @foreach (var h in _hits)
+        {
+            <button type="button"
+                    class="btn btn-sm btn-outline-secondary"
+                    style="margin:4px;"
+                    @onclick="() => Select(h)">
+                @h.FullName
+            </button>
+        }
+    </div>
+}
+
+@code {
+    public JmsUser User { get; private set; } = default!;
+
+    private bool _isMissing = false;
+    private string _query = "";
+
+    private List<JmsUser> _hits = new();
+    
+    private CancellationTokenSource? _cts;
+
+    public JmsUser GetJmsUser() => User;
+
+    // Deliberately synchronous (not async) — the debounce+search runs detached in
+    // SearchAfterDelayAsync rather than being awaited here. The old version awaited JMS
+    // session resolution before even echoing the typed character into _query, then awaited a
+    // 250ms delay + network search on top of that — all inline, which blocked Blazor Server's
+    // per-circuit event queue from processing the *next* keystroke until it finished. That
+    // queued keystroke's eventual render then landed late, showing this handler's now-stale
+    // _query and visibly deleting whatever had been typed since. Returning immediately keeps
+    // every keystroke processed in near real time.
+    private void OnInput(ChangeEventArgs e)
+    {
+        _query = e.Value?.ToString() ?? "";
+        User = default;
+
+        _cts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _cts = cts;
+
+        _hits.Clear();
+        if (_query.Length < 2) return;
+
+        _ = SearchAfterDelayAsync(_query, cts);
+    }
+
+    private async Task SearchAfterDelayAsync(string term, CancellationTokenSource cts)
+    {
+        try
+        {
+            await Task.Delay(250, cts.Token);
+            if (cts.Token.IsCancellationRequested) return;
+
+            var jms = await JmsRead.GetClientAsync();
+            if (jms == null) return;
+
+            var hits = await jms.SearchUsersAsync(term);
+            if (cts.Token.IsCancellationRequested) return;
+
+            _hits = hits;
+            await InvokeAsync(StateHasChanged);
+        }
+        catch { /* ignore */ }
+    }
+
+    public async Task PrefillOwnerFromUsernameAsync(string username)
+    {
+        var jms = await JmsRead.GetClientAsync();
+        if (jms == null) return;
+
+        // Turn "alex.example" into "alex example"
+        var baseQuery = (username ?? "")
+            .Trim()
+            .Replace('.', ' ')
+            .Replace('_', ' ')
+            .Replace('-', ' ');
+
+        baseQuery = string.Join(" ", baseQuery
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+
+        if (string.IsNullOrWhiteSpace(baseQuery))
+        {
+            _query = "e.g. alex.example";
+            _hits.Clear();
+            StateHasChanged();
+            return;
+        }
+
+        // Build candidates by shortening "backwards":
+        // 1) drop last word(s): "alex example" -> "alex"
+        // 2) then trim last characters of the remaining word: "alex" -> "ale" -> ...
+        var candidates = new List<string>();
+
+        var parts = baseQuery.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+        for (int i = parts.Count; i >= 1; i--)
+        {
+            candidates.Add(string.Join(" ", parts.Take(i)));
+        }
+
+        // If only one word, progressively shorten it char-by-char
+        var first = candidates.Last(); // shortest "word-level" candidate (e.g. "alex")
+        if (!string.IsNullOrWhiteSpace(first))
+        {
+            for (int len = first.Length - 1; len >= 2; len--)
+            {
+                candidates.Add(first.Substring(0, len));
+            }
+        }
+
+        foreach (var q in candidates.Distinct())
+        {
+            _query = q;
+            User = default;
+            _hits.Clear();
+            StateHasChanged(); // show what we're trying (optional but nice)
+
+            try
+            {
+                var hits = await jms.SearchUsersAsync(q);
+
+                if (hits is null || hits.Count == 0)
+                    continue;
+
+                // Found at least one
+                if (hits.Count == 1)
+                {
+                    Select(hits[0]);      // uses your existing method
+                    StateHasChanged();
+                    return;
+                }
+
+                // 2+ hits: show options
+                _hits = hits;
+                StateHasChanged();
+                return;
+            }
+            catch
+            {
+                // ignore and try shorter query
+            }
+        }
+
+        // Nothing matched at all
+        _hits.Clear();
+        User = default;
+        _query = "e.g. alex.example";
+        StateHasChanged();
+    }
+
+    private void Select(JmsUser hit)
+    {
+        User = hit;
+        _query = hit.FullName;
+        _hits.Clear();
+    }
+
+    public void SetError(bool isMissing)
+    {
+        _isMissing = isMissing;
+        StateHasChanged();
+    }
+}

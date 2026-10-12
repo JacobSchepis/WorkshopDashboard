@@ -1,0 +1,1550 @@
+@page "/waiting-quote/{CompanyName}/{CompanyIds}"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+
+@using System.Text.Json
+@using System.Text.RegularExpressions
+@using Microsoft.AspNetCore.Components.Forms
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.External.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.External.Email
+@using WorkshopDashboard.Services.External.Google
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Analytics
+@using WorkshopDashboard.Services.Stores
+@using WorkshopDashboard.Models
+@using BlazorBootstrap
+
+@inject IJSRuntime JS
+@inject IWebHostEnvironment Env
+@inject ScopeJobStore ScopeJobs
+@inject WaitingQuoteEmailConfig EmailConfig
+@inject EmailService Gmail
+@inject WaitingQuoteJobLookup JobLookup
+@inject WaitingWorkshopProcessingService WwpProcessing
+@inject LoanEquipmentLookup LoanEquipment
+@inject LoanEquipmentOverlayStore LoanOverlays
+@inject LoanEquipmentStatusStore LoanStatuses
+@inject AnalyticsService Analytics
+@inject TimesheetLoggingService TimesheetLogging
+@inject ScopeCustomerStore ScopeCustomers
+@inject ICustomerCreditSource CreditLookup
+@inject ScopeLookupService ScopeLookup
+@inject ManufacturerAbbreviationStore ManufacturerAbbreviations
+@inject ILogger<WaitingQuoteDetail> Logger
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    WaitingQuoteDetail — interactive view of one company's open summary.
+
+    Report logic (SQL, parsing, urgency, status names, report HTML, contact
+    grouping) lives in src/Services/WaitingQuoteReport.cs and is shared with
+    the dashboard and the future automated-email job. This page:
+
+      • runs the queries through Jms and hands the CSV to the service
+      • renders the two tables with hide (×) and exclude-model (🚫) buttons
+      • lets the user pick quote PDFs to attach (per-quote checkboxes)
+      • lets the user CC extra addresses and upload ad-hoc file attachments
+      • provides the SEND PANEL with three modes (see below)
+      • copies the service-built report HTML to the clipboard for Gmail
+
+    ── Departments ────────────────────────────────────────────────────────
+      When the ScopeCustomer has Departments, a picker filters every table,
+      the preview, the credit card and all send modes to one department's
+      jobs (ScopeCustomer.DepartmentForJobContact). _allQuoteJobs /
+      _allOtherJobs hold everything loaded; _quoteJobs / _otherJobs are the
+      filtered view the rest of the page reads.
+
+    ── Send modes ─────────────────────────────────────────────────────────
+      1. Custom person      — free-typed To address, one email, whole report.
+      2. Customer contacts  — the Scope Customer Manager contacts: the picked
+                              department's primary (To), secondary + our
+                              contact (CC); with no department picked, the
+                              customer's own primary (To) / secondary (CC).
+      3. Per job contact    — one email PER contact (job.contact_name →
+                              company_people), each containing only that
+                              contact's jobs. Contacts with no email are
+                              listed as un-sendable.
+
+    ── Attachments ────────────────────────────────────────────────────────
+      Two sources, merged in BuildAttachmentsAsync:
+        1. Ticked quote PDFs — fetched via Jms.GetQuotePdfAsync, scoped to the
+           jobs in the email (so per-contact sends only carry their own).
+        2. Manually uploaded files — held in memory for the session, added to
+           EVERY email regardless of mode.
+
+    ── Credit ─────────────────────────────────────────────────────────────
+      The customer's credit comes from the shared Google Sheet via
+      CustomerCreditLookup (same source as CustomerCreditPage.razor). The
+      sheet tab is the picked department's own tab if set, otherwise the
+      ScopeCustomer's, and is loaded after the jobs so it never holds up the page.
+      The "Include credit summary" checkbox is only enabled once it's loaded.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="d-flex align-items-center gap-3 mb-3">
+    <Button Color="ButtonColor.Secondary" Outline="true" @onclick="GoBack">← Back</Button>
+    <h3 class="mb-0">@CompanyName — Open Summary Report</h3>
+</div>
+
+@if (!_loading && _customer is { Departments.Count: > 0 })
+{
+    <div class="d-flex align-items-center gap-2 mb-3">
+        <label class="form-label mb-0 text-nowrap">Department</label>
+        <select class="form-select" style="max-width: 320px;" value="@_departmentFilter" @onchange="OnDepartmentChangedAsync">
+            <option value="@AllDepartments">All jobs (@JobCount(AllDepartments))</option>
+            @foreach (var d in _customer.Departments)
+            {
+                <option value="@d.Name">@d.Name (@JobCount(d.Name))</option>
+            }
+            @if (JobCount(NoDepartment) > 0)
+            {
+                <option value="@NoDepartment">No department (@JobCount(NoDepartment))</option>
+            }
+        </select>
+    </div>
+}
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else
+{
+    <!-- ── Section 1: Waiting Quote Confirmation ── -->
+    <Card Class="mb-4">
+        <CardHeader>Pending Quote Approval</CardHeader>
+        <CardBody>
+            @if (_quoteJobs.Count == 0)
+            {
+                <p class="text-muted mb-0">No jobs waiting quote confirmation.</p>
+            }
+            else
+            {
+                <Grid TItem="QuoteRow" Class="table table-striped align-middle mb-0" Data="QuoteRows()">
+                    <GridColumns>
+                        <GridColumn TItem="QuoteRow" HeaderText="Job ID">
+                            <a href="@JmsLinks.JobSummary(context.Job.JobId)"
+                               target="_blank" rel="noopener noreferrer">@context.Job.JobId</a>
+                        </GridColumn>
+                        <GridColumn TItem="QuoteRow" HeaderText="Created">@context.Job.JobCreated.ToString("dd MMM yyyy")</GridColumn>
+                        <GridColumn TItem="QuoteRow" HeaderText="Equipment">@context.Job.Equipment</GridColumn>
+                        <GridColumn TItem="QuoteRow" HeaderText="Fault">@context.Job.Fault</GridColumn>
+                        <GridColumn TItem="QuoteRow" HeaderText="Contact">
+                            @if (!string.IsNullOrWhiteSpace(context.Job.ContactName))
+                            {
+                                <span title="@context.Job.ContactEmail">@context.Job.ContactName</span>
+                            }
+                            else
+                            {
+                                <span class="text-muted">—</span>
+                            }
+                        </GridColumn>
+                        <GridColumn TItem="QuoteRow" HeaderText="Quote ID">
+                            @if (context.Quote is { } quote)
+                            {
+                                <Badge Color="@UrgencyBadgeColor(quote.DateSent)">Q-@quote.QuoteId</Badge>
+                            }
+                            else
+                            {
+                                <span class="text-muted">—</span>
+                            }
+                        </GridColumn>
+                        <GridColumn TItem="QuoteRow" HeaderText="Price">
+                            @(context.Quote is { } priceQuote ? $"${priceQuote.Price:N2}" : "—")
+                        </GridColumn>
+                        <GridColumn TItem="QuoteRow" HeaderText="Price (ex GST)">
+                            @(context.Quote is { } exGstQuote ? $"${exGstQuote.PriceExGst:N2}" : "—")
+                        </GridColumn>
+                        <GridColumn TItem="QuoteRow" HeaderText="Quote Date">
+                            @(context.Quote is { } dateQuote ? dateQuote.DateSent.ToString("dd MMM yyyy") : "—")
+                        </GridColumn>
+                        <GridColumn TItem="QuoteRow" HeaderText="Lifetime Spend">
+                            @if (_showLifetimeSpend)
+                            {
+                                if (context.Job.TotalSpentJobs == 0)
+                                {
+                                    <span class="text-muted">—</span>
+                                }
+                                else
+                                {
+                                    <div>$@context.Job.TotalSpent.ToString("N2")</div>
+                                    <div class="text-muted small">@context.Job.TotalSpentJobs repair@(context.Job.TotalSpentJobs == 1 ? "" : "s")</div>
+                                }
+                            }
+                        </GridColumn>
+                        <GridColumn TItem="QuoteRow" HeaderText="Attach">
+                            @if (context.Quote is { } attachQuote)
+                            {
+                                <label class="d-flex align-items-center gap-1 mb-0" title="Attach Q-@attachQuote.QuoteId">
+                                    <input type="checkbox"
+                                           checked="@_attachQuoteIds.Contains(attachQuote.QuoteId)"
+                                           @onchange="e => ToggleAttach(attachQuote.QuoteId, e.Value is bool b && b)" />
+                                    Q-@attachQuote.QuoteId
+                                </label>
+                            }
+                        </GridColumn>
+                        <GridColumn TItem="QuoteRow" HeaderText="">
+                            <Button Color="ButtonColor.Secondary" Outline="true" Size="ButtonSize.ExtraSmall"
+                                    @onclick="() => RemoveQuoteRow(context.Job, context.Quote)"
+                                    TooltipTitle="@(context.Quote is { } q ? $"Remove Q-{q.QuoteId} (this session only)" : "Hide row (this session only)")">×</Button>
+                            @if (context.IsFirstRow && context.Job.ModelId.HasValue)
+                            {
+                                <Button Color="ButtonColor.Warning" Outline="true" Size="ButtonSize.ExtraSmall"
+                                        @onclick="() => ExcludeModelAsync(context.Job)"
+                                        TooltipTitle="@($"Exclude model {context.Job.ModelId} from all future reports")">🚫</Button>
+                            }
+                        </GridColumn>
+                    </GridColumns>
+                </Grid>
+            }
+        </CardBody>
+    </Card>
+
+    <!-- ── Section 2: Everything else open ── -->
+    <Card Class="mb-4">
+        <CardHeader>Other Open Jobs</CardHeader>
+        <CardBody>
+            @if (_otherJobs.Count == 0)
+            {
+                <p class="text-muted mb-0">No other open jobs.</p>
+            }
+            else
+            {
+                <Grid TItem="WqJob" Class="table table-striped align-middle mb-0" Data="_otherJobs.OrderBy(j => j.JobId)">
+                    <GridColumns>
+                        <GridColumn TItem="WqJob" HeaderText="Job ID">
+                            <a href="@JmsLinks.JobSummary(context.JobId)"
+                               target="_blank" rel="noopener noreferrer">@context.JobId</a>
+                        </GridColumn>
+                        <GridColumn TItem="WqJob" HeaderText="Created">@context.JobCreated.ToString("dd MMM yyyy")</GridColumn>
+                        <GridColumn TItem="WqJob" HeaderText="Equipment">@context.Equipment</GridColumn>
+                        <GridColumn TItem="WqJob" HeaderText="Fault">@context.Fault</GridColumn>
+                        <GridColumn TItem="WqJob" HeaderText="Contact">
+                            @if (!string.IsNullOrWhiteSpace(context.ContactName))
+                            {
+                                <span title="@context.ContactEmail">@context.ContactName</span>
+                            }
+                            else
+                            {
+                                <span class="text-muted">—</span>
+                            }
+                        </GridColumn>
+                        <GridColumn TItem="WqJob" HeaderText="Status">
+                            <input type="text" class="form-control form-control-sm" style="min-width:9rem;"
+                                   value="@WaitingQuoteReport.FriendlyStatus(context.Status)"
+                                   @onchange="e => context.Status = e.Value?.ToString() ?? string.Empty" />
+                        </GridColumn>
+                        <GridColumn TItem="WqJob" HeaderText="Approved PO">
+                            @if (string.IsNullOrWhiteSpace(context.ApprovedPoNumbers))
+                            {
+                                <span class="text-muted">—</span>
+                            }
+                            else
+                            {
+                                <span>@context.ApprovedPoNumbers</span>
+                            }
+                        </GridColumn>
+                        <GridColumn TItem="WqJob" HeaderText="ETA">
+                            @if (context.JobStatusId == (int)JobStatus.WaitingWorkshopProcessing)
+                            {
+                                @if (context.Eta.HasValue)
+                                {
+                                    <div>@context.Eta.Value.ToString("dd MMM yyyy")</div>
+                                }
+                                else
+                                {
+                                    <div class="text-muted small">Not set</div>
+                                }
+                                <div class="d-flex gap-1 mt-1">
+                                    <input type="date" class="form-control form-control-sm" style="width:auto;" @bind="context.EtaInput" />
+                                    <Button Size="ButtonSize.ExtraSmall" Color="ButtonColor.Secondary" Outline="true"
+                                            Disabled="context.SavingEta" @onclick="() => SaveEtaAsync(context)">
+                                        @(context.SavingEta ? "..." : "Save")
+                                    </Button>
+                                </div>
+                            }
+                            else
+                            {
+                                <span class="text-muted">—</span>
+                            }
+                        </GridColumn>
+                        <GridColumn TItem="WqJob" HeaderText="">
+                            <Button Color="ButtonColor.Secondary" Outline="true" Size="ButtonSize.ExtraSmall"
+                                    @onclick="() => RemoveOtherJob(context.JobId)"
+                                    TooltipTitle="Hide row (this session only)">×</Button>
+                            @if (context.ModelId.HasValue)
+                            {
+                                <Button Color="ButtonColor.Warning" Outline="true" Size="ButtonSize.ExtraSmall"
+                                        @onclick="() => ExcludeModelAsync(context)"
+                                        TooltipTitle="@($"Exclude model {context.ModelId} from all future reports")">🚫</Button>
+                            }
+                        </GridColumn>
+                    </GridColumns>
+                </Grid>
+            }
+        </CardBody>
+    </Card>
+
+    <!-- ── Section 3: Loans currently with this customer ── -->
+    <Card Class="mb-4">
+        <CardHeader>Loans</CardHeader>
+        <CardBody>
+            @if (_loans.Count == 0)
+            {
+                <p class="text-muted mb-0">No loan equipment currently with this customer.</p>
+            }
+            else
+            {
+                <p class="text-muted small">Untick a loan to leave it out of the report — e.g. one that belongs to another department.</p>
+                <Grid TItem="WqLoan" Class="table table-striped align-middle mb-0" Data="_loans">
+                    <GridColumns>
+                        <GridColumn TItem="WqLoan" HeaderText="Send">
+                            <input type="checkbox" class="form-check-input" checked="@(!_ignoredLoans.Contains(context))"
+                                   @onchange="@(e => ToggleLoan(context, e.Value is true))" />
+                        </GridColumn>
+                        <GridColumn TItem="WqLoan" HeaderText="Equipment">
+                            <span class="@(_ignoredLoans.Contains(context) ? "text-muted text-decoration-line-through" : "")">@context.Equipment</span>
+                        </GridColumn>
+                        <GridColumn TItem="WqLoan" HeaderText="Job">
+                            @if (context.JobId.HasValue)
+                            {
+                                <a href="@JmsLinks.JobSummary(context.JobId)"
+                                   target="_blank" rel="noopener noreferrer">@context.JobId</a>
+                            }
+                            else
+                            {
+                                <span class="text-muted">—</span>
+                            }
+                        </GridColumn>
+                        <GridColumn TItem="WqLoan" HeaderText="Loaned">@(context.LoanedDate?.ToString("dd MMM yyyy") ?? "—")</GridColumn>
+                        <GridColumn TItem="WqLoan" HeaderText="Status">@context.StatusLabel</GridColumn>
+                        <GridColumn TItem="WqLoan" HeaderText="Covering For">
+                            @if (context.CoveringFor is not { Count: > 0 })
+                            {
+                                <span class="text-muted">—</span>
+                            }
+                            else
+                            {
+                                @foreach (var cov in context.CoveringFor)
+                                {
+                                    <div>
+                                        <a href="@JmsLinks.JobSummary(cov.JobId)"
+                                           target="_blank" rel="noopener noreferrer">@cov.JobId</a>
+                                        — @cov.Equipment
+                                    </div>
+                                }
+                            }
+                        </GridColumn>
+                        <GridColumn TItem="WqLoan" HeaderText="Agreement">
+                            @if (context.AgreementSigned)
+                            {
+                                <Badge Color="BadgeColor.Success">Signed</Badge>
+                            }
+                            else
+                            {
+                                <Badge Color="BadgeColor.Secondary">Not Signed</Badge>
+                            }
+                        </GridColumn>
+                    </GridColumns>
+                </Grid>
+            }
+        </CardBody>
+    </Card>
+
+    <!-- ── Section 4: Credit (shared Google Sheet) ── -->
+    <Card Class="mb-4">
+        <CardHeader>Credit</CardHeader>
+        <CardBody>
+            @if (string.IsNullOrWhiteSpace(_creditTabName))
+            {
+                <p class="text-muted mb-0">
+                    No credit sheet tab linked for this customer — link one on the
+                    <a href="scope-customers">Scope Customer Manager</a>.
+                </p>
+            }
+            else if (_loadingCredit)
+            {
+                <div class="d-flex align-items-center gap-2">
+                    <Spinner Color="SpinnerColor.Primary" Size="SpinnerSize.Small" />
+                    <span class="text-muted">Loading credit...</span>
+                </div>
+            }
+            else if (_credit is { Error: { Length: > 0 } })
+            {
+                <Callout Color="CalloutColor.Danger" Class="mb-0">@_credit.Error</Callout>
+            }
+            else if (_credit is not null)
+            {
+                <div class="row g-3 mb-3">
+                    <div class="col-6 col-md-3">
+                        <div class="text-muted small text-uppercase">Total Accrued</div>
+                        <div class="fs-5 fw-bold">@(string.IsNullOrWhiteSpace(_credit.TotalAccrued) ? "—" : _credit.TotalAccrued)</div>
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <div class="text-muted small text-uppercase">Total Remaining</div>
+                        <div class="fs-5 fw-bold">@(string.IsNullOrWhiteSpace(_credit.TotalRemaining) ? "—" : _credit.TotalRemaining)</div>
+                    </div>
+                </div>
+
+                @if (_credit.Lines.Count == 0)
+                {
+                    <p class="text-muted mb-0">No credit lines recorded.</p>
+                }
+                else
+                {
+                    <Grid TItem="CreditLine" Class="table table-striped align-middle mb-0" Data="_credit.Lines">
+                        <GridColumns>
+                            <GridColumn TItem="CreditLine" HeaderText="Serial Number">@context.SerialNumber</GridColumn>
+                            <GridColumn TItem="CreditLine" HeaderText="Model">@context.Model</GridColumn>
+                            <GridColumn TItem="CreditLine" HeaderText="Credit Gained">@context.CreditGained</GridColumn>
+                            <GridColumn TItem="CreditLine" HeaderText="Credit Deducted">@context.CreditDeducted</GridColumn>
+                            <GridColumn TItem="CreditLine" HeaderText="Date">@context.Date</GridColumn>
+                            <GridColumn TItem="CreditLine" HeaderText="Quote No.">@context.QuoteNo</GridColumn>
+                            <GridColumn TItem="CreditLine" HeaderText="Purchase Offer No.">@context.PurchaseOfferNo</GridColumn>
+                            <GridColumn TItem="CreditLine" HeaderText="Remaining Balance">@context.RemainingBalance</GridColumn>
+                        </GridColumns>
+                    </Grid>
+                }
+            }
+        </CardBody>
+    </Card>
+
+    <!-- ── Report preview ── -->
+    <Card Class="mb-4">
+        <CardHeader>Report Preview</CardHeader>
+        <CardBody>
+            <p class="text-muted small">Preview reflects hidden/excluded rows and the credit-summary/loans/lifetime-spend/ETA toggles below.</p>
+            <div class="bg-white rounded p-3">
+                @((MarkupString)WaitingQuoteReport.BuildReportHtml(ReportName, _quoteJobs, _otherJobs, _includeCreditSummary,
+                    PreviewMessage, IncludeLoansInReport, SentLoans, _showLifetimeSpend, ReportCredit, _includeEta))
+            </div>
+        </CardBody>
+    </Card>
+
+    <!-- ── Send panel ── -->
+    <Card Class="mb-4">
+        <CardHeader>Send Report</CardHeader>
+        <CardBody>
+
+            <!-- Options that apply to every mode -->
+            <div class="mb-3">
+                <CheckboxInput Label="Include credit summary" @bind-Value="_includeCreditSummary" Disabled="@(!CreditAvailable)" />
+                @if (!CreditAvailable)
+                {
+                    <div class="text-muted small">@CreditUnavailableReason</div>
+                }
+            </div>
+            <div class="mb-3">
+                <CheckboxInput Label="Include loans" @bind-Value="_includeLoans" />
+            </div>
+            <div class="mb-3">
+                <CheckboxInput Label="Include lifetime repair spend" @bind-Value="_showLifetimeSpend" />
+            </div>
+            <div class="mb-3">
+                <CheckboxInput Label="Include ETAs on other open jobs" @bind-Value="_includeEta" />
+            </div>
+            <div class="mb-3">
+                <CheckboxInput Label="@(TimesheetLoggingService.Enabled ? "Test mode — don't send from Scopes (still logs timesheets)" : "Test mode — don't send from Scopes")" @bind-Value="_testMode" />
+            </div>
+
+            <p class="text-muted small">
+                @{
+                    var attachCount = _attachQuoteIds.Count;
+                }
+                @attachCount quote PDF@(attachCount == 1 ? "" : "s") selected to attach
+                @if (_manualAttachments.Count > 0)
+                {
+                    <text>
+                        + @_manualAttachments.Count uploaded file@(_manualAttachments.Count == 1 ? "" : "s")
+                        (@FormatSize(TotalManualBytes))
+                    </text>
+                }
+            </p>
+
+            <!-- One message, sent above the whole report in every mode -->
+            <div class="mb-3">
+                <label class="form-label">
+                    Message
+                    <span class="text-muted small">
+                        — shown above the report. {firstName} becomes the recipient's first name
+                        @(_mode switch
+                        {
+                            SendMode.PerContact => "(each contact's own).",
+                            SendMode.Predefined => "(the primary contact's, when there's only one).",
+                            _ => "— none is known for a custom recipient, so it's left out (\"Hi,\")."
+                        })
+                    </span>
+                </label>
+                <TextAreaInput @bind-Value="_message" Rows="3"
+                               Placeholder="Each line becomes its own paragraph." />
+            </div>
+
+            <!-- CC + ad-hoc attachments — apply to every mode -->
+            <div class="mb-3">
+                <label class="form-label">
+                    CC
+                    <span class="text-muted small">— @ScopesAddress is always CC'd and doesn't need adding</span>
+                </label>
+                <TextInput @bind-Value="_ccEmail" Placeholder="cc@example.com (comma-separate for multiple)" />
+
+                @if (_mode == SendMode.PerContact && ParseCcInput().Length > 0)
+                {
+                    var sendableCount = WaitingQuoteReport.GroupByContact(_quoteJobs, _otherJobs).Count(g => g.CanSend);
+                    <Alert Color="AlertColor.Warning" Class="mt-2 mb-0">
+                        Per-contact mode sends @sendableCount separate email@(sendableCount == 1 ? "" : "s").
+                        Anyone CC'd here receives all of them, and every contact sees their address.
+                    </Alert>
+                }
+            </div>
+
+            <div class="mb-3">
+                <label class="form-label">
+                    Extra attachments
+                    <span class="text-muted small">— added to every email, on top of any ticked quote PDFs</span>
+                </label>
+
+                <InputFile @key="_fileInputKey" OnChange="OnFilesSelectedAsync" multiple class="form-control" />
+
+                @if (_manualAttachments.Count > 0)
+                {
+                    <ul class="list-group mt-2">
+                        @foreach (var f in _manualAttachments)
+                        {
+                            <li class="list-group-item d-flex justify-content-between align-items-center">
+                                <span>@f.FileName <span class="text-muted small">(@FormatSize(f.Content.LongLength))</span></span>
+                                <Button Color="ButtonColor.Secondary" Outline="true" Size="ButtonSize.ExtraSmall"
+                                        @onclick="() => RemoveManualAttachment(f.FileName)"
+                                        TooltipTitle="Remove attachment">×</Button>
+                            </li>
+                        }
+                    </ul>
+                }
+
+                @if (!string.IsNullOrEmpty(_attachError))
+                {
+                    <Alert Color="AlertColor.Danger" Class="mt-2 mb-0">@_attachError</Alert>
+                }
+
+                @if (TotalManualBytes > MaxTotalManualBytes)
+                {
+                    <Alert Color="AlertColor.Danger" Class="mt-2 mb-0">
+                        Uploaded files total @FormatSize(TotalManualBytes), over the
+                        @FormatSize(MaxTotalManualBytes) limit. Remove some before sending.
+                        (Quote PDFs are fetched at send time and aren't counted here.)
+                    </Alert>
+                }
+            </div>
+
+            <!-- Mode selector + mode-specific body -->
+            <Tabs NavStyle="NavStyle.Pills" Class="mb-3">
+                <Tab Title="Customer contacts" Active="@(_mode == SendMode.Predefined)" OnClick="@(() => _mode = SendMode.Predefined)">
+                    <Content>
+                        @{
+                            var recipients = CustomerRecipients();
+                        }
+                        <p class="text-muted small">
+                            One email with the report, to the @(SelectedDepartment is { } sd ? $"{sd.Name} department's" : "customer's") contacts from the
+                            <a href="scope-customers">Scope Customer Manager</a>.
+                            @if (SelectedDepartment is null && _customer is { Departments.Count: > 0 })
+                            {
+                                <span>Pick a department above to send to its contacts instead.</span>
+                            }
+                        </p>
+                        @if (_customer is null)
+                        {
+                            <Alert Color="AlertColor.Warning" Class="mb-0">This company isn't set up on the Scope Customer Manager.</Alert>
+                        }
+                        else if (recipients.To.Count == 0)
+                        {
+                            <Alert Color="AlertColor.Warning" Class="mb-0">No primary contacts with an email address to send to.</Alert>
+                        }
+                        else
+                        {
+                            <div class="small">
+                                <div><strong>To:</strong> @string.Join(", ", recipients.To.Select(c => c.Label))</div>
+                                @if (recipients.Cc.Count > 0)
+                                {
+                                    <div><strong>CC:</strong> @string.Join(", ", recipients.Cc.Select(c => c.Label))</div>
+                                }
+                            </div>
+                        }
+                        @if (recipients.MissingEmail.Count > 0)
+                        {
+                            <div class="text-warning small mt-1">No email in JMS, skipped: @string.Join(", ", recipients.MissingEmail)</div>
+                        }
+                    </Content>
+                </Tab>
+                <Tab Title="Custom person" Active="@(_mode == SendMode.Custom)" OnClick="@(() => _mode = SendMode.Custom)">
+                    <Content>
+                        <p class="text-muted small">One email containing the whole report, to an address you type.</p>
+                        <TextInput @bind-Value="_customEmail" Placeholder="recipient@example.com (comma-separate for multiple)" />
+                    </Content>
+                </Tab>
+                <Tab Title="Per job contact" Active="@(_mode == SendMode.PerContact)" OnClick="@(() => _mode = SendMode.PerContact)">
+                    <Content>
+                        <p class="text-muted small">
+                            One email per job contact, each containing only that contact's jobs.
+                            Contacts without an email address can't be sent to and are listed below.
+                        </p>
+
+                        @{
+                            var groups = WaitingQuoteReport.GroupByContact(_quoteJobs, _otherJobs);
+                            var sendable = groups.Where(g => g.CanSend).ToList();
+                            var unsendable = groups.Where(g => !g.CanSend).ToList();
+                        }
+
+                        <ul class="list-group mb-2">
+                            @foreach (var g in sendable)
+                            {
+                                <li class="list-group-item d-flex justify-content-between align-items-center">
+                                    <span>@(g.ContactName ?? g.ContactEmail) <span class="text-muted small">&lt;@g.ContactEmail&gt;</span></span>
+                                    <Badge Color="BadgeColor.Secondary">
+                                        @(g.QuoteJobs.Count + g.OtherJobs.Count) job@(g.QuoteJobs.Count + g.OtherJobs.Count == 1 ? "" : "s")
+                                    </Badge>
+                                </li>
+                            }
+                        </ul>
+
+                        @if (unsendable.Any())
+                        {
+                            var orphanJobs = unsendable.Sum(g => g.QuoteJobs.Count + g.OtherJobs.Count);
+                            <Alert Color="AlertColor.Warning" Class="mb-0">
+                                @orphanJobs job@(orphanJobs == 1 ? "" : "s") have no contact email and will be skipped.
+                            </Alert>
+                        }
+                    </Content>
+                </Tab>
+            </Tabs>
+
+            <!-- Send button + status -->
+            <div class="d-flex align-items-center gap-2">
+                <Button Color="ButtonColor.Secondary" Outline="true" @onclick="CopyReportAsync">📋 Copy for Gmail</Button>
+                <Button Color="ButtonColor.Primary" @onclick="SendAsync"
+                        Disabled="@(_sending || TotalManualBytes > MaxTotalManualBytes)"
+                        Loading="_sending" LoadingText="Sending...">Send</Button>
+            </div>
+
+            @if (!string.IsNullOrEmpty(_sendStatus))
+            {
+                <Alert Color="@(_sendSuccess ? AlertColor.Success : AlertColor.Danger)" Class="mt-3 mb-0">@_sendStatus</Alert>
+            }
+        </CardBody>
+    </Card>
+}
+
+<script>
+    window.copyRichText = async (html) => {
+        try {
+            const blob = new Blob([html], { type: 'text/html' });
+            const item = new ClipboardItem({ 'text/html': blob });
+            await navigator.clipboard.write([item]);
+        } catch (e) {
+            const tmp = document.createElement('div');
+            tmp.innerHTML = html;
+            await navigator.clipboard.writeText(tmp.innerText);
+        }
+    };
+</script>
+
+@code {
+    [Parameter] public string CompanyName { get; set; } = "";
+    [Parameter] public string CompanyIds { get; set; } = "";
+
+    // Core report state — populated by LoadJobsAsync(), read from markup broadly.
+    private bool _loading = true;
+    private List<WqJob> _quoteJobs = new();
+    private List<WqJob> _otherJobs = new();
+    private List<WqLoan> _loans = new();
+    private bool _includeLoans;
+
+    // Loans unticked in the Loans table — still shown on the page, left out of the report.
+    // Reset on every reload, since loans are rebuilt as new records.
+    private HashSet<WqLoan> _ignoredLoans = new(ReferenceEqualityComparer.Instance);
+    private List<WqLoan> SentLoans => _loans.Where(l => !_ignoredLoans.Contains(l)).ToList();
+
+    // The report shows "No loan equipment" when the section is on but empty — but if the
+    // customer does have loans and every one was unticked, leave the section out instead of
+    // telling them they have none.
+    private bool IncludeLoansInReport => _includeLoans && !(_loans.Count > 0 && _ignoredLoans.Count >= _loans.Count);
+
+    private void ToggleLoan(WqLoan loan, bool send)
+    {
+        if (send) _ignoredLoans.Remove(loan);
+        else _ignoredLoans.Add(loan);
+    }
+    private Dictionary<string, string> _manuAbbreviations = new();
+
+    // Also gates the "Lifetime Spend" column on the on-screen Pending Quote Approval grid
+    // above (not Other Open Jobs), in addition to the emailed report — same field, both
+    // surfaces.
+    private bool _showLifetimeSpend;
+
+    // Emailed report only — the on-screen ETA column stays, since it's where ETAs are edited.
+    private bool _includeEta;
+
+    protected override async Task OnInitializedAsync() => await base.OnInitializedAsync();
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+        await LoadJobsAsync();
+    }
+
+    private void GoBack() => Nav.NavigateTo("/waiting-quote");
+
+    // Hide buttons: session-only.
+    // A job can carry several unaccepted quotes, each on its own row — so
+    // removing a row should drop just that quote, not the whole job. The job
+    // row itself only disappears once its last quote (or its quote-less
+    // placeholder row) is removed.
+    private void RemoveQuoteRow(WqJob job, WqQuote? quote)
+    {
+        if (quote is { } q)
+        {
+            job.Quotes.RemoveAll(x => x.QuoteId == q.QuoteId);
+            _attachQuoteIds.Remove(q.QuoteId);
+
+            if (job.Quotes.Count > 0) return;
+        }
+
+        _quoteJobs.Remove(job);
+        _allQuoteJobs.Remove(job);
+    }
+
+    private void RemoveOtherJob(string jobId)
+    {
+        _otherJobs.RemoveAll(j => j.JobId == jobId);
+        _allOtherJobs.RemoveAll(j => j.JobId == jobId);
+    }
+
+    // Reuses WaitingWorkshopProcessingService's ETA note (service_type_id 11, "ETA - yyyy-MM-dd").
+    // A full reload is needed afterwards (not just a local update) because a first-time save
+    // has no EtaServiceId yet — the next edit needs the freshly created service id to update
+    // rather than duplicate the note, same as WaitingWorkshopProcessing.razor.
+    private async Task SaveEtaAsync(WqJob job)
+    {
+        if (job.EtaInput is not { } eta) return;
+
+        job.SavingEta = true;
+        StateHasChanged();
+        try
+        {
+            var ok = await WwpProcessing.SaveEtaAsync(int.Parse(job.JobId), job.EtaServiceId, eta,
+                msg => Logger.LogWarning("{Message}", msg));
+            if (ok)
+                await LoadJobsAsync();
+        }
+        finally
+        {
+            job.SavingEta = false;
+            StateHasChanged();
+        }
+    }
+
+    // Exclude button: persists model id, removes visible rows, next load
+    // excludes in SQL.
+    private async Task ExcludeModelAsync(WqJob job)
+    {
+        if (!job.ModelId.HasValue) return;
+
+        var modelId = job.ModelId.Value;
+        await ScopeJobs.AddModelAsync(modelId);
+
+        _quoteJobs.RemoveAll(j => j.ModelId == modelId);
+        _otherJobs.RemoveAll(j => j.ModelId == modelId);
+        _allQuoteJobs.RemoveAll(j => j.ModelId == modelId);
+        _allOtherJobs.RemoveAll(j => j.ModelId == modelId);
+
+        // A ticked quote might belong to a now-removed job — prune the set.
+        PruneAttachSelection();
+    }
+
+    // ── Grid row projection ─────────────────────────────────────────────────
+    // A job with several open quotes needs several table rows, one per quote.
+    // Every row gets its own remove (×) button (removing just that quote), but
+    // the exclude-model (🚫) button only belongs on the first row for a job —
+    // so the Grid's Data source is a flattened (job, quote?, isFirstRow) row
+    // list rather than the raw job list.
+
+    private record QuoteRow(WqJob Job, WqQuote? Quote, bool IsFirstRow);
+
+    private IEnumerable<QuoteRow> QuoteRows()
+    {
+        foreach (var job in _quoteJobs.OrderBy(WaitingQuoteReport.LatestQuoteDate))
+        {
+            if (job.Quotes.Count == 0)
+            {
+                yield return new QuoteRow(job, null, true);
+                continue;
+            }
+
+            var first = true;
+            foreach (var q in job.Quotes.OrderBy(q => q.DateSent))
+            {
+                yield return new QuoteRow(job, q, first);
+                first = false;
+            }
+        }
+    }
+
+    private static BadgeColor UrgencyBadgeColor(DateTime dateSent) => WaitingQuoteReport.GetUrgency(dateSent) switch
+    {
+        WqUrgency.Urgent => BadgeColor.Danger,
+        WqUrgency.Medium => BadgeColor.Warning,
+        _ => BadgeColor.Success
+    };
+
+    // ── Attachment selection ────────────────────────────────────────────────
+
+    private readonly HashSet<string> _attachQuoteIds = new();
+
+    private void ToggleAttach(string quoteId, bool value)
+    {
+        if (value) _attachQuoteIds.Add(quoteId);
+        else _attachQuoteIds.Remove(quoteId);
+    }
+
+    private void PruneAttachSelection()
+    {
+        var live = _quoteJobs.Concat(_otherJobs)
+            .SelectMany(j => j.Quotes)
+            .Select(q => q.QuoteId)
+            .ToHashSet();
+        _attachQuoteIds.RemoveWhere(id => !live.Contains(id));
+    }
+
+    // ── Ad-hoc file uploads ─────────────────────────────────────────────────
+    // Held in memory for the life of the circuit and attached to every email in
+    // every mode. Blazor Server streams these over the SignalR circuit, so the
+    // caps below are deliberately conservative.
+
+    private const long MaxManualFileBytes = 10 * 1024 * 1024;   // per file
+    private const long MaxTotalManualBytes = 20 * 1024 * 1024;  // all files
+    private const int MaxManualFileCount = 20;
+
+    private readonly List<EmailAttachment> _manualAttachments = new();
+    private string? _attachError;
+
+    // Changing the key forces a fresh <InputFile>, so the same file can be
+    // re-picked after being removed.
+    private Guid _fileInputKey = Guid.NewGuid();
+
+    private long TotalManualBytes => _manualAttachments.Sum(a => a.Content.LongLength);
+
+    private async Task OnFilesSelectedAsync(InputFileChangeEventArgs e)
+    {
+        _attachError = null;
+
+        IReadOnlyList<IBrowserFile> files;
+        try
+        {
+            files = e.GetMultipleFiles(MaxManualFileCount);
+        }
+        catch (InvalidOperationException)
+        {
+            _attachError = $"Select at most {MaxManualFileCount} files at once.";
+            _fileInputKey = Guid.NewGuid();
+            return;
+        }
+
+        foreach (var file in files)
+        {
+            if (file.Size > MaxManualFileBytes)
+            {
+                _attachError = $"{file.Name} is {FormatSize(file.Size)} — over the "
+                             + $"{FormatSize(MaxManualFileBytes)} per-file limit.";
+                continue;
+            }
+
+            if (_manualAttachments.Count >= MaxManualFileCount)
+            {
+                _attachError = $"Attachment limit ({MaxManualFileCount} files) reached.";
+                break;
+            }
+
+            try
+            {
+                using var ms = new MemoryStream();
+                await using (var stream = file.OpenReadStream(MaxManualFileBytes))
+                    await stream.CopyToAsync(ms);
+
+                // Re-picking the same name replaces rather than duplicates.
+                _manualAttachments.RemoveAll(a =>
+                    string.Equals(a.FileName, file.Name, StringComparison.OrdinalIgnoreCase));
+
+                _manualAttachments.Add(new EmailAttachment
+                    {
+                        FileName = file.Name,
+                        Content = ms.ToArray()
+                    });
+            }
+            catch (Exception ex)
+            {
+                _attachError = $"Could not read {file.Name}: {ex.Message}";
+                Logger.LogError(ex, "Reading upload {File} failed", file.Name);
+            }
+        }
+
+        _fileInputKey = Guid.NewGuid();
+        StateHasChanged();
+    }
+
+    private void RemoveManualAttachment(string fileName)
+    {
+        _manualAttachments.RemoveAll(a =>
+            string.Equals(a.FileName, fileName, StringComparison.OrdinalIgnoreCase));
+        _attachError = null;
+    }
+
+    private static string FormatSize(long bytes) =>
+        bytes >= 1024 * 1024
+            ? $"{bytes / 1024d / 1024d:0.#} MB"
+            : $"{Math.Max(1, bytes / 1024):0} KB";
+
+    // ── CC ──────────────────────────────────────────────────────────────────
+    // Applies to every mode. ScopesAddress is always CC'd on top of this.
+
+    private string _ccEmail = string.Empty;
+
+    // Just what the user typed, split and trimmed. Used by the UI warning.
+    private string[] ParseCcInput() =>
+        _ccEmail.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    // What actually goes on the wire: scopes@ plus the typed addresses,
+    // de-duplicated so scopes@ can't be added twice.
+    private string[] BuildCcList() =>
+        new[] { ScopesAddress }
+            .Concat(ParseCcInput())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+    // ── Gmail copy ────────────────────────────────────────────────────────────
+
+    private async Task CopyReportAsync()
+    {
+        var html = WaitingQuoteReport.BuildReportHtml(ReportName, _quoteJobs, _otherJobs, _includeCreditSummary,
+            PreviewMessage, IncludeLoansInReport, SentLoans, _showLifetimeSpend, ReportCredit, _includeEta);
+        await JS.InvokeVoidAsync("copyRichText", html);
+        await Analytics.TrackEventAsync("Waiting quote email copied");
+    }
+
+    // ── Send ────────────────────────────────────────────────────────────────
+
+    private enum SendMode { Custom, Predefined, PerContact }
+    private SendMode _mode = SendMode.Predefined;
+    private string _customEmail = string.Empty;
+
+    // The one message above the report. Pre-filled below (or from the email config's
+    // DefaultBodyText), editable per send; {firstName} is filled per email by MessageFor.
+    private const string DefaultMessage =
+        "Hi {firstName},\n" +
+        "Please see your Open Summary Report below. Reply to this email to approve or decline any " +
+        "outstanding quotes, or if you have any questions.";
+
+    private string _message = DefaultMessage;
+
+    // {firstName} → the given name, or dropped along with the space before it ("Hi {firstName}," → "Hi,").
+    private string MessageFor(string? firstName) => string.IsNullOrWhiteSpace(firstName)
+        ? Regex.Replace(_message, @"[ \t]*\{firstName\}", "", RegexOptions.IgnoreCase)
+        : Regex.Replace(_message, @"\{firstName\}", firstName.Trim().Replace("$", "$$"), RegexOptions.IgnoreCase);
+
+    // Customer contacts mode greets the primary contact by name only when there's exactly one.
+    private string? CustomerContactsFirstName()
+    {
+        var to = CustomerRecipients().To;
+        return to.Count == 1 ? WaitingQuoteReport.FirstName(to[0].Name) : null;
+    }
+
+    // What the on-page preview / Gmail copy show. Per-contact mode shows a placeholder, since
+    // the real name differs per email.
+    private string PreviewMessage => _mode switch
+    {
+        SendMode.PerContact => MessageFor("[contact's first name]"),
+        SendMode.Predefined => MessageFor(CustomerContactsFirstName()),
+        _ => MessageFor(null),
+    };
+
+    private bool _includeCreditSummary;
+
+    // Credit for this customer (see the Credit section of the header comment).
+    // _creditTabName null = no ScopeCustomer match or no tab linked.
+    private string? _creditTabName;
+    private bool _loadingCredit;
+    private CustomerCredit? _credit;
+
+    private bool CreditAvailable => _credit is { Error: null or "" };
+
+    private string CreditUnavailableReason =>
+        _creditTabName is null ? "No credit sheet tab linked for this customer."
+        : _loadingCredit ? "Loading credit..."
+        : "Credit couldn't be loaded — see the Credit card above.";
+
+    // What BuildReportHtml gets — null when unticked or not loaded, so the
+    // report never renders a half-loaded or errored credit block.
+    private CustomerCredit? ReportCredit => _includeCreditSummary && CreditAvailable ? _credit : null;
+    private WaitingQuoteEmailConfig.EmailConfigData _config = new();
+
+    private bool _sending;
+    private bool _sendSuccess;
+    private string _sendStatus = string.Empty;
+
+    // Blocks the real Gmail send (and the always-on scopes CC, since nothing goes out at all)
+    // so this page can be exercised against real jobs — including the timesheet logging below,
+    // which still fires — without emailing real customers.
+    private bool _testMode;
+
+    // Fetch the ticked quote PDFs for a given set of jobs. Only quotes that
+    // (a) belong to one of the supplied jobs AND (b) were ticked to attach are
+    // fetched — so per-contact sends only include that contact's own quotes.
+    // Quotes with no file, or whose fetch doesn't return a real PDF (e.g. an
+    // expired session returning an HTML login page), are skipped.
+    //
+    // Manually uploaded files are appended last and are NOT job-scoped — they
+    // go on every email, including each one in per-contact mode.
+    private async Task<List<EmailAttachment>> BuildAttachmentsAsync(IEnumerable<WqJob> jobs)
+    {
+        var selectedQuotes = jobs
+            .SelectMany(j => j.Quotes)
+            .Where(q => _attachQuoteIds.Contains(q.QuoteId))
+            .ToList();
+
+        var attachments = new List<EmailAttachment>();
+        foreach (var q in selectedQuotes)
+        {
+            if (string.IsNullOrWhiteSpace(q.FileLocation))
+                continue;
+
+            var bytes = await JobLookup.GetQuotePdfBytesAsync(q.FileLocation);
+            if (bytes is null)
+            {
+                Logger.LogWarning("Quote Q-{QuoteId} didn't come back as a PDF (session expired?) — not attached", q.QuoteId);
+                continue;
+            }
+
+            var fileName = Path.GetFileName(q.FileLocation);
+            if (string.IsNullOrWhiteSpace(fileName))
+                fileName = $"Quote-{q.QuoteId}.pdf";
+
+            attachments.Add(new EmailAttachment { FileName = fileName, Content = bytes });
+        }
+
+        // Ad-hoc uploads ride along on every email. If an upload happens to
+        // share a name with a fetched quote PDF, suffix it so neither is lost.
+        foreach (var manual in _manualAttachments)
+        {
+            var name = manual.FileName;
+            if (attachments.Any(a => string.Equals(a.FileName, name, StringComparison.OrdinalIgnoreCase)))
+            {
+                var stem = Path.GetFileNameWithoutExtension(name);
+                var ext = Path.GetExtension(name);
+                name = $"{stem}-attached{ext}";
+            }
+
+            attachments.Add(new EmailAttachment { FileName = name, Content = manual.Content });
+        }
+
+        return attachments;
+    }
+
+    // ── Timesheet logging ──────────────────────────────────────────────────
+    // Logs a real JMS timesheet entry per job included in a send — base time for the job
+    // update/quote-sent email, plus stacking bonuses for what was actually included for that
+    // specific job. See docs/timesheet-logging.md. Runs even in test mode (only the email itself is
+    // suppressed there) so this page's logging can be verified against real jobs without
+    // emailing real customers.
+    private const double QuoteSentBaseHours = 1.0 / 60;
+    private const double QuotePdfBonusHours = 1.0 / 60;
+    private const double ApprovedPoBonusHours = 1.0 / 60;
+    private const double LifetimeSpendBonusHours = 1.0 / 60;
+
+    // Grouped by job id rather than iterated per WqJob — a job can legitimately come back from
+    // both the quote-jobs and other-jobs queries (they're independent SQL, not mutually
+    // exclusive by job id), which was logging the same job twice. Conditions are OR'd across
+    // every occurrence of that job id in the input.
+    private List<(int JobId, double EstimatedHours, string Notes)> BuildTimesheetEntries(IEnumerable<WqJob> jobs, string recipientLabel)
+    {
+        var entries = new List<(int, double, string)>();
+
+        var byJobId = jobs
+            .Where(j => int.TryParse(j.JobId, out _))
+            .GroupBy(j => j.JobId);
+
+        foreach (var group in byJobId)
+        {
+            var jobId = int.Parse(group.Key);
+
+            var hours = QuoteSentBaseHours;
+            var extras = new List<string>();
+
+            if (group.Any(j => j.Quotes.Any(q => _attachQuoteIds.Contains(q.QuoteId))))
+            {
+                hours += QuotePdfBonusHours;
+                extras.Add("quote PDF attached");
+            }
+
+            var approvedPo = group.Select(j => j.ApprovedPoNumbers).FirstOrDefault(s => !string.IsNullOrWhiteSpace(s));
+            if (!string.IsNullOrWhiteSpace(approvedPo))
+            {
+                hours += ApprovedPoBonusHours;
+                extras.Add($"PO included ({approvedPo})");
+            }
+
+            if (_showLifetimeSpend)
+            {
+                hours += LifetimeSpendBonusHours;
+                extras.Add("lifetime repair spend included");
+            }
+
+            var notes = $"Job update — quote sent with summary to {recipientLabel}."
+                + (extras.Count > 0 ? " Also included: " + string.Join(", ", extras) + "." : "");
+
+            entries.Add((jobId, hours, notes));
+        }
+
+        return entries;
+    }
+
+    // Returns a short suffix to append to _sendStatus so a failure is visible on the page
+    // itself, not just the server console — LogVariableForJobsAsync's results were previously
+    // discarded entirely, which is why a failed post here showed no error anywhere.
+    private async Task<string> LogQuoteSendTimesheetAsync(IEnumerable<WqJob> jobs, string recipientLabel)
+    {
+        if (!TimesheetLoggingService.Enabled) return "";
+
+        var entries = BuildTimesheetEntries(jobs, recipientLabel);
+        if (entries.Count == 0) return "";
+
+        var results = await TimesheetLogging.LogVariableForJobsAsync(entries);
+        var failed = results.Where(r => !r.Success && !r.AlreadyLoggedToday).ToList();
+
+        if (failed.Count > 0)
+        {
+            Logger.LogWarning("Timesheet logging failed for job(s) {JobIds} — see the TimeSheetService log for why", string.Join(", ", failed.Select(f => f.JobId)));
+            return $" ⚠ Timesheet logging FAILED for {failed.Count}/{results.Count} job(s) — check the server log.";
+        }
+
+        Logger.LogInformation("Timesheet logged: {Entries}", string.Join(", ", results.Select(r => $"job {r.JobId} = {r.EstimatedHours * 60:0.#}min")));
+        return $" Logged timesheet for {results.Count} job(s).";
+    }
+
+    private async Task SendAsync()
+    {
+        _sendStatus = string.Empty;
+        _sending = true;
+        try
+        {
+            // Cheap sanity check — a typo'd CC silently drops the whole send
+            // at the Gmail API otherwise.
+            var badCc = ParseCcInput().Where(a => !a.Contains('@') || a.EndsWith('@')).ToList();
+            if (badCc.Count > 0)
+            {
+                _sendSuccess = false;
+                _sendStatus = $"Not a valid CC address: {string.Join(", ", badCc)}";
+                return;
+            }
+
+            switch (_mode)
+            {
+                case SendMode.Custom:
+                    await SendCustomAsync();
+                    break;
+                case SendMode.Predefined:
+                    await SendPredefinedAsync();
+                    break;
+                case SendMode.PerContact:
+                    await SendPerContactAsync();
+                    break;
+            }
+
+            var cc = ParseCcInput();
+            if (_sendSuccess && cc.Length > 0 && !_testMode)
+                _sendStatus += $" CC'd {string.Join(", ", cc)}.";
+
+            if (_sendSuccess && _testMode)
+                _sendStatus = "[TEST MODE — nothing sent] " + _sendStatus;
+        }
+        catch (Exception ex)
+        {
+            _sendSuccess = false;
+            _sendStatus = $"Failed: {ex.Message}";
+        }
+        finally
+        {
+            _sending = false;
+        }
+    }
+
+    // Mode 1 — custom typed recipient(s), whole report in one email.
+    private async Task SendCustomAsync()
+    {
+        var to = _customEmail
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        if (to.Length == 0)
+        {
+            _sendSuccess = false;
+            _sendStatus = "Enter at least one recipient.";
+            return;
+        }
+
+        // Whole-report send → attachments span every job.
+        var attachments = await BuildAttachmentsAsync(_quoteJobs.Concat(_otherJobs));
+        var html = WaitingQuoteReport.BuildReportHtml(ReportName, _quoteJobs, _otherJobs, _includeCreditSummary,
+            MessageFor(null), IncludeLoansInReport, SentLoans, _showLifetimeSpend, ReportCredit, _includeEta);
+        await ComposeAndSend(to, $"{ReportName} — Open Summary Report", html, attachments);
+        var tsStatus = await LogQuoteSendTimesheetAsync(_quoteJobs.Concat(_otherJobs), string.Join(", ", to));
+
+        _sendSuccess = true;
+        _sendStatus = $"Sent to {string.Join(", ", to)}.{tsStatus}";
+    }
+
+    // Mode 2 — predefined recipient from config, whole report in one email.
+    private async Task SendPredefinedAsync()
+    {
+        var recipients = CustomerRecipients();
+        if (recipients.To.Count == 0)
+        {
+            _sendSuccess = false;
+            _sendStatus = "No primary contacts with an email address to send to.";
+            return;
+        }
+
+        // Whole-report send (for the picked department) → attachments span every shown job.
+        var attachments = await BuildAttachmentsAsync(_quoteJobs.Concat(_otherJobs));
+
+        var html = WaitingQuoteReport.BuildReportHtml(ReportName, _quoteJobs, _otherJobs, _includeCreditSummary,
+            MessageFor(CustomerContactsFirstName()), IncludeLoansInReport, SentLoans, _showLifetimeSpend, ReportCredit, _includeEta);
+        await ComposeAndSend(recipients.To.Select(c => c.Email), $"{ReportName} — Open Summary Report", html, attachments,
+            recipients.Cc.Select(c => c.Email));
+
+        var toLabel = string.Join(", ", recipients.To.Select(c => c.Name ?? c.Email));
+        var tsStatus = await LogQuoteSendTimesheetAsync(_quoteJobs.Concat(_otherJobs), toLabel);
+
+        _sendSuccess = true;
+        _sendStatus = $"Sent to {toLabel}"
+                      + (recipients.Cc.Count > 0 ? $", CC {string.Join(", ", recipients.Cc.Select(c => c.Name ?? c.Email))}" : "")
+                      + $".{tsStatus}";
+    }
+
+    // Mode 3 — one email per job contact, each with only that contact's jobs
+    // AND only that contact's ticked quote attachments.
+    private async Task SendPerContactAsync()
+    {
+        var groups = WaitingQuoteReport.GroupByContact(_quoteJobs, _otherJobs);
+        var sendable = groups.Where(g => g.CanSend).ToList();
+
+        if (sendable.Count == 0)
+        {
+            _sendSuccess = false;
+            _sendStatus = "No contacts with an email address to send to.";
+            return;
+        }
+
+        var sent = 0;
+        var tsFailures = 0;
+        foreach (var g in sendable)
+        {
+            // Scope both the report AND the attachments to this contact's jobs.
+            var attachments = await BuildAttachmentsAsync(g.QuoteJobs.Concat(g.OtherJobs));
+            var html = WaitingQuoteReport.BuildReportHtml(ReportName, g.QuoteJobs, g.OtherJobs, _includeCreditSummary,
+                MessageFor(WaitingQuoteReport.FirstName(g.ContactName)), IncludeLoansInReport, SentLoans, _showLifetimeSpend, ReportCredit, _includeEta);
+
+            await ComposeAndSend(new[] { g.ContactEmail! },
+                $"{ReportName} — Open Summary Report", html, attachments);
+            var tsStatus = await LogQuoteSendTimesheetAsync(g.QuoteJobs.Concat(g.OtherJobs), g.ContactName ?? g.ContactEmail!);
+            if (tsStatus.Contains("FAILED")) tsFailures++;
+            sent++;
+        }
+
+        var skipped = groups.Count - sendable.Count;
+        _sendSuccess = true;
+        _sendStatus = $"Sent {sent} email{(sent == 1 ? "" : "s")}"
+                      + (skipped > 0 ? $", skipped {skipped} contact(s) with no email." : ".")
+                      + (tsFailures > 0 ? $" ⚠ Timesheet logging failed for {tsFailures} contact(s) — check server console." : "");
+    }
+
+    // Shared compose helper. Every email goes out FROM scopes and CCs scopes
+    // so the sent copy lands in the scopes inbox too — plus whatever the user
+    // typed in the CC box. Config can still override the display name /
+    // address if ever needed.
+    private const string ScopesAddress = CompanyProfile.WorkshopEmail;
+    private const string ScopesDisplayName = "Scopes";
+
+    private async Task ComposeAndSend(IEnumerable<string> to, string subject, string html,
+        List<EmailAttachment> attachments, IEnumerable<string>? extraCc = null)
+    {
+        if (_testMode)
+        {
+            Logger.LogInformation("Test mode — would send \"{Subject}\" to {To} (not sent, not CC'd)", subject, string.Join(", ", to));
+            return;
+        }
+
+        var fromName = string.IsNullOrWhiteSpace(_config.FromName) ? ScopesDisplayName : _config.FromName;
+        var fromAddress = string.IsNullOrWhiteSpace(_config.FromAddress) ? ScopesAddress : _config.FromAddress;
+
+        var email = Gmail.Compose()
+            .To(to.ToArray())
+            .Cc(BuildCcList().Concat(extraCc ?? Enumerable.Empty<string>()).Distinct(StringComparer.OrdinalIgnoreCase).ToArray())
+            .Subject(subject)
+            .HtmlBody(html)
+            .From(fromName, fromAddress);
+
+        if (attachments.Count > 0)
+            email.AttachRange(attachments);
+
+        await email.SendAsync();
+        await Analytics.TrackEventAsync("Waiting quote email sent");
+    }
+
+    // ── Load ──────────────────────────────────────────────────────────────────
+
+    private async Task LoadJobsAsync()
+    {
+        _loading = true;
+        StateHasChanged();
+
+        var ids = CompanyIds
+            .Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Select(s => int.TryParse(s.Trim(), out var id) ? id : -1)
+            .Where(id => id > 0)
+            .ToList();
+
+        if (ids.Count == 0) { _loading = false; StateHasChanged(); return; }
+
+        // Equipment-name abbreviations (display config, read-only).
+        try
+        {
+            _manuAbbreviations = await ManufacturerAbbreviations.LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning("Could not load manufacturer abbreviations: {Error}", ex.Message);
+        }
+
+        // Email config for the predefined-recipient mode (and shared From).
+        _config = await EmailConfig.LoadAsync();
+
+        // Optional: the config can override DefaultMessage. Not required — leave
+        // the config alone and the const is used.
+        if (!string.IsNullOrWhiteSpace(_config.DefaultBodyText))
+            _message = _config.DefaultBodyText;
+
+        var exclusions = await ScopeJobs.LoadAsync();
+
+        (_allQuoteJobs, _allOtherJobs) = await JobLookup.GetJobsAsync(ids, exclusions);
+
+        foreach (var job in _allQuoteJobs.Concat(_allOtherJobs))
+            job.Equipment = WaitingQuoteReport.AbbreviateEquipment(job.Equipment, _manuAbbreviations);
+
+        _customer = await FindCustomerAsync(ids);
+        _contactDetails = await LoadCustomerContactsAsync(_customer);
+
+        // A reload (e.g. after an ETA save) keeps the picked department if it still exists.
+        if (_departmentFilter != AllDepartments && _departmentFilter != NoDepartment && SelectedDepartment is null)
+            _departmentFilter = AllDepartments;
+        ApplyDepartmentFilter();
+
+        _loans = await LoadLoansAsync(ids);
+        _ignoredLoans.Clear();
+
+        _loading = false;
+        StateHasChanged();
+
+        await LoadCreditAsync();
+    }
+
+    // Matches the ScopeCustomer by its exact company-id set (the route's ids
+    // come straight from ScopeCustomer.CompanyIds on WaitingQuote.razor),
+    // falling back to the display name in case the list was edited since.
+    private async Task<ScopeCustomer?> FindCustomerAsync(List<int> companyIds)
+    {
+        var customers = await ScopeCustomers.LoadAsync();
+        var idSet = companyIds.ToHashSet();
+        return customers.FirstOrDefault(c => idSet.SetEquals(c.CompanyIds))
+               ?? customers.FirstOrDefault(c => string.Equals(c.DisplayName, CompanyName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    // Name + email for every contact the customer and its departments send to, for the
+    // Customer contacts send mode.
+    private async Task<Dictionary<int, ScopeContactRow>> LoadCustomerContactsAsync(ScopeCustomer? customer)
+    {
+        if (customer is null) return new();
+        var ids = customer.PrimaryContactIds.Concat(customer.SecondaryContactIds)
+            .Concat(customer.Departments.SelectMany(d => d.PrimaryContactIds.Concat(d.SecondaryContactIds).Concat(d.OurContactIds)))
+            .Distinct().ToList();
+        var rows = await ScopeLookup.GetContactDetailsAsync(ids);
+        return rows.GroupBy(r => r.ContactId).ToDictionary(g => g.Key, g => g.First());
+    }
+
+    // ── Departments ─────────────────────────────────────────────────────────
+
+    private const string AllDepartments = "";
+    private const string NoDepartment = "__none__";
+
+    private ScopeCustomer? _customer;
+    private Dictionary<int, ScopeContactRow> _contactDetails = new();
+    private List<WqJob> _allQuoteJobs = new();
+    private List<WqJob> _allOtherJobs = new();
+    private string _departmentFilter = AllDepartments;
+
+    private ScopeDepartment? SelectedDepartment =>
+        _customer?.Departments.FirstOrDefault(d => d.Name == _departmentFilter);
+
+    // Heading/subject name — the department is added so separate sends are easy to tell apart.
+    private string ReportName => SelectedDepartment is { } d ? $"{CompanyName} — {d.Name}" : CompanyName;
+
+    private bool InFilter(WqJob job, string filter)
+    {
+        if (filter == AllDepartments || _customer is null) return true;
+        var dept = _customer.DepartmentForJobContact(job.ContactId);
+        return filter == NoDepartment ? dept is null : dept?.Name == filter;
+    }
+
+    private int JobCount(string filter) =>
+        _allQuoteJobs.Concat(_allOtherJobs).Count(j => InFilter(j, filter));
+
+    private void ApplyDepartmentFilter()
+    {
+        _quoteJobs = _allQuoteJobs.Where(j => InFilter(j, _departmentFilter)).ToList();
+        _otherJobs = _allOtherJobs.Where(j => InFilter(j, _departmentFilter)).ToList();
+        PruneAttachSelection();
+    }
+
+    private async Task OnDepartmentChangedAsync(ChangeEventArgs e)
+    {
+        _departmentFilter = e.Value?.ToString() ?? AllDepartments;
+        ApplyDepartmentFilter();
+        await LoadCreditAsync();
+    }
+
+    private record Recipient(string? Name, string Email)
+    {
+        public string Label => string.IsNullOrWhiteSpace(Name) ? Email : $"{Name} <{Email}>";
+    }
+
+    // To = primary contacts, CC = secondary (+ our contact for a department). Contacts with
+    // no email in JMS are listed separately so the page can say who was skipped.
+    private (List<Recipient> To, List<Recipient> Cc, List<string> MissingEmail) CustomerRecipients()
+    {
+        var missing = new List<string>();
+        if (_customer is null) return (new(), new(), missing);
+
+        var dept = SelectedDepartment;
+        var toIds = dept?.PrimaryContactIds ?? _customer.PrimaryContactIds;
+        var ccIds = dept is null ? _customer.SecondaryContactIds : dept.SecondaryContactIds.Concat(dept.OurContactIds);
+
+        List<Recipient> Resolve(IEnumerable<int> ids)
+        {
+            var list = new List<Recipient>();
+            foreach (var id in ids.Distinct())
+            {
+                var row = _contactDetails.GetValueOrDefault(id);
+                if (row is null || string.IsNullOrWhiteSpace(row.Email))
+                    missing.Add(row?.FullName ?? $"Contact #{id}");
+                else
+                    list.Add(new Recipient(row.FullName, row.Email.Trim()));
+            }
+            return list;
+        }
+
+        var to = Resolve(toIds);
+        var cc = Resolve(ccIds).Where(c => !to.Any(t => t.Email.Equals(c.Email, StringComparison.OrdinalIgnoreCase))).ToList();
+        return (to, cc, missing);
+    }
+
+    // The picked department's own credit tab if it has one, otherwise the customer's. Skips
+    // the sheet read when switching between departments that share the same tab.
+    private async Task LoadCreditAsync()
+    {
+        var tab = SelectedDepartment?.CreditSheetTabName is { Length: > 0 } deptTab ? deptTab : _customer?.CreditSheetTabName;
+        _creditTabName = string.IsNullOrWhiteSpace(tab) ? null : tab;
+        if (_creditTabName is null) { _credit = null; StateHasChanged(); return; }
+        if (_credit is { Error: null or "" } && _credit.TabName == _creditTabName) { StateHasChanged(); return; }
+        _credit = null;
+
+        _loadingCredit = true;
+        StateHasChanged();
+
+        try
+        {
+            _credit = await CreditLookup.GetCreditAsync(_creditTabName);
+        }
+        catch (Exception ex)
+        {
+            _credit = new CustomerCredit(_creditTabName, "", "", new(), $"Couldn't load credit: {ex.Message}");
+        }
+
+        _loadingCredit = false;
+        StateHasChanged();
+    }
+
+    // "Currently with this customer" isn't something JMS tracks directly — LoanedToCompanyId
+    // only exists in LoanEquipmentOverlayStore's local annotations on top of the live LOAN-UNIT
+    // fleet (see LoanEquipmentManager.razor, the page that maintains it). So this loads the same
+    // two sources that page does and filters to units whose overlay says they're with one of
+    // this customer's company ids.
+    private async Task<List<WqLoan>> LoadLoansAsync(List<int> companyIds)
+    {
+        var rows = await LoanEquipment.GetLoanEquipmentAsync();
+        if (rows is null) return new();
+
+        var idSet = companyIds.ToHashSet();
+        var overlaysByEquipmentId = (await LoanOverlays.LoadAsync()).ToDictionary(o => o.EquipmentId);
+        var statusLabelById = (await LoanStatuses.LoadAsync()).ToDictionary(s => s.Id, s => s.Label);
+
+        var matches = rows
+            .Select(r =>
+            {
+                overlaysByEquipmentId.TryGetValue(r.EquipmentId, out var overlay);
+                return (Row: r, Overlay: overlay);
+            })
+            .Where(x => x.Overlay is not null && x.Overlay.LoanedToCompanyId is int cid && idSet.Contains(cid))
+            .ToList();
+
+        // CoveringForJobIds is a locally-entered list on the overlay (see LoanEquipmentOverlay) —
+        // resolve each to its equipment description in one batched call rather than per-loan.
+        var coveringJobIds = matches.SelectMany(x => x.Overlay!.CoveringForJobIds).Distinct().ToList();
+        var coveringEquipmentByJobId = await LoadCoveringJobEquipmentAsync(coveringJobIds);
+
+        return matches
+            .Select(x => new WqLoan(
+                Equipment: FormatLoanEquipmentLabel(x.Row.ManufacturerId, x.Row.ManufacturerName, x.Row.ModelNameNo, x.Row.SerialNo),
+                JobId: x.Row.LoanJobId,
+                LoanedDate: DateTime.TryParse(x.Row.LoanedDate, out var d) ? d : (DateTime?)null,
+                StatusLabel: statusLabelById.GetValueOrDefault(x.Overlay!.Status, x.Overlay!.Status),
+                AgreementSigned: x.Row.AgreementCount > 0,
+                CoveringFor: x.Overlay.CoveringForJobIds
+                    .Select(id => new WqLoanCoveringJob(id, coveringEquipmentByJobId.GetValueOrDefault(id, $"Job {id}")))
+                    .ToList()))
+            .ToList();
+    }
+
+    private async Task<Dictionary<int, string>> LoadCoveringJobEquipmentAsync(List<int> jobIds)
+    {
+        if (jobIds.Count == 0) return new();
+
+        var rows = await LoanEquipment.GetCoveringJobsAsync(jobIds);
+        return rows.ToDictionary(r => r.JobId, r => string.IsNullOrWhiteSpace(r.Equipment) ? $"Job {r.JobId}" : r.Equipment);
+    }
+
+    // Same abbreviation convention as WaitingQuoteReport.AbbreviateEquipment/
+    // LoanEquipmentManager.razor's FormatModelLabel — ManufacturerAbbreviationStore is keyed
+    // by manufacturer id (as a string), not name.
+    private string FormatLoanEquipmentLabel(int? manufacturerId, string? manufacturerName, string? modelName, string? serialNo)
+    {
+        var manuLabel = manufacturerId is int id && _manuAbbreviations.TryGetValue(id.ToString(), out var abbrev)
+            ? abbrev
+            : manufacturerName ?? "";
+        var model = string.IsNullOrWhiteSpace(manuLabel) ? (modelName ?? "") : $"{manuLabel} {modelName}".Trim();
+        return string.IsNullOrWhiteSpace(serialNo) ? model : $"{model} ({serialNo})";
+    }
+}

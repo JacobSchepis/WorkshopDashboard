@@ -1,0 +1,313 @@
+@page "/usage-analytics"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+
+@inherits DevOnlyComponentBase
+
+@using BlazorBootstrap
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Components.Layout
+@using WorkshopDashboard.Data
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Analytics
+@using WorkshopDashboard.Services.Stores
+
+@inject AnalyticsWriter Writer
+@inject ActionTimeSavingStore TimeSavings
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    UsageAnalytics — reads every App_Data/analytics/events-*.ndjson file
+    (AnalyticsService/AnalyticsWriter: one line per page view or tracked
+    action) and splits it into three tabs, worked out by UsageSummaries:
+      • Page views — each page (by its NavCatalog name), how often, by whom.
+        Signed-out views (the workshop TV screens) are hidden by default.
+      • Users      — each person: days active, views, actions, time saved.
+      • Actions    — each tracked action, and the time it's saved, from the
+                     minutes per use set on UsageTimeSaved.razor.
+    No prerender (real data in OnInitializedAsync). Dev-only, like the rest
+    of the Dev Tools section.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Usage Analytics</h1>
+    <p class="text-muted">Who's using which pages, what they're doing with them, and the time it's saved.</p>
+</div>
+
+<div class="d-flex flex-wrap align-items-center gap-3 mb-3">
+    <select class="form-select form-select-sm" style="max-width: 180px;" @bind="_rangeDays" @bind:after="LoadAsync">
+        <option value="1">Today</option>
+        <option value="7">Last 7 days</option>
+        <option value="30">Last 30 days</option>
+        <option value="90">Last 90 days</option>
+        <option value="0">All time</option>
+    </select>
+    <a class="btn btn-sm btn-outline-secondary ms-auto" href="usage-analytics/time-saved"><i class="bi bi-stopwatch"></i> Set time saved</a>
+</div>
+
+@if (_loading)
+{
+    <Spinner Color="SpinnerColor.Primary" />
+}
+else
+{
+    <ul class="nav nav-tabs mb-3">
+        @foreach (var (tab, label, count) in new[] { (Tab.PageViews, "Page views", _pageViewCount), (Tab.Users, "Users", _users.Count), (Tab.Actions, "Actions", _actionCount) })
+        {
+            <li class="nav-item">
+                <button class="nav-link @(_tab == tab ? "active" : "")" @onclick="() => SelectTab(tab)">
+                    @label <span class="badge text-bg-secondary ms-1">@count</span>
+                </button>
+            </li>
+        }
+    </ul>
+
+    @switch (_tab)
+    {
+        case Tab.PageViews:
+            <div class="form-check mb-2">
+                <input class="form-check-input" type="checkbox" id="signedOut" @bind="_includeSignedOut" @bind:after="Summarise" />
+                <label class="form-check-label small" for="signedOut">Include signed-out views (workshop TV screens, login page)</label>
+            </div>
+            @if (_pages.Count == 0)
+            {
+                <Callout Color="CalloutColor.Info">No page views in this range.</Callout>
+            }
+            else
+            {
+                var most = _pages.Max(p => p.Views);
+                <table class="table table-sm table-hover align-middle">
+                    <thead>
+                        <tr><th>Page</th><th>Section</th><th style="width: 30%;">Views</th><th class="text-end">People</th><th>Last viewed</th></tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var pg in _pages)
+                        {
+                            var open = _expanded == pg.Key;
+                            <tr class="cursor-pointer" @onclick="() => Toggle(pg.Key)">
+                                <td><i class="bi @(open ? "bi-chevron-down" : "bi-chevron-right") small text-muted me-1"></i>@pg.Title</td>
+                                <td class="text-muted small">@(pg.Section ?? "—")</td>
+                                <td>@Bar(pg.Views, most)</td>
+                                <td class="text-end">@pg.Users</td>
+                                <td class="small">@When(pg.LastSeen)</td>
+                            </tr>
+                            @if (open)
+                            {
+                                <tr><td colspan="5" class="bg-body-tertiary">@People(pg.ByUser, "view")</td></tr>
+                            }
+                        }
+                    </tbody>
+                </table>
+            }
+            break;
+
+        case Tab.Users:
+            @if (_users.Count == 0)
+            {
+                <Callout Color="CalloutColor.Info">Nobody's signed in during this range.</Callout>
+            }
+            else
+            {
+                <table class="table table-sm table-hover align-middle">
+                    <thead>
+                        <tr>
+                            <th>Person</th><th class="text-end">Days active</th><th class="text-end">Page views</th>
+                            <th class="text-end">Actions</th><th class="text-end">Time saved</th><th>Last seen</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var user in _users)
+                        {
+                            var open = _expanded == user.User;
+                            <tr class="cursor-pointer" @onclick="() => Toggle(user.User)">
+                                <td><i class="bi @(open ? "bi-chevron-down" : "bi-chevron-right") small text-muted me-1"></i><span class="fw-semibold">@user.User</span></td>
+                                <td class="text-end">@user.ActiveDays <span class="text-muted small">/ @RangeDaysLabel</span></td>
+                                <td class="text-end">@user.PageViews</td>
+                                <td class="text-end">@user.Actions</td>
+                                <td class="text-end">@UsageSummaries.FormatMinutes(user.MinutesSaved)</td>
+                                <td class="small">@When(user.LastSeen)</td>
+                            </tr>
+                            @if (open)
+                            {
+                                <tr>
+                                    <td colspan="6" class="bg-body-tertiary">
+                                        <div class="row small">
+                                            <div class="col-md-6">
+                                                <div class="text-muted mb-1">Most viewed pages</div>
+                                                @foreach (var p in user.TopPages) { <div>@p.Name <span class="text-muted">· @p.Count</span></div> }
+                                                @if (user.TopPages.Count == 0) { <div class="text-muted">None</div> }
+                                            </div>
+                                            <div class="col-md-6">
+                                                <div class="text-muted mb-1">Most used actions</div>
+                                                @foreach (var a in user.TopActions) { <div>@a.Name <span class="text-muted">· @a.Count</span></div> }
+                                                @if (user.TopActions.Count == 0) { <div class="text-muted">None</div> }
+                                            </div>
+                                        </div>
+                                    </td>
+                                </tr>
+                            }
+                        }
+                    </tbody>
+                </table>
+            }
+            break;
+
+        case Tab.Actions:
+            @if (_actions.Count == 0)
+            {
+                <Callout Color="CalloutColor.Info">No tracked actions in this range.</Callout>
+            }
+            else
+            {
+                var saved = _actions.Sum(a => a.MinutesSaved ?? 0);
+                var unset = _actions.Count(a => a.MinutesSaved == null);
+                <div class="d-flex flex-wrap gap-3 mb-3">
+                    <Card Class="flex-fill" Style="max-width: 260px;">
+                        <CardBody>
+                            <div class="text-muted small">Time saved</div>
+                            <div class="fs-3 fw-semibold">@UsageSummaries.FormatMinutes(saved)</div>
+                        </CardBody>
+                    </Card>
+                    <Card Class="flex-fill" Style="max-width: 260px;">
+                        <CardBody>
+                            <div class="text-muted small">Actions taken</div>
+                            <div class="fs-3 fw-semibold">@_actionCount</div>
+                        </CardBody>
+                    </Card>
+                    @if (unset > 0)
+                    {
+                        <div class="align-self-center small text-muted">
+                            @unset action@(unset == 1 ? " has" : "s have") no time saved set — <a href="usage-analytics/time-saved">set them</a>.
+                        </div>
+                    }
+                </div>
+                <table class="table table-sm table-hover align-middle">
+                    <thead>
+                        <tr>
+                            <th>Action</th><th class="text-end">Uses</th><th class="text-end">Items</th>
+                            <th class="text-end">People</th><th class="text-end">Time saved</th><th>Last used</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var action in _actions)
+                        {
+                            var open = _expanded == action.Name;
+                            <tr class="cursor-pointer" @onclick="() => Toggle(action.Name)">
+                                <td><i class="bi @(open ? "bi-chevron-down" : "bi-chevron-right") small text-muted me-1"></i>@action.Name</td>
+                                <td class="text-end">@action.Uses</td>
+                                <td class="text-end">@(action.Items?.ToString() ?? "—")</td>
+                                <td class="text-end">@action.Users</td>
+                                <td class="text-end">
+                                    @if (action.MinutesSaved is { } m)
+                                    {
+                                        @UsageSummaries.FormatMinutes(m)
+                                    }
+                                    else
+                                    {
+                                        <span class="text-muted small">Not set</span>
+                                    }
+                                </td>
+                                <td class="small">@When(action.LastSeen)</td>
+                            </tr>
+                            @if (open)
+                            {
+                                <tr><td colspan="6" class="bg-body-tertiary">@People(action.ByUser, "use")</td></tr>
+                            }
+                        }
+                    </tbody>
+                </table>
+            }
+            break;
+    }
+}
+
+@code {
+    private enum Tab { PageViews, Users, Actions }
+
+    private bool _loading = true;
+    private int _rangeDays = 7;
+    private Tab _tab = Tab.PageViews;
+    private bool _includeSignedOut;
+    private string? _expanded;
+
+    private List<AnalyticsEvent> _events = [];
+    private Dictionary<string, ActionTimeSaving> _savings = new();
+    private List<PageViewRow> _pages = [];
+    private List<UserRow> _users = [];
+    private List<ActionRow> _actions = [];
+    private int _pageViewCount;
+    private int _actionCount;
+
+    private static readonly IReadOnlyList<KnownPage> KnownPages = NavCatalog.Sections
+        .SelectMany(s => s.Tools.Select(t => new KnownPage(t.Href, t.Title, s.Title)))
+        .ToList();
+
+    private string RangeDaysLabel => _rangeDays switch { 0 => "all time", 1 => "today", _ => $"{_rangeDays}" };
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        if (!IsDevAuthorized) return;
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        _loading = true;
+        StateHasChanged();
+
+        var since = _rangeDays > 0 ? DateTime.UtcNow.Date.AddDays(1 - _rangeDays) : (DateTime?)null;
+        _events = await Writer.ReadAllAsync(since);
+        _savings = await TimeSavings.LoadAsync();
+        Summarise();
+
+        _loading = false;
+    }
+
+    private void Summarise()
+    {
+        _pages = UsageSummaries.PageViews(_events, KnownPages, _includeSignedOut);
+        _users = UsageSummaries.Users(_events, KnownPages, _savings);
+        _actions = UsageSummaries.Actions(_events, _savings);
+        _pageViewCount = _pages.Sum(p => p.Views);
+        _actionCount = _actions.Sum(a => a.Uses);
+    }
+
+    private void SelectTab(Tab tab)
+    {
+        _tab = tab;
+        _expanded = null;
+    }
+
+    private void Toggle(string key) => _expanded = _expanded == key ? null : key;
+
+    private static string When(DateTime utc)
+    {
+        var local = utc.ToLocalTime();
+        return local.Date == DateTime.Today ? $"Today {local:h:mm tt}"
+            : local.Date == DateTime.Today.AddDays(-1) ? $"Yesterday {local:h:mm tt}"
+            : local.ToString("d MMM, h:mm tt");
+    }
+
+    private static RenderFragment Bar(int value, int max) => __builder =>
+    {
+        <div class="d-flex align-items-center gap-2">
+            <div class="progress flex-grow-1" style="height: 6px;">
+                <div class="progress-bar" style="width: @(max == 0 ? 0 : value * 100 / max)%;"></div>
+            </div>
+            <span class="text-end" style="min-width: 3ch;">@value</span>
+        </div>
+    };
+
+    private static RenderFragment People(List<UserCount> people, string noun) => __builder =>
+    {
+        <div class="d-flex flex-wrap gap-2 small">
+            @foreach (var p in people)
+            {
+                <span class="badge text-bg-light border fw-normal">
+                    @p.User · @p.Count @(p.Count == 1 ? noun : noun + "s")@(p.MinutesSaved is { } m && m > 0 ? $" · {UsageSummaries.FormatMinutes(m)} saved" : "")
+                </span>
+            }
+        </div>
+    };
+}

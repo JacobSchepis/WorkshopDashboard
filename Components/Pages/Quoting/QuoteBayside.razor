@@ -1,0 +1,444 @@
+@page "/quote-bayside"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+
+@using System.Globalization
+@using WorkshopDashboard.Services.Quoting.Bayside
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Quoting
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Analytics
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+@using WorkshopDashboard.Components.Pages.Quoting.Cards
+
+@inject IConfiguration Configuration
+@inject IJsonCompletionClient OpenAi
+@inject CompanyGroupStore CompanyGroups
+@inject QuoteNoticeStore Notices
+@inject JobLookupService JobLookup
+@inject JobEquipmentLookup EquipmentLookup
+@inject QuoteSubmissionService QuoteSubmission
+@inject AnalyticsService Analytics
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    QuoteBayside — repairer quote extraction + pricing for Bayside. One of six near-identical per-repairer
+    quoting pages (Apex/Bayside/Cobalt/Dorado/Ember/Falcon) sharing the same
+    upload→extract→submit shape; see QuoteDorado for the fullest write-up.
+    Bayside quotes in USD, so this page's job is really a currency conversion
+    with a reconciliation check on top.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      (extractor built inline in RunQuery, from src/Services/Quoting/Bayside)
+      Notices          — QuoteNoticeStore: repairer-scope notices
+      JobLookup        — job -> owner company id / name
+      EquipmentLookup  — equipment options for the equipment selector
+      QuoteSubmission  — posts the priced line items back to JMS
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      HandleFileSelected -> RunQuery extracts the PDF's USD line items and
+      totals. The reconciliation callout compares the summed line items
+      against the quote's own printed total (UsdVariance) so a parsing miss
+      is visible before submit. Each line's AUD "Our Price" is the USD cost
+      times the editable AUD/USD rate (OnRateChanged / ResetRate) — that's
+      CustomerTotal, what actually gets posted via SubmitServices.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="container py-4" style="max-width: 1100px;">
+    <div class="page-header">
+        <h1>Bayside Quote Extractor</h1>
+        <p class="text-muted">Upload a Bayside PDF job quote to extract and create services.</p>
+    </div>
+
+    <QuoteUploadCard HasFile="_pdfBytes != null" HasResult="_result != null" Loading="_loading"
+                      Submitting="_submitting" SubmitSuccess="_submitSuccess" Error="@_error"
+                      CanSubmit="!SubmitDisabled"
+                      OnFileSelected="HandleFileSelected" OnExtract="RunQuery" OnSubmit="SubmitServices" />
+
+    @if (_result != null)
+    {
+        @* ── Summary bar ── *@
+        <QuoteSummaryBar JobNumber="@_result.JobNumber" JobNumberChanged="v => _result.JobNumber = v"
+                          RetryLoading="_jobLookupLoading" OnRetry="RetryJobLookup">
+            <ExtraFields>
+                <div>
+                    <div class="text-muted small mb-1">AUD/USD Rate</div>
+                    <div class="d-flex gap-2 align-items-center">
+                        <input type="number" step="0.0001" min="0.0001"
+                               class="form-control form-control-sm" style="width: 100px;"
+                               value="@_audUsdRate.ToString(CultureInfo.InvariantCulture)"
+                               @onchange="OnRateChanged" />
+                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" @onclick="ResetRate">Reset</Button>
+                    </div>
+                </div>
+                <div>
+                    <div class="text-muted small">Bayside Total (USD)</div>
+                    <div class="fw-semibold">@_result.TotalPriceUsd.ToString("C")</div>
+                </div>
+                <div>
+                    <div class="text-muted small">Our Total (AUD)</div>
+                    <div class="fw-semibold text-success">@CustomerTotal.ToString("C")</div>
+                </div>
+            </ExtraFields>
+        </QuoteSummaryBar>
+
+        @* ── Reconciliation check ── *@
+        <Callout Color="ReconCalloutColor" Class="mb-3">
+            <div class="d-flex justify-content-between align-items-start flex-wrap gap-3">
+                <div>
+                    <div class="fw-semibold">@ReconHeadline</div>
+                </div>
+                <div class="small text-end">
+                    <div>Sum of @_result.LineItems.Count line item(s): <span class="fw-semibold">@_result.LineItemUsdTotal.ToString("C")</span></div>
+                    <div>Total printed on quote: <span class="fw-semibold">@_result.TotalPriceUsd.ToString("C")</span></div>
+                    <div>Variance: <span class="fw-semibold">@_result.UsdVariance.ToString("C")</span></div>
+                </div>
+            </div>
+        </Callout>
+
+        @* ── Job equipment ── *@
+        <EquipmentSelectorCard Equipment="_jobEquipment" Loading="_equipmentLoading" @bind-SelectedEquipmentId="_selectedEquipmentId" />
+
+        @* ── Line items ── *@
+        <Card Class="mb-3">
+            <CardHeader Class="d-flex justify-content-between align-items-center">
+                <span>Line Items</span>
+                <span class="text-muted fw-normal small">Our total: <span class="fw-semibold text-dark">@CustomerTotal.ToString("C")</span></span>
+            </CardHeader>
+            <CardBody Class="p-0">
+                <table class="table table-sm mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th>Description</th>
+                            <th class="text-end" style="width:100px">Bayside Cost (USD)</th>
+                            <th class="text-end" style="width:120px">Our Price (AUD)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @for (int i = 0; i < _result.LineItems.Count; i++)
+                        {
+                            var item = _result.LineItems[i];
+                            var idx = i;
+                            var repairsText = string.Join("\n", item.RepairsRequired);
+                            var observationsText = string.Join("\n", item.TechnicalObservations);
+                            <tr class="align-middle">
+                                <td>
+                                    <input type="text" class="form-control form-control-sm fw-semibold mb-1"
+                                           style="font-size:0.8rem"
+                                           placeholder="Item (for reference only — not included in the service description)"
+                                           value="@item.ItemDescription"
+                                           @oninput="e => item.ItemDescription = e.Value?.ToString() ?? string.Empty" />
+                                    <div class="row g-2">
+                                        <div class="col-6">
+                                            <div class="text-muted" style="font-size:0.7rem">Repairs Required</div>
+                                            <textarea class="form-control form-control-sm"
+                                                      rows="3"
+                                                      placeholder="What we'll do (one per line) — leave blank if unrepairable"
+                                                      style="font-size:0.8rem; resize:vertical;"
+                                                      value="@repairsText"
+                                                      @oninput="e => item.RepairsRequired = (e.Value?.ToString() ?? string.Empty).Split('\n').ToList()"></textarea>
+                                        </div>
+                                        <div class="col-6">
+                                            <div class="text-muted" style="font-size:0.7rem">Technical Observations</div>
+                                            <textarea class="form-control form-control-sm"
+                                                      rows="3"
+                                                      placeholder="Findings (one per line)"
+                                                      style="font-size:0.8rem; resize:vertical;"
+                                                      value="@observationsText"
+                                                      @oninput="e => item.TechnicalObservations = (e.Value?.ToString() ?? string.Empty).Split('\n').ToList()"></textarea>
+                                        </div>
+                                    </div>
+                                </td>
+                                <td class="text-end">
+                                    <div class="input-group input-group-sm justify-content-end">
+                                        <span class="input-group-text">$</span>
+                                        <input type="number"
+                                               class="form-control text-end"
+                                               style="width:80px"
+                                               step="0.01"
+                                               value="@item.CostUsd"
+                                               @oninput="e => UpdateLineCostUsd(idx, e.Value?.ToString())" />
+                                    </div>
+                                </td>
+                                <td class="text-end">
+                                    <div class="input-group input-group-sm justify-content-end">
+                                        <span class="input-group-text">$</span>
+                                        <input type="number"
+                                               class="form-control text-end"
+                                               style="width:90px"
+                                               step="0.01"
+                                               value="@_customerPrices[idx]"
+                                               @oninput="e => UpdateCustomerPrice(idx, e.Value?.ToString())" />
+                                    </div>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                    <tfoot class="table-light">
+                        <tr>
+                            <td></td>
+                            <td class="text-end fw-semibold small">@_result.LineItemUsdTotal.ToString("C")</td>
+                            <td class="text-end fw-semibold">@CustomerTotal.ToString("C")</td>
+                        </tr>
+                    </tfoot>
+                </table>
+            </CardBody>
+        </Card>
+
+        @* ── Notices ── *@
+        <QuoteNoticesCard Notices="_applicableNotices" SelectedIds="_selectedNoticeIds" />
+    }
+</div>
+
+@code {
+    private byte[]? _pdfBytes;
+    private BaysideQuoteExtraction? _result;
+    private List<decimal> _customerPrices = new();
+    private int _companyId;
+    private bool _loading = false;
+    private bool _submitting = false;
+    private bool _submitSuccess = false;
+    private string? _error;
+
+    private List<JobEquipmentInfo> _jobEquipment = new();
+    private string? _selectedEquipmentId;
+    private bool _equipmentLoading = false;
+    private bool _jobLookupLoading = false;
+
+    private decimal _audUsdRate = BaysidePricingConfig.DefaultAudUsdRate;
+    private decimal _configuredRate = BaysidePricingConfig.DefaultAudUsdRate;
+
+    private List<QuoteNotice> _applicableNotices = new();
+    private HashSet<Guid> _selectedNoticeIds = new();
+
+    private decimal CustomerTotal => _customerPrices.Sum();
+
+    private bool SubmitDisabled =>
+        _submitting
+        || string.IsNullOrEmpty(_selectedEquipmentId);
+
+    private CalloutColor ReconCalloutColor =>
+        _result != null && _result.Reconciles ? CalloutColor.Success : CalloutColor.Danger;
+
+    private string ReconHeadline =>
+        _result == null ? string.Empty
+        : _result.Reconciles
+            ? "Reconciled — line items match the printed total."
+            : "Does NOT reconcile — check the line items against the source quote.";
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+
+        // Optional appsettings override: "Pricing": { "BaysideAudUsdRate": 0.69 }
+        var configured = Configuration["Pricing:BaysideAudUsdRate"];
+        if (decimal.TryParse(configured, NumberStyles.Any, CultureInfo.InvariantCulture, out var rate) && rate > 0)
+            _configuredRate = rate;
+
+        _audUsdRate = _configuredRate;
+    }
+
+    private void OnRateChanged(ChangeEventArgs e)
+    {
+        if (decimal.TryParse(e.Value?.ToString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var rate) && rate > 0)
+        {
+            _audUsdRate = rate;
+            RecalculatePrices();
+        }
+    }
+
+    private void ResetRate()
+    {
+        _audUsdRate = _configuredRate;
+        RecalculatePrices();
+    }
+
+    private void RecalculatePrices()
+    {
+        if (_result == null) return;
+        _customerPrices = _result.LineItems
+            .Select(i => BaysidePricingConfig.Calculate(i.CostUsd, _audUsdRate).Total)
+            .ToList();
+    }
+
+    private void UpdateLineCostUsd(int index, string? value)
+    {
+        if (_result == null || index < 0 || index >= _result.LineItems.Count) return;
+        if (!decimal.TryParse(value, out var d)) d = 0m;
+        _result.LineItems[index].CostUsd = d;
+        if (index < _customerPrices.Count)
+            _customerPrices[index] = BaysidePricingConfig.Calculate(d, _audUsdRate).Total;
+    }
+
+    private void UpdateCustomerPrice(int index, string? value)
+    {
+        if (index >= 0 && index < _customerPrices.Count)
+            _customerPrices[index] = decimal.TryParse(value, out var d) ? d : 0m;
+    }
+
+    private async Task LoadJobEquipmentAsync(int jobId)
+    {
+        _equipmentLoading = true;
+        try
+        {
+            _jobEquipment = await EquipmentLookup.LoadAsync(jobId);
+
+            if (_jobEquipment.Count == 1)
+                _selectedEquipmentId = _jobEquipment[0].EquipmentId;
+        }
+        catch (Exception ex)
+        {
+            _error = "Failed to load job equipment: " + ex.Message;
+        }
+        finally
+        {
+            _equipmentLoading = false;
+        }
+    }
+
+    private async Task LoadApplicableNoticesAsync()
+    {
+        _applicableNotices = await Notices.GetApplicableAsync(QuoteNoticeTarget.Bayside);
+        _selectedNoticeIds = _applicableNotices.Select(n => n.Id).ToHashSet();
+    }
+
+    private async Task HandleFileSelected(InputFileChangeEventArgs e)
+    {
+        _result = null;
+        _error = null;
+        _submitSuccess = false;
+
+        var bytes = await QuotePdfUpload.ReadPdfAsync(e, msg => _error = msg);
+        if (bytes != null)
+            _pdfBytes = bytes;
+        StateHasChanged();
+    }
+
+    private async Task RunQuery()
+    {
+        if (_pdfBytes == null) return;
+
+        _loading = true;
+        _error = null;
+        _result = null;
+        _customerPrices = new();
+        _submitSuccess = false;
+        _selectedEquipmentId = null;
+        _jobEquipment = new();
+        _audUsdRate = _configuredRate;
+        StateHasChanged();
+
+        try
+        {
+            var client = new BaysideQuoteExtractor(OpenAi);
+            _result = await client.ExtractAsync(_pdfBytes);
+            RecalculatePrices();
+
+            await LoadApplicableNoticesAsync();
+            await RunJobLookupAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = "Extraction failed: " + ex.Message;
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task RetryJobLookup()
+    {
+        if (_result == null) return;
+
+        _jobLookupLoading = true;
+        _error = null;
+        _selectedEquipmentId = null;
+        _jobEquipment = new();
+        StateHasChanged();
+
+        try
+        {
+            await RunJobLookupAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = "Job lookup failed: " + ex.Message;
+        }
+        finally
+        {
+            _jobLookupLoading = false;
+        }
+    }
+
+    private async Task RunJobLookupAsync()
+    {
+        if (_result == null) return;
+
+        int jobId;
+        if (!int.TryParse(_result.JobNumber, out jobId))
+        {
+            _error = "Could not extract a valid job number from the quote.";
+            return;
+        }
+
+        var companyId = await JobLookup.GetOwnerCompanyIdAsync(jobId);
+        if (companyId is null)
+            throw new Exception("Could not retrieve company ID for job " + jobId);
+        _companyId = companyId.Value;
+
+        await LoadJobEquipmentAsync(jobId);
+    }
+
+    private async Task SubmitServices()
+    {
+        if (_result == null || string.IsNullOrEmpty(_selectedEquipmentId)) return;
+
+        _submitting = true;
+        _error = null;
+        _submitSuccess = false;
+        StateHasChanged();
+
+        try
+        {
+            int jobId;
+            if (!int.TryParse(_result.JobNumber, out jobId))
+            {
+                _error = "Could not extract a valid job number from the quote.";
+                return;
+            }
+
+            var lineItems = new List<(string, decimal)>();
+            for (int i = 0; i < _result.LineItems.Count; i++)
+            {
+                var item = _result.LineItems[i];
+                lineItems.Add((BaysideServiceDescriptions.GetTechnicalObservationsDescription(item), 0m));
+                lineItems.Add((BaysideServiceDescriptions.GetRepairsDescription(item), _customerPrices[i]));
+            }
+
+            var selectedNotices = _applicableNotices.Where(n => _selectedNoticeIds.Contains(n.Id));
+
+            await QuoteSubmission.SubmitAsync(
+                jobId, _selectedEquipmentId,
+                lineItems, selectedNotices);
+
+            _submitSuccess = true;
+            await Analytics.TrackEventAsync("Quote services created — Bayside");
+        }
+        catch (Exception ex)
+        {
+            _error = "Submission failed: " + ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+}

@@ -1,0 +1,161 @@
+@using System.Globalization
+@using CsvHelper
+@using CsvHelper.Configuration
+
+@using WorkshopDashboard.Abstract
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.External.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    JobListSection — renders (and owns the loading of) a job table for one
+    job-status query, with a select checkbox per row. Used by pages that
+    need the "jobs currently at status X, with history" shape more than
+    once without re-fetching/re-parsing CSV each time.
+
+    ── Public surface ───────────────────────────────────────────────────────
+      LoadJobsAsync(jmsClient, jobStatusId, filterHistoryToStatus) — runs
+      JmsQueries.JobsWithHistoryQuery, groups the CSV rows by job_id
+      (a join produces multiple rows per job), and renders. Jobs is the
+      loaded (and checkbox-mutated) list for the caller to read back.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else if (_jobs.Count == 0)
+{
+    <Callout Color="CalloutColor.Info">No jobs found.</Callout>
+}
+else
+{
+    <table class="table table-striped align-middle">
+        <tbody>
+            @foreach (var job in _jobs)
+            {
+                <tr>
+                    <td>
+                        <a href="@JmsLinks.JobSummary(job.JobId)"
+                           target="_blank"
+                           rel="noopener noreferrer">
+                            @job.JobId
+                        </a>
+                    </td>
+                    <td>@job.Owner</td>
+                    <td>@job.Model</td>
+                    <td>@job.Notes</td>
+                    <td>@((MarkupString)string.Join("<br />", job.Connote))</td>
+                    <td class="@(job.StatusChangeDate < DateTime.Today.AddDays(-7) ? "text-stale-danger" : "")">
+                        @job.StatusChangeDate.ToString("dd MMM yyyy")
+                    </td>
+                    <td class="text-end">
+                        <input type="checkbox" @bind="job.IsSelected" />
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    private List<JobRecord> _jobs = new();
+    private bool _loading = false;
+
+    public IReadOnlyList<JobRecord> Jobs => _jobs;
+
+    // CSV row model matching the query columns
+    private class JobCsvRow
+    {
+        public int job_id { get; set; }
+        public string? job_notes { get; set; }
+        public string? first_name { get; set; }
+        public string? job_status { get; set; }
+        public string? history_notes { get; set; }
+        public string? creation_date { get; set; }
+        public string? company_name { get; set; }
+        public string? model_name_no { get; set; }
+    }
+
+    // filterHistoryToStatus: true  = only include history rows matching jobStatusId (e.g. Waiting Outward Shipping)
+    //                         false = include all history rows (e.g. Unit Departed, so connotes from earlier statuses are visible)
+    public async Task LoadJobsAsync(IJmsDataClient jmsClient, int jobStatusId, bool filterHistoryToStatus = true)
+    {
+        _loading = true;
+        StateHasChanged();
+
+        var query = JmsQueries.JobsWithHistoryQuery(jobStatusId, filterHistoryToStatus);
+
+        var res = await jmsClient.PostQueryForCsvAsync(query);
+
+        if (!res.Success)
+        {
+            _loading = false;
+            StateHasChanged();
+            return;
+        }
+
+        var config = new CsvConfiguration(CultureInfo.InvariantCulture)
+        {
+            HeaderValidated = null,
+            MissingFieldFound = null
+        };
+
+        using var reader = new StringReader(res.Content);
+        using var csv = new CsvReader(reader, config);
+
+        var rows = csv.GetRecords<JobCsvRow>().ToList();
+
+        // Group rows by job_id since joins produce multiple rows per job
+        var grouped = rows.GroupBy(r => r.job_id);
+
+        var jobs = new List<JobRecord>();
+
+        foreach (var group in grouped)
+        {
+            var first = group.First();
+
+            var job = new JobRecord
+            {
+                JobId = group.Key,
+                Notes = first.job_notes ?? "",
+                Owner = first.company_name ?? "",
+                Model = first.model_name_no ?? ""
+            };
+
+            // Get the most recent creation_date across all history rows for this job
+            var latestDate = group
+                .Where(r => DateTime.TryParse(r.creation_date, out _))
+                .Select(r => DateTime.Parse(r.creation_date!))
+                .OrderByDescending(d => d)
+                .FirstOrDefault();
+
+            job.StatusChangeDate = latestDate == default ? DateTime.Today : latestDate;
+
+            // Connotes are the history_notes from rows where job_status is "Waiting Outward Shipping"
+            job.Connote = group
+                .Where(r => r.job_status?.Equals("Waiting Outward Shipping", StringComparison.OrdinalIgnoreCase) == true
+                         && !string.IsNullOrWhiteSpace(r.history_notes))
+                .Select(r => r.history_notes!)
+                .Distinct()
+                .ToList();
+
+            jobs.Add(job);
+        }
+
+        _jobs = jobs;
+        _loading = false;
+        StateHasChanged();
+    }
+}

@@ -1,0 +1,913 @@
+@page "/customs-info-manager"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject CustomsInfoStore CustomsInfo
+@inject ScopeLookupService ScopeLookup
+
+@using CsvHelper
+@using CsvHelper.Configuration
+@using System.Globalization
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    CustomsInfoManager — CRUD for the manufacturer/510(k)/model data
+    (CustomsInfoStore) that drives the "Generate
+    Customs Info" button on the Repair Request page's Equipment tab
+    (InternationalShipping.razor).
+
+    Models are the primary flat list, each referencing a manufacturer (by
+    name) and a 510(k) (by number) rather than duplicating their fields —
+    several models often share the same manufacturer or 510(k), so those are
+    created once and reused. Adding a model looks up what you type against
+    the existing manufacturers/510(k)s and shows a quick preview if found;
+    if not found, it reveals inline fields to create it as part of saving the
+    model, so there's no separate "create the manufacturer first" step for
+    the common case. The Manufacturers/510(k)s sections below are for
+    correcting entries after the fact.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Customs Info Manager</h1>
+    <p class="text-muted">
+        Per-model customs data (manufacturer, FDA 510(k), HTS code, country of origin) used to
+        generate the customs info form attached to a DHL booking. Models are linked by JMS's
+        model id so the form can be generated automatically — see the "Customs" flag on the
+        Repair Request page's US/Equipment tab.
+    </p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else
+{
+    <Card Class="mb-4">
+        <CardHeader>@(_editingModelId is null ? "Add Model" : $"Edit \"{_formModelLabel}\"")</CardHeader>
+        <CardBody>
+            @if (!string.IsNullOrEmpty(_formError))
+            {
+                <Callout Color="CalloutColor.Danger" Class="mb-3">@_formError</Callout>
+            }
+
+            @if (_editingModelId is null)
+            {
+                <div class="mb-3" style="max-width: 480px;">
+                    <label class="form-label">Model</label>
+                    <input class="form-control" placeholder="Search model name..." value="@_modelQuery" @oninput="OnModelSearchInput" />
+                    @if (_modelSearching)
+                    {
+                        <div class="text-muted small mt-1">Searching...</div>
+                    }
+                    @if (_modelHits.Count > 0)
+                    {
+                        <div class="border rounded mt-1 p-2" style="max-height:220px; overflow-y:auto;">
+                            @foreach (var hit in _modelHits)
+                            {
+                                <button type="button" class="btn btn-sm btn-outline-secondary d-block w-100 text-start mb-1"
+                                        @onclick="() => SelectModel(hit.Id, hit.Label)">
+                                    @hit.Label
+                                </button>
+                            }
+                        </div>
+                    }
+                    @if (_selectedModelId is not null)
+                    {
+                        <div class="mt-2"><span class="badge bg-primary">@_formModelLabel</span></div>
+                    }
+                </div>
+            }
+            else
+            {
+                <div class="mb-3"><strong>@_formModelLabel</strong></div>
+            }
+
+            <div class="row g-4">
+                <div class="col-md-6">
+                    <label class="form-label">Manufacturer</label>
+                    <input class="form-control" placeholder="e.g. Olympus" @bind-value="_formManufacturerName" @bind-value:event="oninput" />
+
+                    @{ var matchedManufacturer = FindManufacturer(_formManufacturerName); }
+
+                    @if (matchedManufacturer is null && !string.IsNullOrWhiteSpace(_formManufacturerName))
+                    {
+                        var manufacturerSuggestions = _manufacturers
+                            .Where(m => m.Name.Contains(_formManufacturerName, StringComparison.OrdinalIgnoreCase))
+                            .OrderBy(m => m.Name, StringComparer.OrdinalIgnoreCase)
+                            .Take(8)
+                            .ToList();
+
+                        if (manufacturerSuggestions.Count > 0)
+                        {
+                            <div class="border rounded mt-1 p-2">
+                                @foreach (var hit in manufacturerSuggestions)
+                                {
+                                    <button type="button" class="btn btn-sm btn-outline-secondary d-block w-100 text-start mb-1"
+                                            @onclick="() => _formManufacturerName = hit.Name">
+                                        @hit.Name
+                                    </button>
+                                }
+                            </div>
+                        }
+                    }
+
+                    @if (matchedManufacturer is not null)
+                    {
+                        <div class="small text-success mt-1">
+                            Using existing manufacturer ✓ — @matchedManufacturer.Address, @matchedManufacturer.Country (Reg. @matchedManufacturer.RegistrationNumber)
+                        </div>
+                    }
+                    else if (!string.IsNullOrWhiteSpace(_formManufacturerName))
+                    {
+                        <div class="border rounded p-2 mt-2">
+                            <div class="small text-warning mb-2">New manufacturer — fill in its details:</div>
+                            <div class="mb-2">
+                                <label class="form-label small mb-0">Address</label>
+                                <input class="form-control form-control-sm" @bind-value="_newManufacturerAddress" />
+                            </div>
+                            <div class="row g-2">
+                                <div class="col-6">
+                                    <label class="form-label small mb-0">Registration No.</label>
+                                    <input class="form-control form-control-sm" @bind-value="_newManufacturerRegistrationNumber" />
+                                </div>
+                                <div class="col-6">
+                                    <label class="form-label small mb-0">Country</label>
+                                    <input class="form-control form-control-sm" @bind-value="_newManufacturerCountry" />
+                                </div>
+                            </div>
+                        </div>
+                    }
+                </div>
+
+                <div class="col-md-6">
+                    <label class="form-label">FDA 510(k) Number <span class="text-muted">(optional)</span></label>
+                    <input class="form-control" placeholder="e.g. K131780" @bind-value="_formFda510kNumber" @bind-value:event="oninput" />
+
+                    @{ var matchedFda510k = FindFda510k(_formFda510kNumber); }
+                    @if (matchedFda510k is not null)
+                    {
+                        <div class="small text-success mt-1">
+                            Using existing 510(k) ✓ — Product Code @matchedFda510k.ProductCode, Regulation @matchedFda510k.RegulationNumber
+                        </div>
+                    }
+                    else if (!string.IsNullOrWhiteSpace(_formFda510kNumber))
+                    {
+                        <div class="border rounded p-2 mt-2">
+                            <div class="small text-warning mb-2">New 510(k) — fill in its details:</div>
+                            <div class="row g-2">
+                                <div class="col-6">
+                                    <label class="form-label small mb-0">FDA Product Code</label>
+                                    <input class="form-control form-control-sm" @bind-value="_newFda510kProductCode" />
+                                </div>
+                                <div class="col-6">
+                                    <label class="form-label small mb-0">Regulation No.</label>
+                                    <input class="form-control form-control-sm" @bind-value="_newFda510kRegulationNumber" />
+                                </div>
+                            </div>
+                            <div class="mt-2">
+                                <label class="form-label small mb-0">FDA Page URL</label>
+                                <input class="form-control form-control-sm" @bind-value="_newFda510kPageUrl" />
+                            </div>
+                        </div>
+                    }
+                </div>
+            </div>
+
+            <div class="row g-3 mt-1">
+                <div class="col-md-3">
+                    <label class="form-label">Type</label>
+                    <input class="form-control" placeholder="e.g. Colonoscope" @bind-value="_formType" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">HTS Code</label>
+                    <input class="form-control" @bind-value="_formHtsCode" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">Device Listing No. (LST)</label>
+                    <input class="form-control" placeholder="Leave blank if unknown" @bind-value="_formDeviceListingNumber" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">Declared Value <span class="text-muted">(number only)</span></label>
+                    <input class="form-control" placeholder="e.g. 150" @bind-value="_formDeclaredValue" />
+                </div>
+            </div>
+
+            <div class="row g-3 mt-1">
+                <div class="col-md-4">
+                    <label class="form-label">Weight (kg)</label>
+                    <input class="form-control" placeholder="e.g. 2.5" @bind-value="_formWeight" />
+                </div>
+            </div>
+            <p class="text-muted small mb-0 mt-1">
+                The customs form's description is generated automatically as
+                "MANUFACTURER MODEL Type - SN: [serial] - REPAIR AND RETURN. FDA Code: product code / 510(k)".
+            </p>
+
+            <div class="d-flex gap-2 mt-3">
+                <Button Color="ButtonColor.Primary" Disabled="_saving" @onclick="SaveModelAsync">
+                    @(_saving ? "Saving..." : _editingModelId is null ? "Add Model" : "Save Changes")
+                </Button>
+                @if (_editingModelId is not null)
+                {
+                    <Button Color="ButtonColor.Secondary" Outline="true" Disabled="_saving" @onclick="CancelModelEdit">
+                        Cancel
+                    </Button>
+                }
+            </div>
+        </CardBody>
+    </Card>
+
+    <Card Class="mb-4">
+        <CardHeader>Models (@_models.Count)</CardHeader>
+        <CardBody>
+            @if (_models.Count == 0)
+            {
+                <p class="text-muted small mb-0">No models configured yet — add one above.</p>
+            }
+            else
+            {
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead>
+                            <tr>
+                                <th>Model</th>
+                                <th>Manufacturer</th>
+                                <th>Country of Origin</th>
+                                <th>510(k)</th>
+                                <th>LST</th>
+                                <th>Type</th>
+                                <th>HTS Code</th>
+                                <th>Value</th>
+                                <th>Weight (kg)</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var m in _models.OrderBy(m => m.ModelLabel, StringComparer.OrdinalIgnoreCase))
+                            {
+                                <tr>
+                                    <td>@m.ModelLabel</td>
+                                    <td>@m.ManufacturerName</td>
+                                    <td>@(FindManufacturer(m.ManufacturerName)?.Country ?? "—")</td>
+                                    <td>@(string.IsNullOrWhiteSpace(m.Fda510kNumber) ? "—" : m.Fda510kNumber)</td>
+                                    <td>
+                                        @if (string.IsNullOrWhiteSpace(m.DeviceListingNumber))
+                                        {
+                                            <span class="badge bg-warning text-dark">Unknown</span>
+                                        }
+                                        else
+                                        {
+                                            @m.DeviceListingNumber
+                                        }
+                                    </td>
+                                    <td>@m.Type</td>
+                                    <td>@m.HtsCode</td>
+                                    <td>@(string.IsNullOrWhiteSpace(m.DeclaredValue) ? "—" : m.DeclaredValue)</td>
+                                    <td>@(string.IsNullOrWhiteSpace(m.Weight) ? "—" : m.Weight)</td>
+                                    <td class="text-end" style="white-space: nowrap;">
+                                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="me-2" @onclick="() => StartModelEdit(m)">
+                                            Edit
+                                        </Button>
+                                        @if (_pendingDeleteModelId == m.ModelId)
+                                        {
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" @onclick="() => DeleteModelAsync(m.ModelId)">
+                                                Confirm?
+                                            </Button>
+                                        }
+                                        else
+                                        {
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" @onclick="() => _pendingDeleteModelId = m.ModelId">
+                                                Delete
+                                            </Button>
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </CardBody>
+    </Card>
+
+    <Card Class="mb-4">
+        <CardHeader>@(_editingManufacturerName is null ? "Add Manufacturer" : $"Edit \"{_editingManufacturerName}\"")</CardHeader>
+        <CardBody>
+            @if (!string.IsNullOrEmpty(_manufacturerFormError))
+            {
+                <Callout Color="CalloutColor.Danger" Class="mb-3">@_manufacturerFormError</Callout>
+            }
+            <div class="row g-3 mb-3">
+                <div class="col-md-3">
+                    <label class="form-label">Name</label>
+                    <input class="form-control" @bind-value="_manufacturerFormName" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">Registration No.</label>
+                    <input class="form-control" @bind-value="_manufacturerFormRegistrationNumber" />
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">Country</label>
+                    <input class="form-control" @bind-value="_manufacturerFormCountry" />
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">Address</label>
+                    <input class="form-control" @bind-value="_manufacturerFormAddress" />
+                </div>
+            </div>
+            <div class="row g-3 mb-3">
+                <div class="col-md-8">
+                    <label class="form-label">FDA Establishment Page URL</label>
+                    <input class="form-control" @bind-value="_manufacturerFormFdaEstablishmentPageUrl" />
+                </div>
+            </div>
+            <div class="d-flex gap-2">
+                <Button Color="ButtonColor.Primary" Disabled="_savingManufacturer" @onclick="SaveManufacturerAsync">
+                    @(_savingManufacturer ? "Saving..." : _editingManufacturerName is null ? "Add Manufacturer" : "Save Changes")
+                </Button>
+                @if (_editingManufacturerName is not null)
+                {
+                    <Button Color="ButtonColor.Secondary" Outline="true" Disabled="_savingManufacturer" @onclick="CancelManufacturerEdit">
+                        Cancel
+                    </Button>
+                }
+            </div>
+        </CardBody>
+    </Card>
+
+    <Card Class="mb-4">
+        <CardHeader>Manufacturers (@_manufacturers.Count)</CardHeader>
+        <CardBody>
+            @if (_manufacturers.Count == 0)
+            {
+                <p class="text-muted small mb-0">None yet.</p>
+            }
+            else
+            {
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Registration No.</th>
+                                <th>Country</th>
+                                <th>Address</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var m in _manufacturers.OrderBy(m => m.Name, StringComparer.OrdinalIgnoreCase))
+                            {
+                                <tr>
+                                    <td>@m.Name</td>
+                                    <td>@m.RegistrationNumber</td>
+                                    <td>@m.Country</td>
+                                    <td>@m.Address</td>
+                                    <td class="text-end" style="white-space: nowrap;">
+                                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="me-2" @onclick="() => StartManufacturerEdit(m)">
+                                            Edit
+                                        </Button>
+                                        @if (_pendingDeleteManufacturerName == m.Name)
+                                        {
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" @onclick="() => DeleteManufacturerAsync(m.Name)">
+                                                Confirm?
+                                            </Button>
+                                        }
+                                        else
+                                        {
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" @onclick="() => _pendingDeleteManufacturerName = m.Name">
+                                                Delete
+                                            </Button>
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </CardBody>
+    </Card>
+
+    <Card Class="mb-4">
+        <CardHeader>@(_editingFda510kNumber is null ? "Add 510(k)" : $"Edit \"{_editingFda510kNumber}\"")</CardHeader>
+        <CardBody>
+            @if (!string.IsNullOrEmpty(_fda510kFormError))
+            {
+                <Callout Color="CalloutColor.Danger" Class="mb-3">@_fda510kFormError</Callout>
+            }
+            <div class="row g-3 mb-3">
+                <div class="col-md-3">
+                    <label class="form-label">Number</label>
+                    <input class="form-control" placeholder="e.g. K131780" @bind-value="_fda510kFormNumber" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">FDA Product Code</label>
+                    <input class="form-control" @bind-value="_fda510kFormProductCode" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">Regulation No.</label>
+                    <input class="form-control" @bind-value="_fda510kFormRegulationNumber" />
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">FDA Page URL</label>
+                    <input class="form-control" @bind-value="_fda510kFormPageUrl" />
+                </div>
+            </div>
+            <div class="d-flex gap-2">
+                <Button Color="ButtonColor.Primary" Disabled="_savingFda510k" @onclick="SaveFda510kAsync">
+                    @(_savingFda510k ? "Saving..." : _editingFda510kNumber is null ? "Add 510(k)" : "Save Changes")
+                </Button>
+                @if (_editingFda510kNumber is not null)
+                {
+                    <Button Color="ButtonColor.Secondary" Outline="true" Disabled="_savingFda510k" @onclick="CancelFda510kEdit">
+                        Cancel
+                    </Button>
+                }
+            </div>
+        </CardBody>
+    </Card>
+
+    <Card Class="mb-4">
+        <CardHeader>FDA 510(k)s (@_fda510ks.Count)</CardHeader>
+        <CardBody>
+            @if (_fda510ks.Count == 0)
+            {
+                <p class="text-muted small mb-0">None yet.</p>
+            }
+            else
+            {
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead>
+                            <tr>
+                                <th>Number</th>
+                                <th>FDA Product Code</th>
+                                <th>Regulation No.</th>
+                                <th>FDA Page URL</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var f in _fda510ks.OrderBy(f => f.Number, StringComparer.OrdinalIgnoreCase))
+                            {
+                                <tr>
+                                    <td>@f.Number</td>
+                                    <td>@f.ProductCode</td>
+                                    <td>@f.RegulationNumber</td>
+                                    <td>@f.PageUrl</td>
+                                    <td class="text-end" style="white-space: nowrap;">
+                                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="me-2" @onclick="() => StartFda510kEdit(f)">
+                                            Edit
+                                        </Button>
+                                        @if (_pendingDeleteFda510kNumber == f.Number)
+                                        {
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" @onclick="() => DeleteFda510kAsync(f.Number)">
+                                                Confirm?
+                                            </Button>
+                                        }
+                                        else
+                                        {
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" @onclick="() => _pendingDeleteFda510kNumber = f.Number">
+                                                Delete
+                                            </Button>
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </CardBody>
+    </Card>
+}
+
+@code {
+    private bool _loading = true;
+    private List<CustomsManufacturer> _manufacturers = new();
+    private List<CustomsFda510k> _fda510ks = new();
+    private List<CustomsModel> _models = new();
+
+    // ── Model add/edit ───────────────────────────────────────────────────
+
+    private int? _editingModelId;
+    private int? _selectedModelId;
+    private string _formModelLabel = "";
+    private string _formManufacturerName = "";
+    private string _formFda510kNumber = "";
+    private string _formType = "";
+    private string _formHtsCode = "";
+    private string _formDeviceListingNumber = "";
+    private string _formDeclaredValue = "";
+    private string _formWeight = "";
+    private string? _formError;
+    private bool _saving;
+    private int? _pendingDeleteModelId;
+
+    private string _newManufacturerAddress = "";
+    private string _newManufacturerRegistrationNumber = "";
+    private string _newManufacturerCountry = "";
+
+    private string _newFda510kProductCode = "";
+    private string _newFda510kRegulationNumber = "";
+    private string _newFda510kPageUrl = "";
+
+    private string _modelQuery = "";
+    private bool _modelSearching;
+    private List<(int Id, string Label)> _modelHits = new();
+    private CancellationTokenSource? _modelSearchCts;
+
+    // ── Manufacturer add/edit ────────────────────────────────────────────
+
+    private string? _editingManufacturerName;
+    private string _manufacturerFormName = "";
+    private string _manufacturerFormAddress = "";
+    private string _manufacturerFormRegistrationNumber = "";
+    private string _manufacturerFormCountry = "";
+    private string _manufacturerFormFdaEstablishmentPageUrl = "";
+    private string? _manufacturerFormError;
+    private bool _savingManufacturer;
+    private string? _pendingDeleteManufacturerName;
+
+    // ── 510(k) add/edit ───────────────────────────────────────────────────
+
+    private string? _editingFda510kNumber;
+    private string _fda510kFormNumber = "";
+    private string _fda510kFormProductCode = "";
+    private string _fda510kFormRegulationNumber = "";
+    private string _fda510kFormPageUrl = "";
+    private string? _fda510kFormError;
+    private bool _savingFda510k;
+    private string? _pendingDeleteFda510kNumber;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        await ReloadAsync();
+    }
+
+    private async Task ReloadAsync()
+    {
+        var data = await CustomsInfo.LoadAsync();
+        _manufacturers = data.Manufacturers;
+        _fda510ks = data.Fda510ks;
+        _models = data.Models;
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private CustomsManufacturer? FindManufacturer(string name) =>
+        string.IsNullOrWhiteSpace(name)
+            ? null
+            : _manufacturers.FirstOrDefault(m => m.Name.Equals(name.Trim(), StringComparison.OrdinalIgnoreCase));
+
+    private CustomsFda510k? FindFda510k(string number) =>
+        string.IsNullOrWhiteSpace(number)
+            ? null
+            : _fda510ks.FirstOrDefault(f => f.Number.Equals(number.Trim(), StringComparison.OrdinalIgnoreCase));
+
+    // ── Model search (JMS) ───────────────────────────────────────────────
+
+    // Deliberately synchronous (not async) — the debounce+search runs detached in
+    // SearchModelsAfterDelayAsync rather than being awaited here. Awaiting it inline used to
+    // block Blazor Server's per-circuit event queue from processing the *next* keystroke until
+    // this one's 250ms delay + network search finished; that queued keystroke's eventual render
+    // then landed late, showing this handler's now-stale _modelQuery and visibly deleting
+    // whatever had been typed since. Returning immediately keeps every keystroke processed in
+    // near real time, so _modelQuery is always current by the time any render actually happens.
+    private void OnModelSearchInput(ChangeEventArgs e)
+    {
+        _modelQuery = e.Value?.ToString() ?? "";
+        _modelHits.Clear();
+
+        _modelSearchCts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _modelSearchCts = cts;
+
+        if (_modelQuery.Trim().Length < 2)
+        {
+            _modelSearching = false;
+            return;
+        }
+
+        _modelSearching = true;
+        _ = SearchModelsAfterDelayAsync(_modelQuery.Trim(), cts);
+    }
+
+    private async Task SearchModelsAfterDelayAsync(string term, CancellationTokenSource cts)
+    {
+        try
+        {
+            await Task.Delay(250, cts.Token);
+            var rows = await ScopeLookup.SearchModelsAsync(term);
+            if (cts.Token.IsCancellationRequested) return;
+
+            _modelHits = rows
+                .Where(r => !_models.Any(m => m.ModelId == r.ModelId))
+                .Select(r => (r.ModelId, string.IsNullOrWhiteSpace(r.Label) ? $"({r.ModelId})" : $"{r.Label} ({r.ModelId})"))
+                .ToList();
+            _modelSearching = false;
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (TaskCanceledException) { }
+    }
+
+    private void SelectModel(int modelId, string label)
+    {
+        _selectedModelId = modelId;
+        _formModelLabel = label;
+        _modelQuery = "";
+        _modelHits.Clear();
+    }
+
+    // ── Model add/edit/delete ────────────────────────────────────────────
+
+    private void StartModelEdit(CustomsModel m)
+    {
+        _editingModelId = m.ModelId;
+        _selectedModelId = m.ModelId;
+        _formModelLabel = m.ModelLabel;
+        _formManufacturerName = m.ManufacturerName;
+        _formFda510kNumber = m.Fda510kNumber;
+        _formType = m.Type;
+        _formHtsCode = m.HtsCode;
+        _formDeviceListingNumber = m.DeviceListingNumber;
+        _formDeclaredValue = m.DeclaredValue;
+        _formWeight = m.Weight;
+        _formError = null;
+    }
+
+    private void CancelModelEdit()
+    {
+        _editingModelId = null;
+        _selectedModelId = null;
+        _formModelLabel = "";
+        _formManufacturerName = "";
+        _formFda510kNumber = "";
+        _formType = "";
+        _formHtsCode = "";
+        _formDeviceListingNumber = "";
+        _formDeclaredValue = "";
+        _formWeight = "";
+        _formError = null;
+        _newManufacturerAddress = "";
+        _newManufacturerRegistrationNumber = "";
+        _newManufacturerCountry = "";
+        _newFda510kProductCode = "";
+        _newFda510kRegulationNumber = "";
+        _newFda510kPageUrl = "";
+        _modelQuery = "";
+        _modelHits.Clear();
+    }
+
+    private async Task SaveModelAsync()
+    {
+        _formError = null;
+
+        if (_selectedModelId is not int modelId)
+        {
+            _formError = "Search for and select a model.";
+            return;
+        }
+
+        var manufacturerName = _formManufacturerName.Trim();
+        if (string.IsNullOrWhiteSpace(manufacturerName))
+        {
+            _formError = "Enter a manufacturer.";
+            return;
+        }
+
+        var fda510kNumber = _formFda510kNumber.Trim();
+
+        var existingManufacturer = FindManufacturer(manufacturerName);
+        var newManufacturer = existingManufacturer is null
+            ? new CustomsManufacturer
+            {
+                Name = manufacturerName,
+                Address = _newManufacturerAddress.Trim(),
+                RegistrationNumber = _newManufacturerRegistrationNumber.Trim(),
+                Country = _newManufacturerCountry.Trim()
+            }
+            : null;
+
+        CustomsFda510k? newFda510k = null;
+        if (!string.IsNullOrWhiteSpace(fda510kNumber) && FindFda510k(fda510kNumber) is null)
+        {
+            newFda510k = new CustomsFda510k
+            {
+                Number = fda510kNumber,
+                ProductCode = _newFda510kProductCode.Trim(),
+                RegulationNumber = _newFda510kRegulationNumber.Trim(),
+                PageUrl = _newFda510kPageUrl.Trim()
+            };
+        }
+
+        var model = new CustomsModel
+        {
+            ModelId = modelId,
+            ModelLabel = _formModelLabel,
+            ManufacturerName = manufacturerName,
+            Fda510kNumber = fda510kNumber,
+            Type = _formType.Trim(),
+            HtsCode = _formHtsCode.Trim(),
+            DeviceListingNumber = _formDeviceListingNumber.Trim(),
+            DeclaredValue = _formDeclaredValue.Trim(),
+            Weight = _formWeight.Trim()
+        };
+
+        _saving = true;
+        StateHasChanged();
+
+        try
+        {
+            if (_editingModelId is null)
+                await CustomsInfo.AddModelAsync(model, newManufacturer, newFda510k);
+            else
+                await CustomsInfo.UpdateModelAsync(model, newManufacturer, newFda510k);
+
+            CancelModelEdit();
+            await ReloadAsync();
+        }
+        catch (InvalidOperationException ex)
+        {
+            _formError = ex.Message;
+        }
+        finally
+        {
+            _saving = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task DeleteModelAsync(int modelId)
+    {
+        _pendingDeleteModelId = null;
+        await CustomsInfo.RemoveModelAsync(modelId);
+        if (_editingModelId == modelId) CancelModelEdit();
+        await ReloadAsync();
+    }
+
+    // ── Manufacturer add/edit/delete ─────────────────────────────────────
+
+    private void StartManufacturerEdit(CustomsManufacturer m)
+    {
+        _editingManufacturerName = m.Name;
+        _manufacturerFormName = m.Name;
+        _manufacturerFormAddress = m.Address;
+        _manufacturerFormRegistrationNumber = m.RegistrationNumber;
+        _manufacturerFormCountry = m.Country;
+        _manufacturerFormFdaEstablishmentPageUrl = m.FdaEstablishmentPageUrl;
+        _manufacturerFormError = null;
+    }
+
+    private void CancelManufacturerEdit()
+    {
+        _editingManufacturerName = null;
+        _manufacturerFormName = "";
+        _manufacturerFormAddress = "";
+        _manufacturerFormRegistrationNumber = "";
+        _manufacturerFormCountry = "";
+        _manufacturerFormFdaEstablishmentPageUrl = "";
+        _manufacturerFormError = null;
+    }
+
+    private async Task SaveManufacturerAsync()
+    {
+        _manufacturerFormError = null;
+
+        var name = _manufacturerFormName.Trim();
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            _manufacturerFormError = "Enter a manufacturer name.";
+            return;
+        }
+
+        var manufacturer = new CustomsManufacturer
+        {
+            Name = name,
+            Address = _manufacturerFormAddress.Trim(),
+            RegistrationNumber = _manufacturerFormRegistrationNumber.Trim(),
+            Country = _manufacturerFormCountry.Trim(),
+            FdaEstablishmentPageUrl = _manufacturerFormFdaEstablishmentPageUrl.Trim()
+        };
+
+        _savingManufacturer = true;
+        StateHasChanged();
+
+        try
+        {
+            if (_editingManufacturerName is null)
+                await CustomsInfo.AddManufacturerAsync(manufacturer);
+            else
+                await CustomsInfo.UpdateManufacturerAsync(_editingManufacturerName, manufacturer);
+
+            CancelManufacturerEdit();
+            await ReloadAsync();
+        }
+        catch (InvalidOperationException ex)
+        {
+            _manufacturerFormError = ex.Message;
+        }
+        finally
+        {
+            _savingManufacturer = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task DeleteManufacturerAsync(string name)
+    {
+        _pendingDeleteManufacturerName = null;
+        await CustomsInfo.RemoveManufacturerAsync(name);
+        if (_editingManufacturerName == name) CancelManufacturerEdit();
+        await ReloadAsync();
+    }
+
+    // ── 510(k) add/edit/delete ────────────────────────────────────────────
+
+    private void StartFda510kEdit(CustomsFda510k f)
+    {
+        _editingFda510kNumber = f.Number;
+        _fda510kFormNumber = f.Number;
+        _fda510kFormProductCode = f.ProductCode;
+        _fda510kFormRegulationNumber = f.RegulationNumber;
+        _fda510kFormPageUrl = f.PageUrl;
+        _fda510kFormError = null;
+    }
+
+    private void CancelFda510kEdit()
+    {
+        _editingFda510kNumber = null;
+        _fda510kFormNumber = "";
+        _fda510kFormProductCode = "";
+        _fda510kFormRegulationNumber = "";
+        _fda510kFormPageUrl = "";
+        _fda510kFormError = null;
+    }
+
+    private async Task SaveFda510kAsync()
+    {
+        _fda510kFormError = null;
+
+        var number = _fda510kFormNumber.Trim();
+        if (string.IsNullOrWhiteSpace(number))
+        {
+            _fda510kFormError = "Enter a 510(k) number.";
+            return;
+        }
+
+        var fda510k = new CustomsFda510k
+        {
+            Number = number,
+            ProductCode = _fda510kFormProductCode.Trim(),
+            RegulationNumber = _fda510kFormRegulationNumber.Trim(),
+            PageUrl = _fda510kFormPageUrl.Trim()
+        };
+
+        _savingFda510k = true;
+        StateHasChanged();
+
+        try
+        {
+            if (_editingFda510kNumber is null)
+                await CustomsInfo.AddFda510kAsync(fda510k);
+            else
+                await CustomsInfo.UpdateFda510kAsync(_editingFda510kNumber, fda510k);
+
+            CancelFda510kEdit();
+            await ReloadAsync();
+        }
+        catch (InvalidOperationException ex)
+        {
+            _fda510kFormError = ex.Message;
+        }
+        finally
+        {
+            _savingFda510k = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task DeleteFda510kAsync(string number)
+    {
+        _pendingDeleteFda510kNumber = null;
+        await CustomsInfo.RemoveFda510kAsync(number);
+        if (_editingFda510kNumber == number) CancelFda510kEdit();
+        await ReloadAsync();
+    }
+
+}

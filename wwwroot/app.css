@@ -1,0 +1,113 @@
+/* ══════════════════════════════════════════════════════════════════════
+   House style additions on top of Bootstrap 5 + Blazor.Bootstrap.
+   Keep this file small — reach for Bootstrap/Blazor.Bootstrap utility
+   classes and components first; only add a rule here when the same need
+   shows up on several pages.
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* Every page's title + one-line description, right below the top bar. */
+.page-header {
+    margin-bottom: 1.5rem;
+}
+
+.page-header h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+}
+
+.page-header p {
+    margin-bottom: 0;
+}
+
+/* Staleness colouring shared by every "days since X" queue table
+   (Waiting Workshop Processing/Assignment, Waiting Quote Confirmation,
+   Stale Jobs, Shipping Checks, ...). Apply to the cell holding the date.
+   !important matches Bootstrap's own .text-danger/.text-warning utilities —
+   needed because Bootstrap's table-cell color rule (.table > :not(caption) >
+   * > *) is a more specific selector than a plain class and otherwise wins,
+   silently falling back to the theme's default (white in dark mode) text
+   colour instead. */
+.text-stale-warn {
+    color: #fbbf24 !important;
+}
+
+.text-stale-danger {
+    color: #f87171 !important;
+    font-weight: 600;
+}
+
+/* Headline stat tiles (Overview.razor). */
+.stat-icon {
+    font-size: 1.75rem;
+    line-height: 1;
+}
+
+.stat-value {
+    font-size: 1.75rem;
+    font-weight: 700;
+    line-height: 1.1;
+}
+
+.stat-label {
+    font-size: 0.8rem;
+}
+
+/* Bootstrap has no built-in cursor utility — used on clickable table rows. */
+.cursor-pointer {
+    cursor: pointer;
+}
+
+/* Workshop TV kiosk pages (WorkshopStatus, WorkshopNotifications) are read from across
+   the room, so everything rem-sized (text, padding, badges) scales with the screen: 24px
+   on a 1080p TV, 1.5x the desktop size. Only while a kiosk page is showing. */
+html:has(.kiosk-main) {
+    font-size: clamp(16px, 1.25vw, 40px);
+}
+
+/* The LAN address pill in the kiosk header, and the big device-pairing code. */
+.lan-pill {
+    font-size: 0.85rem;
+    padding: 0.35rem 0.75rem;
+    border: 1px solid var(--bs-border-color);
+    border-radius: var(--bs-border-radius);
+    color: var(--bs-secondary-color);
+}
+
+.pairing-code {
+    font-size: 6rem;
+    font-weight: 700;
+    letter-spacing: 0.3em;
+    font-family: var(--bs-font-monospace);
+}
+
+/* QR codes need real black-on-white contrast to scan reliably regardless of
+   the dashboard's theme, so this stays a fixed white box, not theme-aware. */
+.home-qr {
+    background: #fff;
+    padding: 4px;
+    border-radius: 6px;
+    line-height: 0;
+}
+
+    .home-qr svg {
+        display: block;
+        width: 3.5rem;
+        height: 3.5rem;
+    }
+
+/* Larger variants for the full-screen unpaired "waiting to pair" state,
+   read from across the room rather than glanced at in a small header. */
+.home-qr-lg {
+    padding: 16px;
+}
+
+    .home-qr-lg svg {
+        width: 220px;
+        height: 220px;
+    }
+
+.lan-pill-lg {
+    font-size: 1.5rem;
+    padding: 0.5rem 1.25rem;
+}

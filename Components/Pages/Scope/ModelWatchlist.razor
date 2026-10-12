@@ -1,0 +1,467 @@
+@page "/model-watchlist"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+
+@inherits JmsComponentBase
+@inject ModelWatchlistLookup WatchlistLookup
+@inject ScopeLookupService ScopeLookup
+@inject InterestedModelStore InterestedModels
+@inject JobOfferOverlayStore OfferOverlays
+@inject ScopeJobStore ScopeJobs
+@inject JobNotesService JobNotes
+@inject IgnoredJobStatusStore IgnoredStatuses
+
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Components.Forms
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Stores
+@using WorkshopDashboard.Models
+@using static WorkshopDashboard.Services.Admin.ScopeLabelFormatter
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    ModelWatchlist — buy-back/offer opportunity tracker.
+
+    Three pieces:
+      1. "Most repaired models, last 12 months" — pure reference: every scope job created in
+         the last year, grouped by model, ordered by count (JmsQueries.ModelRepairCountsQuery).
+         Read-only; each row has a quick "Watch" button so staff don't have to re-type a model
+         name they can already see here.
+      2. "Interested models" — a shared watchlist of model ids (InterestedModelStore), edited
+         via the same ExclusionSection component RepairerManager/ScopeCustomerManager use for
+         "search a model by name, add/remove chips." Each search hit shows its own last-12-month
+         job count too (JmsQueries.ModelRepairCountsQuery's modelIds filter).
+      3. "Open opportunities" — every open scope job carrying a watchlisted model
+         (JmsQueries.OpenScopeJobsForModelsQuery). A job JMS has already quoted shows that
+         quoted amount read-only; a job with no quote yet gets an editable cost-estimate box
+         instead. Either way there's a free-text "our offer" box — both are staff-entered
+         local notes (JobOfferOverlayStore, keyed by job_id), since JMS has no field for
+         either. A job stays on this list until someone hits Ignore, which writes a plain
+         JMS job note (JmsQueries.ModelWatchlistIgnoredNotePrefix, via JobNotesService) that
+         every future load filters back out — deliberately not quote/approval state, so the
+         list can't silently drop a job someone still cares about. "Lifetime repair spend" is
+         the invoiced total across every job the job's own equipment unit(s) have ever been
+         on (not just this one) — see OpenScopeJobsForModelsQuery's comment. Separately, a
+         persisted "Never show this status" filter (IgnoredJobStatusStore) hides entire job
+         statuses (e.g. Waiting Parts) from this list for everyone, until removed — distinct
+         from the per-job Ignore button above, which only dismisses one job.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Model Watchlist</h1>
+    <p class="text-muted">
+        Track models worth watching for buy-back/offer opportunities, and see the open scope
+        jobs for them.
+    </p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else
+{
+    <div class="row g-4 mb-4">
+        <div class="col-md-6">
+            <Card class="h-100">
+                <CardHeader>Most repaired models &middot; last 12 months</CardHeader>
+                <CardBody>
+                    @if (_topModels.Count == 0)
+                    {
+                        <p class="text-muted small mb-0">No jobs found in the last year.</p>
+                    }
+                    else
+                    {
+                        <div class="table-responsive" style="max-height:420px; overflow-y:auto;">
+                            <table class="table table-sm align-middle mb-0">
+                                <thead>
+                                    <tr>
+                                        <th>Model</th>
+                                        <th class="text-end">Jobs</th>
+                                        <th></th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var m in _topModels)
+                                    {
+                                        <tr>
+                                            <td>@LabelFor(m.ModelId)</td>
+                                            <td class="text-end">@m.JobCount</td>
+                                            <td class="text-end">
+                                                @if (_watchedModelIds.Contains(m.ModelId))
+                                                {
+                                                    <span class="text-muted small">Watching</span>
+                                                }
+                                                else
+                                                {
+                                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                                            @onclick="() => AddWatchedModel(m.ModelId)">
+                                                        Watch
+                                                    </Button>
+                                                }
+                                            </td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    }
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col-md-6">
+            <ExclusionSection Title="Interested models"
+                               Placeholder="Search model name..."
+                               Ids="_watchedModelIds.OrderBy(id => id).ToList()"
+                               Labels="_modelLabels"
+                               SearchAsync="SearchModelsAsync"
+                               OnAdd="AddWatchedModel"
+                               OnRemove="RemoveWatchedModel" />
+        </div>
+    </div>
+
+    <Card>
+        <CardHeader>Open opportunities</CardHeader>
+        <CardBody>
+            @if (_watchedModelIds.Count == 0)
+            {
+                <p class="text-muted small mb-0">Add a model above to see its open jobs here.</p>
+            }
+            else
+            {
+                <div class="d-flex flex-wrap gap-3 mb-2 align-items-end">
+                    <div style="max-width:360px;">
+                        <label class="form-label small mb-1">Filter</label>
+                        <input class="form-control form-control-sm" placeholder="Filter by job, owner, model, status, fault..."
+                               value="@_opportunityFilter" @oninput="@(e => _opportunityFilter = e.Value?.ToString() ?? "")" />
+                    </div>
+                    <div style="max-width:280px;">
+                        <label class="form-label small mb-1">Never show this status</label>
+                        <div class="d-flex gap-1">
+                            <select class="form-select form-select-sm" value="@_statusToIgnore"
+                                    @onchange="@(e => _statusToIgnore = e.Value?.ToString() ?? "")">
+                                <option value="">Select a status...</option>
+                                @foreach (var s in _allStatuses.Where(s => !_ignoredStatusIds.Contains(s.Id)).OrderBy(s => s.Name))
+                                {
+                                    <option value="@s.Id">@s.Name</option>
+                                }
+                            </select>
+                            <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                    Disabled="@string.IsNullOrEmpty(_statusToIgnore)"
+                                    @onclick="AddIgnoredStatusAsync">
+                                Add
+                            </Button>
+                        </div>
+                    </div>
+                </div>
+
+                @if (_ignoredStatusIds.Count > 0)
+                {
+                    <div class="mb-3 d-flex flex-wrap gap-2">
+                        @foreach (var id in _ignoredStatusIds.OrderBy(x => x))
+                        {
+                            <span class="badge bg-secondary d-flex align-items-center gap-2">
+                                @StatusNameFor(id)
+                                <a href="javascript:void(0)" class="text-white text-decoration-none" title="Stop ignoring"
+                                   @onclick="() => RemoveIgnoredStatusAsync(id)">&times;</a>
+                            </span>
+                        }
+                    </div>
+                }
+
+                @if (_opportunities.Count == 0)
+                {
+                    <p class="text-muted small mb-0">No open jobs for any watched model right now.</p>
+                }
+                else if (FilteredOpportunities.Count == 0)
+                {
+                    <p class="text-muted small mb-0">No jobs match "@_opportunityFilter".</p>
+                }
+                else
+                {
+                    <div class="table-responsive">
+                        <table class="table table-sm align-middle">
+                            <thead>
+                                <tr>
+                                    <th>Job</th>
+                                    <th>Owner</th>
+                                    <th>Model</th>
+                                    <th>Serial</th>
+                                    <th>Status</th>
+                                    <th>Created</th>
+                                    <th>Cost</th>
+                                    <th>Lifetime repair spend</th>
+                                    <th style="min-width:260px;">Our offer</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var job in FilteredOpportunities)
+                                {
+                                    <tr>
+                                        <td>
+                                            <a href="@JmsLinks.JobSummary(job.JobId)"
+                                               target="_blank" rel="noopener noreferrer">@job.JobId</a>
+                                        </td>
+                                        <td class="small">@job.Owner</td>
+                                        <td class="small">
+                                            @(job.ModelIds.Count == 0 ? "—" : string.Join(", ", job.ModelIds.Select(LabelFor)))
+                                        </td>
+                                        <td class="small">
+                                            @(job.SerialNumbers.Count == 0 ? "—" : string.Join(", ", job.SerialNumbers))
+                                        </td>
+                                        <td class="small">@job.Status</td>
+                                        <td class="small">
+                                            @job.Created.ToString("dd MMM yyyy")
+                                            <div class="text-muted">@DaysAgoText(job.Created)</div>
+                                        </td>
+                                        <td style="min-width:160px;">
+                                            @if (job.QuotedAmount is { } amount)
+                                            {
+                                                <div class="small">Quoted @amount.ToString("C")</div>
+                                                <div class="text-muted small">@(job.QuotedDate?.ToString("dd MMM yyyy"))</div>
+                                            }
+                                            else
+                                            {
+                                                <input class="form-control form-control-sm" type="number" step="0.01"
+                                                       placeholder="Estimate $"
+                                                       value="@GetCostInput(job.JobId)"
+                                                       @oninput="@(e => SetCostInput(job.JobId, e.Value?.ToString()))" />
+                                            }
+                                        </td>
+                                        <td class="small">
+                                            @if (job.TotalSpentJobs == 0)
+                                            {
+                                                <span class="text-muted">—</span>
+                                            }
+                                            else
+                                            {
+                                                <div>@job.TotalSpent.ToString("C")</div>
+                                                <div class="text-muted">across @job.TotalSpentJobs invoice@(job.TotalSpentJobs == 1 ? "" : "s")</div>
+                                            }
+                                        </td>
+                                        <td>
+                                            <textarea class="form-control form-control-sm" rows="2"
+                                                      placeholder="Offer notes..."
+                                                      value="@GetOfferInput(job.JobId)"
+                                                      @oninput="@(e => SetOfferInput(job.JobId, e.Value?.ToString()))"></textarea>
+                                        </td>
+                                        <td class="text-end">
+                                            <div class="d-flex flex-column gap-1">
+                                                <Button Size="ButtonSize.Small" Color="ButtonColor.Primary" Outline="true"
+                                                        Disabled="@(_saving == job.JobId)"
+                                                        @onclick="() => SaveOverlayAsync(job.JobId)">
+                                                    @(_saving == job.JobId ? "..." : "Save")
+                                                </Button>
+                                                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                                        Disabled="@(_ignoring == job.JobId)"
+                                                        @onclick="() => IgnoreJobAsync(job.JobId)">
+                                                    @(_ignoring == job.JobId ? "..." : "Ignore")
+                                                </Button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+            }
+        </CardBody>
+    </Card>
+}
+
+@code {
+    private static readonly DateTime PeriodStart = DateTime.Today.AddYears(-1);
+
+    private bool _loading = true;
+
+    private List<ModelRepairCount> _topModels = new();
+    private HashSet<int> _watchedModelIds = new();
+    private Dictionary<int, string> _modelLabels = new();
+    private List<WatchlistJobRow> _opportunities = new();
+    private List<JobOfferOverlay> _overlays = new();
+
+    private readonly Dictionary<int, string> _costInputs = new();
+    private readonly Dictionary<int, string> _offerInputs = new();
+    private int? _saving;
+    private int? _ignoring;
+    private string _opportunityFilter = "";
+
+    private List<JobStatusOption> _allStatuses = new();
+    private HashSet<int> _ignoredStatusIds = new();
+    private string _statusToIgnore = "";
+
+    private ScopeJobExclusions _exclusions = new();
+
+    private List<WatchlistJobRow> FilteredOpportunities =>
+        string.IsNullOrWhiteSpace(_opportunityFilter)
+            ? _opportunities
+            : _opportunities.Where(j =>
+                j.JobId.ToString().Contains(_opportunityFilter, StringComparison.OrdinalIgnoreCase) ||
+                j.Owner.Contains(_opportunityFilter, StringComparison.OrdinalIgnoreCase) ||
+                j.Status.Contains(_opportunityFilter, StringComparison.OrdinalIgnoreCase) ||
+                j.Fault.Contains(_opportunityFilter, StringComparison.OrdinalIgnoreCase) ||
+                j.ModelIds.Any(id => LabelFor(id).Contains(_opportunityFilter, StringComparison.OrdinalIgnoreCase)) ||
+                j.SerialNumbers.Any(s => s.Contains(_opportunityFilter, StringComparison.OrdinalIgnoreCase)))
+              .ToList();
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+
+        _exclusions = await ScopeJobs.LoadAsync();
+        _topModels = await WatchlistLookup.GetModelRepairCountsAsync(PeriodStart, _exclusions);
+        _watchedModelIds = await InterestedModels.LoadAsync();
+        _allStatuses = await WatchlistLookup.GetAllJobStatusesAsync();
+        _ignoredStatusIds = await IgnoredStatuses.LoadAsync();
+
+        await RefreshModelLabelsAsync();
+        await RefreshOpportunitiesAsync();
+
+        _loading = false;
+    }
+
+    private async Task RefreshModelLabelsAsync()
+    {
+        var ids = _topModels.Select(m => m.ModelId).Concat(_watchedModelIds).Distinct().ToList();
+        var rows = await ScopeLookup.GetModelLabelsAsync(ids);
+        _modelLabels = rows.ToDictionary(r => r.ModelId, r => FormatModelLabel(r.ModelId, r.Label));
+    }
+
+    private async Task RefreshOpportunitiesAsync()
+    {
+        _opportunities = await WatchlistLookup.GetOpenJobsAsync(_watchedModelIds, _exclusions, _ignoredStatusIds);
+        _overlays = await OfferOverlays.LoadAsync();
+
+        var moreModelIds = _opportunities.SelectMany(j => j.ModelIds).Except(_modelLabels.Keys).Distinct().ToList();
+        if (moreModelIds.Count > 0)
+        {
+            var rows = await ScopeLookup.GetModelLabelsAsync(moreModelIds);
+            foreach (var r in rows) _modelLabels[r.ModelId] = FormatModelLabel(r.ModelId, r.Label);
+        }
+
+        _costInputs.Clear();
+        _offerInputs.Clear();
+        foreach (var o in _overlays)
+        {
+            if (o.RepairCostEstimate is { } cost) _costInputs[o.JobId] = cost.ToString("0.00");
+            if (!string.IsNullOrEmpty(o.OfferEstimate)) _offerInputs[o.JobId] = o.OfferEstimate;
+        }
+    }
+
+    private async Task<List<(int Id, string Label)>> SearchModelsAsync(string term)
+    {
+        var rows = await ScopeLookup.SearchModelsAsync(term);
+        if (rows.Count == 0) return new();
+
+        var counts = await WatchlistLookup.GetModelRepairCountsAsync(PeriodStart, _exclusions, rows.Select(r => r.ModelId).ToList());
+        var countByModel = counts.ToDictionary(c => c.ModelId, c => c.JobCount);
+
+        return rows.Select(r =>
+        {
+            var count = countByModel.GetValueOrDefault(r.ModelId, 0);
+            var label = $"{FormatModelLabel(r.ModelId, r.Label)} — {count} job{(count == 1 ? "" : "s")}/yr";
+            return (r.ModelId, label);
+        }).ToList();
+    }
+
+    private async Task AddWatchedModel(int modelId)
+    {
+        if (!_watchedModelIds.Add(modelId)) return;
+        await InterestedModels.AddAsync(modelId);
+        await RefreshModelLabelsAsync();
+        await RefreshOpportunitiesAsync();
+    }
+
+    private async Task RemoveWatchedModel(int modelId)
+    {
+        _watchedModelIds.Remove(modelId);
+        await InterestedModels.RemoveAsync(modelId);
+        await RefreshOpportunitiesAsync();
+    }
+
+    private string GetCostInput(int jobId) => _costInputs.GetValueOrDefault(jobId, "");
+    private void SetCostInput(int jobId, string? value) => _costInputs[jobId] = value ?? "";
+
+    private string GetOfferInput(int jobId) => _offerInputs.GetValueOrDefault(jobId, "");
+    private void SetOfferInput(int jobId, string? value) => _offerInputs[jobId] = value ?? "";
+
+    private async Task SaveOverlayAsync(int jobId)
+    {
+        _saving = jobId;
+        try
+        {
+            decimal? cost = null;
+            var rawCost = _costInputs.GetValueOrDefault(jobId, "");
+            if (!string.IsNullOrWhiteSpace(rawCost) && decimal.TryParse(rawCost, out var parsed)) cost = parsed;
+
+            await OfferOverlays.UpsertAsync(new JobOfferOverlay
+            {
+                JobId = jobId,
+                RepairCostEstimate = cost,
+                OfferEstimate = string.IsNullOrWhiteSpace(_offerInputs.GetValueOrDefault(jobId, "")) ? null : _offerInputs[jobId],
+                UpdatedAt = DateTime.UtcNow
+            });
+        }
+        finally
+        {
+            _saving = null;
+        }
+    }
+
+    private async Task IgnoreJobAsync(int jobId)
+    {
+        _ignoring = jobId;
+        try
+        {
+            var ok = await JobNotes.AddUntaggedNoteAsync(jobId, JmsQueries.ModelWatchlistIgnoredNotePrefix);
+            if (ok) _opportunities.RemoveAll(j => j.JobId == jobId);
+        }
+        finally
+        {
+            _ignoring = null;
+        }
+    }
+
+    private async Task AddIgnoredStatusAsync()
+    {
+        if (!int.TryParse(_statusToIgnore, out var statusId)) return;
+
+        _statusToIgnore = "";
+        if (!_ignoredStatusIds.Add(statusId)) return;
+
+        await IgnoredStatuses.AddAsync(statusId);
+        await RefreshOpportunitiesAsync();
+    }
+
+    private async Task RemoveIgnoredStatusAsync(int statusId)
+    {
+        _ignoredStatusIds.Remove(statusId);
+        await IgnoredStatuses.RemoveAsync(statusId);
+        await RefreshOpportunitiesAsync();
+    }
+
+    private string StatusNameFor(int id) =>
+        _allStatuses.FirstOrDefault(s => s.Id == id)?.Name ?? $"Status {id}";
+
+    private static string DaysAgoText(DateTime created)
+    {
+        var days = (int)Math.Floor((DateTime.Today - created.Date).TotalDays);
+        return days switch
+        {
+            <= 0 => "today",
+            1 => "1 day ago",
+            _ => $"{days} days ago"
+        };
+    }
+
+    private string LabelFor(int id) =>
+        _modelLabels.TryGetValue(id, out var label) && !string.IsNullOrWhiteSpace(label) ? label : $"({id})";
+}

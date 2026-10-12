@@ -1,0 +1,446 @@
+@page "/workshop-finalisation-complete"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@implements IDisposable
+@inject ScopeJobStore ScopeJobs
+@inject WorkshopQueueLookup Jobs
+@inject TrackingService TrackingService
+@inject JobStatusActionService StatusAction
+@inject ILogger<WorkshopFinalisationComplete> Logger
+
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.External.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using WorkshopDashboard.Models
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    WorkshopFinalisationComplete — the repairer's finished with the unit and
+    is shipping it back to the workshop. Same tracking-table shape as
+    WaitingWorkshopAssignment (repairer -> workshop leg there too, in the outward
+    direction), but the tracking number usually arrives by email rather than
+    showing up in JMS automatically, so a row with none yet gets an inline
+    Carrier + connote entry form instead of just "N/A".
+
+    ── Services ─────────────────────────────────────────────────────────────
+      ScopeJobs      — ScopeJobStore: excluded-model list applied to the queue
+      Jobs           — WorkshopQueueLookup: GetWorkshopFinalisationCompleteJobsAsync
+      TrackingService — same ExtractTracking/GetTrackingAsync/KnownCarrierPrefixes
+                        WaitingWorkshopAssignment uses; FedEx is a live tracker
+                        here since most repairers ship back via FedEx
+      StatusAction   — JobStatusActionService: AddNoteServiceAsync records the
+                       manually-entered tracking as a $0 NOTE service (not a
+                       charge — see JmsQueries.WorkshopFinalisationCompleteQuery);
+                       DeleteJobServiceAsync undoes one typed in wrong
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      Same load/fetch/cancel shape as WaitingWorkshopAssignment. SaveTrackingAsync
+      posts the manual Carrier/connote entry, then re-runs LoadJobsAsync — a
+      full re-pull rather than a local patch, so the freshly-created service
+      row is what's actually rendered next (same reasoning WaitingWorkshopProcessing's
+      SaveEtaAsync uses). The query also returns that service's own id
+      (tracking_service_id) so the ✕ next to a recorded tracking number can
+      delete exactly that row via RemoveTrackingAsync, falling back to the
+      entry form again — without it, deleting would have meant guessing
+      which of the job's NOTE services was the tracking one.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Workshop Finalisation Complete</h1>
+    <p class="text-muted">Jobs the repairer has finished and is shipping back to the workshop. Oldest first.</p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else if (_jobs.Count == 0)
+{
+    <Callout Color="CalloutColor.Info">No jobs in this queue.</Callout>
+}
+else
+{
+    <p class="text-muted">@_jobs.Count job(s) in queue.</p>
+    <table class="table table-striped align-middle">
+        <thead>
+            <tr>
+                <th>Job ID</th>
+                <th style="min-width:220px;">Tracking</th>
+                <th>Live Status</th>
+                <th>Owner</th>
+                <th>Equipment</th>
+                <th>Fault</th>
+                <th>Last Status Change</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var job in _jobs)
+            {
+                <tr>
+                    <td>
+                        <a href="@JmsLinks.JobSummary(job.JobId)"
+                           target="_blank" rel="noopener noreferrer">@job.JobId</a>
+                    </td>
+                    <td>
+                        @if (!string.IsNullOrWhiteSpace(job.TrackingNumber) && TrackingUrl(job) is { } trackingUrl)
+                        {
+                            <div class="d-flex align-items-center gap-1">
+                                <a href="@trackingUrl"
+                                   target="_blank" rel="noopener noreferrer"
+                                   class="badge @CarrierBadgeClass(job.Carrier) text-decoration-none">
+                                    📦 @job.Carrier @job.TrackingNumber
+                                </a>
+                                @if (job.TrackingServiceId is not null)
+                                {
+                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true"
+                                            Disabled="job.RemovingTracking" Class="py-0 px-1"
+                                            title="Remove — re-enter if this was typed wrong"
+                                            @onclick="() => RemoveTrackingAsync(job)">
+                                        @(job.RemovingTracking ? "..." : "✕")
+                                    </Button>
+                                }
+                            </div>
+                        }
+                        else if (!string.IsNullOrWhiteSpace(job.TrackingNumber))
+                        {
+                            <div class="d-flex align-items-center gap-1">
+                                <span class="badge @CarrierBadgeClass(job.Carrier)">
+                                    📦 @job.Carrier @job.TrackingNumber
+                                </span>
+                                @if (job.TrackingServiceId is not null)
+                                {
+                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true"
+                                            Disabled="job.RemovingTracking" Class="py-0 px-1"
+                                            title="Remove — re-enter if this was typed wrong"
+                                            @onclick="() => RemoveTrackingAsync(job)">
+                                        @(job.RemovingTracking ? "..." : "✕")
+                                    </Button>
+                                }
+                            </div>
+                        }
+                        else
+                        {
+                            <div class="d-flex gap-1">
+                                <select class="form-select form-select-sm" style="width:auto;" @bind="job.ManualCarrier">
+                                    @foreach (var c in TrackingService.KnownCarrierPrefixes)
+                                    {
+                                        <option value="@c">@c</option>
+                                    }
+                                </select>
+                                <input class="form-control form-control-sm" style="width:140px;"
+                                       placeholder="Connote"
+                                       @bind="job.ManualConnote" @bind:event="oninput" />
+                                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                        Disabled="@(job.SavingTracking || string.IsNullOrWhiteSpace(job.ManualConnote))"
+                                        @onclick="() => SaveTrackingAsync(job)">
+                                    @(job.SavingTracking ? "..." : "Save")
+                                </Button>
+                            </div>
+                        }
+                    </td>
+                    <td>
+                        @if (!string.IsNullOrWhiteSpace(job.TrackingNumber))
+                        {
+                            <span class="badge @GetStatusBadgeClass(job)">
+                                @job.LiveStatus
+                            </span>
+                            @if (job.IsDelivered && job.DeliveredAt.HasValue)
+                            {
+                                <div class="small text-muted mt-1">@DeliveredAgoText(job.DeliveredAt.Value)</div>
+                            }
+                            else if (job.InTransitSince.HasValue)
+                            {
+                                <div class="small text-muted mt-1">@InTransitText(job.InTransitSince.Value)</div>
+                            }
+                        }
+                        else
+                        {
+                            <span class="text-muted small">—</span>
+                        }
+                    </td>
+                    <td>@job.Owner</td>
+                    <td>@job.Equipment</td>
+                    <td>@job.Fault</td>
+                    <td class="@StatusAgeClass(job.LastStatusChange)">
+                        @job.LastStatusChange.ToString("dd MMM yyyy")
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+}
+
+@code {
+    // A shipment sitting as "Delivered" for longer than this many days is flagged red.
+    private const double DeliveredStaleDays = 3;
+
+    private bool _loading = true;
+    private List<JobRow> _jobs = new();
+
+    // Tracking lookups queue behind the rate limiter, so a full page can take a while to
+    // fill in. That is long enough for someone to navigate away mid-flight, so the work
+    // needs to be cancellable rather than left calling StateHasChanged on a dead circuit.
+    private CancellationTokenSource? _cts;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        _cts = new CancellationTokenSource();
+        await LoadJobsAsync();
+    }
+
+    private async Task LoadJobsAsync()
+    {
+        var exclusions = await ScopeJobs.LoadAsync();
+        var jobs = await Jobs.GetWorkshopFinalisationCompleteJobsAsync(exclusions);
+
+        _jobs = jobs
+            .Select(j =>
+            {
+                var (number, carrier) = TrackingService.ExtractTracking(j.TrackingRaw);
+                return new JobRow
+                    {
+                        JobId = j.JobId,
+                        TrackingNumber = number ?? "",
+                        Carrier = carrier ?? "",
+                        TrackingServiceId = j.TrackingServiceId,
+                        LiveStatus = !string.IsNullOrWhiteSpace(number) ? "Loading..." : "",
+                        Owner = j.Owner,
+                        Equipment = j.Equipment,
+                        Fault = j.Fault,
+                        LastStatusChange = j.LastStatusChange
+                    };
+            })
+            .ToList();
+
+        _loading = false;
+        StateHasChanged();
+
+        // Fire off the tracking lookups in the background. Nothing awaits this, so it has to
+        // catch its own exceptions — an unawaited faulted task just disappears silently.
+        _ = SafeFetchLiveStatusesAsync();
+    }
+
+    private async Task SafeFetchLiveStatusesAsync()
+    {
+        try
+        {
+            await FetchLiveStatusesAsync(_cts?.Token ?? CancellationToken.None);
+        }
+        catch (OperationCanceledException)
+        {
+            // Navigated away while lookups were still queued. Expected, not an error.
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Tracking fetch failed");
+        }
+    }
+
+    // One lookup per consignment rather than per job: two jobs can share a shipment, and
+    // every duplicate costs a request against a carrier's rate limit.
+    private async Task FetchLiveStatusesAsync(CancellationToken ct)
+    {
+        var trackingTasks = _jobs
+            .Where(j => !string.IsNullOrWhiteSpace(j.TrackingNumber))
+            .GroupBy(j => (j.Carrier, j.TrackingNumber))
+            .Select(async group =>
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var r = await TrackingService.GetTrackingAsync(group.Key.TrackingNumber, group.Key.Carrier);
+                foreach (var job in group)
+                    ApplyResult(job, r);
+
+                // The circuit may have gone away while this was sat in the limiter queue.
+                if (ct.IsCancellationRequested) return;
+                await InvokeAsync(StateHasChanged);
+            });
+
+        await Task.WhenAll(trackingTasks);
+    }
+
+    private static void ApplyResult(JobRow job, TrackingResult r)
+    {
+        job.LiveStatus = string.IsNullOrWhiteSpace(r.Status) ? "Unknown" : r.Status;
+        job.IsDelivered = r.IsDelivered;
+        job.DeliveredAt = r.IsDelivered ? r.LastEventTime : null;
+        job.InTransitSince = r.IsDelivered ? null : r.FirstEventTime;
+    }
+
+    // ── Manual tracking entry ────────────────────────────────────────────────
+
+    private async Task SaveTrackingAsync(JobRow job)
+    {
+        var connote = job.ManualConnote?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(connote)) return;
+
+        job.SavingTracking = true;
+        StateHasChanged();
+
+        try
+        {
+            var description = $"{job.ManualCarrier}: {connote}";
+            var res = await StatusAction.AddNoteServiceAsync(int.Parse(job.JobId), description);
+
+            // Re-pull from JMS rather than assuming success locally — same reasoning
+            // WaitingWorkshopProcessing's SaveEtaAsync uses.
+            if (res is { Success: true })
+                await LoadJobsAsync();
+        }
+        finally
+        {
+            job.SavingTracking = false;
+            StateHasChanged();
+        }
+    }
+
+    // Undoes a wrongly-entered tracking note — deletes the underlying service by id, then
+    // re-pulls so the row falls back to the manual-entry form (same re-pull reasoning as
+    // SaveTrackingAsync above).
+    private async Task RemoveTrackingAsync(JobRow job)
+    {
+        if (job.TrackingServiceId is not int serviceId) return;
+
+        job.RemovingTracking = true;
+        StateHasChanged();
+
+        try
+        {
+            var res = await StatusAction.DeleteJobServiceAsync(int.Parse(job.JobId), serviceId);
+            if (res is { Success: true })
+                await LoadJobsAsync();
+        }
+        finally
+        {
+            job.RemovingTracking = false;
+            StateHasChanged();
+        }
+    }
+
+    // JMLA (login-gated portal) and Smartways have no public tracking page to link
+    // to — null means "show the badge as plain text, not a link" (see markup above).
+    private static string? TrackingUrl(JobRow job)
+    {
+        var num = Uri.EscapeDataString(job.TrackingNumber);
+        return job.Carrier switch
+        {
+            "TNT" => $"https://www.tnt.com/express/en_au/site/shipping-tools/tracking.html?searchType=CON&cons={num}",
+            "DHL" => $"https://www.dhl.com/au-en/home/tracking/tracking-express.html?submit=1&tracking-id={num}",
+            "FedEx" => $"https://www.fedex.com/fedextrack/?trknbr={num}",
+            _ => null
+        };
+    }
+
+    private static string CarrierBadgeClass(string carrier) => carrier switch
+    {
+        "TNT" => "bg-warning text-dark",
+        "DHL" => "bg-dark text-white",
+        "FedEx" => "bg-primary text-white",
+        _ => "bg-secondary text-white"
+    };
+
+    private static string GetStatusBadgeClass(JobRow job)
+    {
+        if (job.LiveStatus == "Loading...") return "bg-light text-dark";
+
+        if (job.IsDelivered)
+        {
+            // Delivered and sitting too long -> red; delivered normally -> yellow.
+            if (job.DeliveredAt.HasValue
+                && (DateTime.Now - job.DeliveredAt.Value).TotalDays > DeliveredStaleDays)
+            {
+                return "bg-danger text-white";
+            }
+            return "bg-warning text-dark";
+        }
+
+        return job.LiveStatus switch
+        {
+            "In Transit" => "bg-info text-dark",
+            "Out for Delivery" => "bg-info text-dark",
+            "Booked" => "bg-secondary text-white",
+            "Picked Up" => "bg-info text-dark",
+            "Delivery Attempted" => "bg-warning text-dark",
+            "Delivery Exception" => "bg-danger text-white",
+            "Cancelled" => "bg-secondary text-white",
+            "Not Found" => "bg-secondary text-white",
+            "Not found" => "bg-secondary text-white",
+            "Unavailable" => "bg-secondary text-white",
+            "Unauthorized" => "bg-secondary text-white",
+            "Missing API Key" => "bg-secondary text-white",
+            "API Offline" => "bg-secondary text-white",
+            "Error" => "bg-secondary text-white",
+            _ => "bg-primary text-white"
+        };
+    }
+
+    private static string DeliveredAgoText(DateTime deliveredAt)
+    {
+        var days = (int)Math.Floor((DateTime.Now - deliveredAt).TotalDays);
+        if (days <= 0) return "Delivered today";
+        if (days == 1) return "Delivered 1 day ago";
+        return $"Delivered {days} days ago";
+    }
+
+    private static string InTransitText(DateTime since)
+    {
+        var days = (int)Math.Floor((DateTime.Now - since).TotalDays);
+        if (days <= 0) return "In transit today";
+        if (days == 1) return "In transit 1 day";
+        return $"In transit {days} days";
+    }
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _cts?.Dispose();
+    }
+
+    private static string StatusAgeClass(DateTime date)
+    {
+        if (date == DateTime.MinValue) return "";
+        var days = (DateTime.Today - date.Date).TotalDays;
+        if (days >= 7) return "text-stale-danger";
+        if (days >= 5) return "text-stale-warn";
+        return "";
+    }
+
+    private class JobRow
+    {
+        public string JobId { get; set; } = "";
+        public string TrackingNumber { get; set; } = "";
+        public string Carrier { get; set; } = "";
+        public int? TrackingServiceId { get; set; }
+        public string LiveStatus { get; set; } = "";
+        public bool IsDelivered { get; set; }
+        public DateTime? DeliveredAt { get; set; }
+        public DateTime? InTransitSince { get; set; }
+        public string Owner { get; set; } = "";
+        public string Equipment { get; set; } = "";
+        public string Fault { get; set; } = "";
+        public DateTime LastStatusChange { get; set; }
+
+        public string ManualCarrier { get; set; } = TrackingService.KnownCarrierPrefixes[0];
+        public string? ManualConnote { get; set; }
+        public bool SavingTracking { get; set; }
+        public bool RemovingTracking { get; set; }
+    }
+}

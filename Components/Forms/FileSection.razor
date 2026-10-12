@@ -1,0 +1,42 @@
+﻿@using Microsoft.AspNetCore.Components.Forms
+
+@* FileSection — single-file picker (image-capture-friendly: accept="image/*"
+   capture="environment" opens a phone's camera directly) with the shared
+   SetError validation pattern. GetFile() hands the raw IBrowserFile to the
+   caller, which owns actually reading/uploading it. *@
+
+<label>
+    Document / Photo
+    @if (_isMissing)
+    {
+        <div class="text-danger">
+            File missing
+        </div>
+    }
+    <InputFile OnChange="OnSelected" accept="image/*" capture="environment" />
+    @if (_file is not null)
+    {
+        <div class="small text-muted">
+            Selected: @_file.Name (@(_file.Size / 1024) KB)
+        </div>
+    }
+</label>
+
+@code {
+    public bool _isMissing = false;
+
+    private IBrowserFile? _file { get; set; }
+
+    public IBrowserFile? GetFile() => _file;
+
+    private void OnSelected(InputFileChangeEventArgs e)
+    {
+        _file = e.File;
+    }
+
+    public void SetError(bool isMissing)
+    {
+        _isMissing = isMissing;
+        StateHasChanged();
+    }
+}

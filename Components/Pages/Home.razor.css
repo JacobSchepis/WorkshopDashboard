@@ -1,0 +1,17 @@
+.home-search {
+    max-width: 280px;
+}
+
+.home-tool {
+    color: inherit;
+    transition: background-color 0.15s ease;
+}
+
+    .home-tool:hover {
+        background-color: var(--bs-tertiary-bg);
+    }
+
+.home-hero-icon {
+    font-size: 1.75rem;
+    line-height: 1;
+}

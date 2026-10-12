@@ -1,0 +1,245 @@
+@page "/scope-reporting"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+
+@inherits JmsComponentBase
+
+@using Microsoft.AspNetCore.Components
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Reporting
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@inject ScopeCustomerStore ScopeCustomers
+@inject ScopeJobStore ScopeJobs
+@inject ScopeReportLookup ReportLookup
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    ScopeReportingOverview — Overview page of the Scope Reporting drill-down
+    (Overview → State → Customer, mirroring WaitingQuote → WaitingQuoteDetail).
+
+    Every tile comes from JmsQueries.BuildScopeReportStatsQuery: job_invoice.total_amount /
+    total_paid for Invoiced/Paid (Outstanding = the difference), job_status_id = 2 +
+    job.completed_date for turnaround, and job_status_history (status 10 → first of status
+    30 or a "Quote declined" status) for response time. See that method's comment for the
+    confirmed status ids/names.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Scope Reporting</h1>
+    <p class="text-muted">
+        Financial and turnaround stats across all scope customers (see
+        <a href="/scope-customers">Scope Customer Manager</a>). Drill into a state, then a
+        customer, for the same breakdown at a narrower scope.
+    </p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else if (_customers.Count == 0)
+{
+    <Callout Color="CalloutColor.Info" Heading="No scope customers configured">
+        Add customers on the <a href="/scope-customers">Scope Customer Manager</a> page.
+    </Callout>
+}
+else
+{
+    <div class="d-flex align-items-center gap-2 mb-4">
+        <label class="form-label mb-0">Period</label>
+        <select class="form-select" style="max-width:220px;" value="@_period.Key" @onchange="OnPeriodChanged">
+            @foreach (var p in ScopeReportingPeriod.All())
+            {
+                <option value="@p.Key">@p.Label</option>
+            }
+        </select>
+        <span class="text-muted small">@_period.Start.ToString("d MMM yyyy") – @_period.End.ToString("d MMM yyyy")</span>
+    </div>
+
+    <div class="row row-cols-1 row-cols-md-3 row-cols-xl-6 g-3 mb-4">
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Repairs</p>
+                    <p class="fs-3 mb-0">@_overall.JobCount</p>
+                    <p class="text-muted small mb-0">@_overall.CompletedCount completed &middot; @_overall.OpenCount open</p>
+                    @if (_overall.ClosedWithoutInvoiceCount > 0)
+                    {
+                        <p class="text-danger small mb-0">@_overall.ClosedWithoutInvoiceCount closed w/o invoice</p>
+                    }
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Invoiced</p>
+                    <p class="fs-3 mb-0">@FormatMoney(_overall.InvoicedTotal)</p>
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Paid</p>
+                    <p class="fs-3 mb-0">@FormatMoney(_overall.PaidTotal)</p>
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Outstanding</p>
+                    <p class="fs-3 mb-0">@FormatMoney(_overall.OutstandingTotal)</p>
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Avg Turnaround</p>
+                    <p class="fs-3 mb-0">@FormatDays(_overall.AvgTurnaroundDays)</p>
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Response Time</p>
+                    <p class="fs-3 mb-0">@FormatDays(_overall.AvgResponseDays)</p>
+                </CardBody>
+            </Card>
+        </div>
+    </div>
+
+    <h5 class="mb-3">By State</h5>
+    <Card>
+        <CardBody>
+            <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                    <thead>
+                        <tr>
+                            <th>State</th>
+                            <th class="text-end">Customers</th>
+                            <th class="text-end">Repairs</th>
+                            <th class="text-end">No Invoice</th>
+                            <th class="text-end">Invoiced</th>
+                            <th class="text-end">Paid</th>
+                            <th class="text-end">Outstanding</th>
+                            <th class="text-end">Avg Turnaround</th>
+                            <th class="text-end">Response Time</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var g in _stateGroups)
+                        {
+                            <tr>
+                                <td>@g.Label</td>
+                                <td class="text-end">@g.CustomerCount</td>
+                                <td class="text-end">@g.Stats.JobCount</td>
+                                <td class="text-end @(g.Stats.ClosedWithoutInvoiceCount > 0 ? "text-danger" : "")">@g.Stats.ClosedWithoutInvoiceCount</td>
+                                <td class="text-end">@FormatMoney(g.Stats.InvoicedTotal)</td>
+                                <td class="text-end">@FormatMoney(g.Stats.PaidTotal)</td>
+                                <td class="text-end">@FormatMoney(g.Stats.OutstandingTotal)</td>
+                                <td class="text-end">@FormatDays(g.Stats.AvgTurnaroundDays)</td>
+                                <td class="text-end">@FormatDays(g.Stats.AvgResponseDays)</td>
+                                <td class="text-end">
+                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                            @onclick="@(() => GoToState(g))">
+                                        View
+                                    </Button>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        </CardBody>
+    </Card>
+}
+
+@code {
+    [SupplyParameterFromQuery(Name = "period")] public string? PeriodKey { get; set; }
+
+    private bool _loading = true;
+    private List<ScopeCustomer> _customers = new();
+    private List<StateGroup> _stateGroups = new();
+    private ScopeReportStats _overall = new();
+    private ScopeReportingPeriod _period;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _period = ScopeReportingPeriod.Resolve(PeriodKey);
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        _loading = true;
+        StateHasChanged();
+
+        _customers = await ScopeCustomers.LoadAsync();
+
+        if (_customers.Count == 0)
+        {
+            _loading = false;
+            StateHasChanged();
+            return;
+        }
+
+        var exclusions = await ScopeJobs.LoadAsync();
+        var allIds = _customers.SelectMany(c => c.CompanyIds).Distinct().ToList();
+
+        var byCompany = await ReportLookup.GetStatsByCompanyAsync(allIds, exclusions, _period.Start, _period.End);
+
+        _overall = ScopeReportStatsParser.Aggregate(byCompany, allIds);
+
+        _stateGroups = _customers
+            .GroupBy(c => string.IsNullOrWhiteSpace(c.State) ? "Unassigned" : c.State!)
+            .Select(g => new StateGroup
+            {
+                Label = g.Key,
+                CustomerCount = g.Count(),
+                Stats = ScopeReportStatsParser.Aggregate(byCompany, g.SelectMany(c => c.CompanyIds))
+            })
+            .OrderBy(g => g.Label == "Unassigned" ? 1 : 0)
+            .ThenBy(g => g.Label, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private void OnPeriodChanged(ChangeEventArgs e) =>
+        Nav.NavigateTo(Nav.GetUriWithQueryParameter("period", e.Value?.ToString()));
+
+    private void GoToState(StateGroup g) =>
+        Nav.NavigateTo($"/scope-reporting/state/{Uri.EscapeDataString(g.Label)}?period={Uri.EscapeDataString(_period.Key)}");
+
+    private static string FormatMoney(decimal amount) => $"${amount:N0}";
+
+    private static string FormatDays(double? days) => days.HasValue ? $"{days.Value:0.#}d" : "—";
+
+    private class StateGroup
+    {
+        public string Label { get; set; } = "";
+        public int CustomerCount { get; set; }
+        public ScopeReportStats Stats { get; set; } = new();
+    }
+}

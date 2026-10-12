@@ -1,0 +1,796 @@
+@page "/send-customer-email"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+@inject ScopeCustomerStore Customers
+@inject WaitingQuoteEmailConfig EmailConfig
+@inject EmailService Gmail
+@inject ScopeLookupService ScopeLookup
+@inject WorkshopDashboard.Services.Analytics.AnalyticsService Analytics
+@inject ILogger<SendCustomerEmail> Logger
+
+@using CsvHelper
+@using CsvHelper.Configuration
+@using System.Globalization
+@using Microsoft.AspNetCore.Components.Forms
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.External.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.External.Email
+@using WorkshopDashboard.Services.External.Google
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    SendCustomerEmail — bulk email to Scope Customer contacts, filtered by
+    state/tag/contact-type, with a per-site individual-vs-combined send mode
+    and a merge-tag ({firstName}/{customerName}/{state}) message body.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      Customers    — ScopeCustomerStore: the customer list + tags/state/contacts
+      ScopeLookup  — resolves JMS contact ids to real name/email (ContactInfo)
+      EmailConfig  — shared From name/address + default test-recipient
+      Gmail        — EmailService: actually sends each composed email
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      ReloadAsync loads customers + resolves their contacts to ContactInfo.
+      AllRows flattens (customer, contact) pairs -> VisibleRows applies the
+      state/tag/contact-type filters -> Recipients applies the per-row
+      checkboxes -> SendUnits groups Recipients by customer into one email
+      per unit (respecting each site's Individual/Combined mode and whether
+      secondaries are CC'd). ConfirmSendAsync sends one real email per unit.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Send Email To All</h1>
+    <p class="text-muted">
+        Sends to each customer's contacts (set on the <a href="/scope-customers">Scope Customer
+        Manager</a>) — individually by default, or bundled into one email per site if you switch
+        its mode below. Filter by state, tag, or contact type, and untick anyone you want to skip.
+    </p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else if (_customers.Count == 0)
+{
+    <Alert Color="AlertColor.Info">
+        No customers configured yet. Add some on the <a href="/scope-customers">Scope Customer Manager</a> page.
+    </Alert>
+}
+else
+{
+    <Card Class="mb-4">
+        <CardHeader>Recipients</CardHeader>
+        <CardBody>
+            <label class="form-label">State</label>
+            <div class="d-flex flex-wrap gap-3 mb-3">
+                @foreach (var key in AuStates.Append(NoStateKey))
+                {
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="@($"state-{key}")"
+                               checked="@_activeStates.Contains(key)" @onchange="@(() => ToggleState(key))" />
+                        <label class="form-check-label" for="@($"state-{key}")">
+                            @(key == NoStateKey ? "No state set" : key)
+                        </label>
+                    </div>
+                }
+            </div>
+
+            <label class="form-label">Tag</label>
+            <div class="d-flex flex-wrap gap-3 mb-3">
+                @foreach (var key in _allTags.Append(NoTagKey))
+                {
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" id="@($"tag-{key}")"
+                               checked="@_activeTags.Contains(key)" @onchange="@(() => ToggleTag(key))" />
+                        <label class="form-check-label" for="@($"tag-{key}")">
+                            @(key == NoTagKey ? "No tags" : key)
+                        </label>
+                    </div>
+                }
+            </div>
+
+            <label class="form-label">Contact type</label>
+            <div class="d-flex flex-wrap gap-3 mb-2">
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="type-primary"
+                           checked="@_includePrimary" @onchange="@(() => { _includePrimary = !_includePrimary; })" />
+                    <label class="form-check-label" for="type-primary">Primary contacts</label>
+                </div>
+                <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="type-secondary"
+                           checked="@_includeSecondary" @onchange="@(() => { _includeSecondary = !_includeSecondary; })" />
+                    <label class="form-check-label" for="type-secondary">Secondary contacts</label>
+                </div>
+            </div>
+            <div class="form-check mb-3">
+                <input class="form-check-input" type="checkbox" id="cc-secondary"
+                       checked="@_ccSecondary" @onchange="@(() => { _ccSecondary = !_ccSecondary; })" />
+                <label class="form-check-label" for="cc-secondary">
+                    CC secondary contacts on the primary email(s) instead of sending them their own
+                    <span class="text-muted small">— if a site has secondary contacts selected but no primary, they're sent to directly instead</span>
+                </label>
+            </div>
+
+            <div class="d-flex align-items-center gap-2 mb-2">
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" @onclick="SelectAllVisible">
+                    Select all shown
+                </Button>
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" @onclick="DeselectAllVisible">
+                    Deselect all shown
+                </Button>
+                <span class="text-muted small">
+                    @Recipients.Count contact@(Recipients.Count == 1 ? "" : "s") selected &middot; @SendUnits.Count email@(SendUnits.Count == 1 ? "" : "s") will go out
+                    @if (MissingEmailCount > 0)
+                    {
+                        @($"· {MissingEmailCount} contact(s) with no email on file, hidden")
+                    }
+                </span>
+            </div>
+
+            <div class="table-responsive" style="max-height: 480px; overflow-y: auto;">
+                <table class="table table-sm align-middle mb-0">
+                    <thead>
+                        <tr>
+                            <th style="width: 40px;"></th>
+                            <th>Contact</th>
+                            <th>Type</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var group in VisibleRows.GroupBy(r => r.Customer))
+                        {
+                            <tr>
+                                <td colspan="3">
+                                    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                                        <div>
+                                            <strong>@group.Key.DisplayName</strong>
+                                            @if (!string.IsNullOrWhiteSpace(group.Key.State))
+                                            {
+                                                <span class="text-muted small ms-2">@group.Key.State</span>
+                                            }
+                                            @foreach (var tag in group.Key.Tags)
+                                            {
+                                                <span class="badge text-bg-secondary ms-1">@tag</span>
+                                            }
+                                        </div>
+                                        @if (group.Count() > 1)
+                                        {
+                                            <div class="d-flex gap-3">
+                                                <div class="form-check form-check-inline mb-0">
+                                                    <input class="form-check-input" type="radio" name="@($"mode-{group.Key.DisplayName}")"
+                                                           id="@($"mode-{group.Key.DisplayName}-ind")"
+                                                           checked="@(GetSendMode(group.Key.DisplayName) == CustomerSendMode.Individual)"
+                                                           @onchange="@(() => SetSendMode(group.Key.DisplayName, CustomerSendMode.Individual))" />
+                                                    <label class="form-check-label small" for="@($"mode-{group.Key.DisplayName}-ind")">
+                                                        Send individually
+                                                    </label>
+                                                </div>
+                                                <div class="form-check form-check-inline mb-0">
+                                                    <input class="form-check-input" type="radio" name="@($"mode-{group.Key.DisplayName}")"
+                                                           id="@($"mode-{group.Key.DisplayName}-comb")"
+                                                           checked="@(GetSendMode(group.Key.DisplayName) == CustomerSendMode.Combined)"
+                                                           @onchange="@(() => SetSendMode(group.Key.DisplayName, CustomerSendMode.Combined))" />
+                                                    <label class="form-check-label small" for="@($"mode-{group.Key.DisplayName}-comb")">
+                                                        One combined email
+                                                    </label>
+                                                </div>
+                                            </div>
+                                        }
+                                    </div>
+                                </td>
+                            </tr>
+                            @foreach (var r in group)
+                            {
+                                <tr>
+                                    <td>
+                                        <input class="form-check-input" type="checkbox"
+                                               checked="@_included.Contains(r.Key)"
+                                               @onchange="@(() => ToggleIncluded(r.Key))" />
+                                    </td>
+                                    <td class="small">@r.Name &lt;@r.Email&gt;</td>
+                                    <td>
+                                        <span class="badge @(r.IsPrimary ? "text-bg-primary" : "text-bg-secondary")">
+                                            @(r.IsPrimary ? "Primary" : _ccSecondary ? "CC" : "Secondary")
+                                        </span>
+                                    </td>
+                                </tr>
+                            }
+                        }
+                    </tbody>
+                </table>
+            </div>
+        </CardBody>
+    </Card>
+
+    <Card Class="mb-4">
+        <CardHeader>Message</CardHeader>
+        <CardBody>
+            <div class="mb-3">
+                <label class="form-label">Subject</label>
+                <input class="form-control" value="@_subject" @oninput="@(e => _subject = e.Value?.ToString() ?? "")" />
+            </div>
+
+            <div class="mb-3">
+                <label class="form-label">
+                    Body
+                    <span class="text-muted small">
+                        — merge tags: <code>{firstName}</code>, <code>{customerName}</code>, <code>{state}</code>
+                        (subject supports them too). On a combined email, <code>{firstName}</code> greets everyone
+                        it's addressed to — "Alex", "Alex and Jordan", "Alex, Jordan and Sam", etc.
+                    </span>
+                </label>
+                <textarea class="form-control" rows="8" value="@_body" @oninput="@(e => _body = e.Value?.ToString() ?? "")"></textarea>
+            </div>
+
+            <div class="mb-3">
+                <label class="form-label">Preview <span class="text-muted small">— using sample data, not a real contact</span></label>
+                <div class="border rounded p-3">
+                    <div class="mb-2"><strong>Subject:</strong> @PreviewSubject</div>
+                    <hr class="my-2" />
+                    @PreviewBody
+                </div>
+            </div>
+
+            <div class="mb-3" style="max-width: 400px;">
+                <label class="form-label">CC <span class="text-muted small">(applies to every email)</span></label>
+                <input class="form-control" placeholder="name@example.com (comma-separate for multiple)"
+                       value="@_ccEmail" @oninput="@(e => _ccEmail = e.Value?.ToString() ?? "")" />
+            </div>
+
+            <div class="mb-2">
+                <label class="form-label">Attachments <span class="text-muted small">— added to every email</span></label>
+                <InputFile @key="_fileInputKey" OnChange="OnFilesSelectedAsync" multiple class="form-control" />
+
+                @if (_attachments.Count > 0)
+                {
+                    <ul class="list-group mt-2">
+                        @foreach (var f in _attachments)
+                        {
+                            <li class="list-group-item d-flex justify-content-between align-items-center">
+                                <span>@f.FileName <span class="text-muted small">(@FormatSize(f.Content.LongLength))</span></span>
+                                <Button Color="ButtonColor.Secondary" Outline="true" Size="ButtonSize.ExtraSmall"
+                                        @onclick="() => RemoveAttachment(f.FileName)">
+                                    Remove
+                                </Button>
+                            </li>
+                        }
+                    </ul>
+                }
+
+                @if (!string.IsNullOrEmpty(_attachError))
+                {
+                    <Alert Color="AlertColor.Danger" Class="mt-2 mb-0">@_attachError</Alert>
+                }
+
+                @if (TotalAttachmentBytes > MaxTotalManualBytes)
+                {
+                    <Alert Color="AlertColor.Danger" Class="mt-2 mb-0">
+                        Uploaded files total @FormatSize(TotalAttachmentBytes), over the @FormatSize(MaxTotalManualBytes) limit.
+                        Remove some before sending.
+                    </Alert>
+                }
+            </div>
+
+            <hr />
+
+            <div>
+                <label class="form-label">Send a test</label>
+                <p class="text-muted small mb-2">
+                    Sends the message above (with attachments, using sample merge data) to just this address —
+                    doesn't touch the recipient list or count against it.
+                </p>
+                <div class="input-group" style="max-width: 400px;">
+                    <input class="form-control" placeholder="you@example.com"
+                           value="@_testEmail" @oninput="@(e => _testEmail = e.Value?.ToString() ?? "")" />
+                    <Button Color="ButtonColor.Secondary" Outline="true" Disabled="_testSending"
+                            Loading="_testSending" LoadingText="Sending..." @onclick="SendTestAsync">
+                        Send Test
+                    </Button>
+                </div>
+                @if (!string.IsNullOrEmpty(_testStatus))
+                {
+                    <Alert Color="@(_testSuccess ? AlertColor.Success : AlertColor.Danger)" Class="mt-2 mb-0">@_testStatus</Alert>
+                }
+            </div>
+        </CardBody>
+    </Card>
+
+    <Card>
+        <CardBody>
+            @if (!_armed)
+            {
+                <Button Color="ButtonColor.Primary"
+                        Disabled="@(SendUnits.Count == 0 || string.IsNullOrWhiteSpace(_subject) || TotalAttachmentBytes > MaxTotalManualBytes)"
+                        @onclick="ArmSend">
+                    Send @SendUnits.Count email@(SendUnits.Count == 1 ? "" : "s") to @Recipients.Count contact@(Recipients.Count == 1 ? "" : "s")
+                </Button>
+            }
+            else
+            {
+                <Alert Color="AlertColor.Warning" Class="mb-2">
+                    This will send @SendUnits.Count separate email@(SendUnits.Count == 1 ? "" : "s") right now, reaching
+                    @Recipients.Count contact@(Recipients.Count == 1 ? "" : "s"). This can't be undone.
+                </Alert>
+                <div class="d-flex gap-2">
+                    <Button Color="ButtonColor.Danger" Disabled="_sending" Loading="_sending" LoadingText="@(_sendProgress ?? "Sending...")"
+                            @onclick="ConfirmSendAsync">
+                        Confirm — Send Now
+                    </Button>
+                    <Button Color="ButtonColor.Secondary" Outline="true" Disabled="_sending" @onclick="CancelSend">
+                        Cancel
+                    </Button>
+                </div>
+            }
+
+            @if (!string.IsNullOrEmpty(_resultSummary))
+            {
+                <Alert Color="@(_resultSuccess ? AlertColor.Success : AlertColor.Warning)" Class="mt-3 mb-0">
+                    @_resultSummary
+                    @if (_failures.Count > 0)
+                    {
+                        <ul class="mb-0 mt-2">
+                            @foreach (var f in _failures)
+                            {
+                                <li>@f.Name — @f.Error</li>
+                            }
+                        </ul>
+                    }
+                </Alert>
+            }
+        </CardBody>
+    </Card>
+}
+
+@code {
+    private static readonly string[] AuStates = { "NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT" };
+    private const string NoStateKey = "NONE";
+    private const string NoTagKey = "NONE";
+
+    // Core recipient/config state — populated by ReloadAsync(), read from markup broadly.
+    private bool _loading = true;
+    private List<ScopeCustomer> _customers = new();
+    private Dictionary<int, ContactInfo> _contacts = new();
+    private WaitingQuoteEmailConfig.EmailConfigData _config = new();
+
+    // ── Recipient filters ────────────────────────────────────────────────────
+
+    private readonly HashSet<string> _activeStates = new(AuStates) { NoStateKey };
+    private List<string> _allTags = new();
+    private HashSet<string> _activeTags = new();
+    private bool _includePrimary = true;
+    private bool _includeSecondary = true;
+    private bool _ccSecondary;
+    private readonly HashSet<string> _included = new();
+
+    private enum CustomerSendMode { Individual, Combined }
+    private readonly Dictionary<string, CustomerSendMode> _sendModes = new();
+
+    // ── Message ──────────────────────────────────────────────────────────────
+
+    private string _subject = "";
+    private string _body = "";
+    private string _ccEmail = "";
+
+    private string _testEmail = "";
+    private bool _testSending;
+    private bool _testSuccess;
+    private string? _testStatus;
+
+    // Same caps as WaitingQuoteDetail.razor's ad-hoc uploads — Blazor Server
+    // streams these over the SignalR circuit, so keep them conservative.
+    private const long MaxManualFileBytes = 10 * 1024 * 1024;
+    private const long MaxTotalManualBytes = 20 * 1024 * 1024;
+    private const int MaxManualFileCount = 20;
+    private readonly List<EmailAttachment> _attachments = new();
+    private string? _attachError;
+    private Guid _fileInputKey = Guid.NewGuid();
+    private long TotalAttachmentBytes => _attachments.Sum(a => a.Content.LongLength);
+
+    // ── Send state ───────────────────────────────────────────────────────────
+
+    private bool _armed;
+    private bool _sending;
+    private string? _sendProgress;
+    private string? _resultSummary;
+    private bool _resultSuccess;
+    private readonly List<(string Name, string Error)> _failures = new();
+
+    // ── Lifecycle / recipient loading ───────────────────────────────────────
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        _config = await EmailConfig.LoadAsync();
+        _testEmail = _config.DefaultRecipientEmail ?? "";
+        await ReloadAsync();
+    }
+
+    private async Task ReloadAsync()
+    {
+        _customers = await Customers.LoadAsync();
+        _contacts = await LoadContactsAsync(_customers
+            .SelectMany(c => c.PrimaryContactIds.Concat(c.SecondaryContactIds))
+            .Distinct().ToList());
+
+        _allTags = _customers.SelectMany(c => c.Tags)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(t => t, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        _activeTags = new HashSet<string>(_allTags) { NoTagKey };
+
+        // Default: every contact with a usable email starts selected.
+        _included.Clear();
+        foreach (var r in AllRows)
+            _included.Add(r.Key);
+
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private record ContactInfo(string? Name, string? Email);
+
+    // ── Recipient projection & filtering ────────────────────────────────────
+
+    // One row per (customer, contact) pair — a contact who is primary for one
+    // customer and secondary for another gets two independent rows, each with
+    // its own key, since each is judged against that customer's state/tags.
+    private record Recipient(ScopeCustomer Customer, int ContactId, string Name, string Email, bool IsPrimary)
+    {
+        public string Key => $"{Customer.DisplayName}|{ContactId}|{(IsPrimary ? "P" : "S")}";
+    }
+
+    private async Task<Dictionary<int, ContactInfo>> LoadContactsAsync(IReadOnlyCollection<int> contactIds)
+    {
+        var rows = await ScopeLookup.GetContactDetailsAsync(contactIds);
+        return rows.ToDictionary(r => r.ContactId, r => new ContactInfo(r.FullName, r.Email));
+    }
+
+    // Every (customer, contact) pair across the whole list, resolved to a real
+    // email — no filters applied. Pairs whose contact id doesn't resolve to an
+    // email (never picked up by JMS, or the person has none on file) are
+    // dropped entirely, since there's nothing sendable about them.
+    private IEnumerable<Recipient> AllRows =>
+        _customers.SelectMany(c =>
+            c.PrimaryContactIds.Select(id => (Customer: c, Id: id, IsPrimary: true))
+             .Concat(c.SecondaryContactIds.Select(id => (Customer: c, Id: id, IsPrimary: false))))
+        .Select(t => _contacts.TryGetValue(t.Id, out var info) ? (t, info) : (t, null))
+        .Where(x => x.Item2 is not null && !string.IsNullOrWhiteSpace(x.Item2!.Email))
+        .Select(x => new Recipient(x.t.Customer, x.t.Id, x.Item2!.Name ?? "(no name)", x.Item2!.Email!, x.t.IsPrimary));
+
+    private int MissingEmailCount =>
+        _customers.Sum(c => c.PrimaryContactIds.Count + c.SecondaryContactIds.Count) - AllRows.Count();
+
+    private static string StateKey(string? state) => string.IsNullOrWhiteSpace(state) ? NoStateKey : state;
+
+    private bool PassesTagFilter(ScopeCustomer c) =>
+        c.Tags.Count == 0 ? _activeTags.Contains(NoTagKey) : c.Tags.Any(t => _activeTags.Contains(t));
+
+    private IEnumerable<Recipient> VisibleRows =>
+        AllRows.Where(r => _activeStates.Contains(StateKey(r.Customer.State))
+                         && PassesTagFilter(r.Customer)
+                         && (r.IsPrimary ? _includePrimary : _includeSecondary))
+               .OrderBy(r => r.Customer.DisplayName, StringComparer.OrdinalIgnoreCase)
+               .ThenByDescending(r => r.IsPrimary);
+
+    private List<Recipient> Recipients =>
+        VisibleRows.Where(r => _included.Contains(r.Key)).ToList();
+
+    // ── Send-unit grouping ───────────────────────────────────────────────────
+
+    // A "site" (customer) sends individually by default — each included
+    // contact gets their own email. Switching a site to Combined bundles all
+    // of its included primary contacts (and, unless CC'd — see _ccSecondary —
+    // secondaries too) into one email instead, e.g. for a small clinic where
+    // everyone just wants the one copy.
+    private CustomerSendMode GetSendMode(string customerName) =>
+        _sendModes.TryGetValue(customerName, out var mode) ? mode : CustomerSendMode.Individual;
+
+    private void SetSendMode(string customerName, CustomerSendMode mode) => _sendModes[customerName] = mode;
+
+    // One outgoing email per unit. ToContacts are addressed directly;
+    // CcContacts (only populated when _ccSecondary is on) ride along as CC.
+    private record SendUnit(ScopeCustomer Customer, List<Recipient> ToContacts, List<Recipient> CcContacts);
+
+    private List<SendUnit> SendUnits =>
+        Recipients.GroupBy(r => r.Customer)
+            .SelectMany(g => BuildUnitsForCustomer(g.Key, g.ToList()))
+            .ToList();
+
+    private IEnumerable<SendUnit> BuildUnitsForCustomer(ScopeCustomer customer, List<Recipient> rows)
+    {
+        var primaries = rows.Where(r => r.IsPrimary).ToList();
+        var secondaries = rows.Where(r => !r.IsPrimary).ToList();
+        var combined = GetSendMode(customer.DisplayName) == CustomerSendMode.Combined;
+
+        // CC mode only applies while there's at least one primary to ride on —
+        // if none is selected/exists, secondaries fall back to being sent to
+        // directly rather than silently dropped.
+        if (_ccSecondary && primaries.Count > 0)
+        {
+            if (combined)
+            {
+                yield return new SendUnit(customer, primaries, secondaries);
+            }
+            else
+            {
+                foreach (var p in primaries)
+                    yield return new SendUnit(customer, new List<Recipient> { p }, secondaries);
+            }
+            yield break;
+        }
+
+        if (combined)
+        {
+            if (rows.Count > 0) yield return new SendUnit(customer, rows, new());
+        }
+        else
+        {
+            foreach (var r in rows)
+                yield return new SendUnit(customer, new List<Recipient> { r }, new());
+        }
+    }
+
+    // ── Filter toggles ───────────────────────────────────────────────────────
+
+    private void ToggleState(string key)
+    {
+        if (!_activeStates.Remove(key)) _activeStates.Add(key);
+    }
+
+    private void ToggleTag(string key)
+    {
+        if (!_activeTags.Remove(key)) _activeTags.Add(key);
+    }
+
+    private void SelectAllVisible()
+    {
+        foreach (var r in VisibleRows)
+            _included.Add(r.Key);
+    }
+
+    private void DeselectAllVisible()
+    {
+        foreach (var r in VisibleRows)
+            _included.Remove(r.Key);
+    }
+
+    private void ToggleIncluded(string key)
+    {
+        if (!_included.Remove(key)) _included.Add(key);
+    }
+
+    // ── Attachments — same pattern as WaitingQuoteDetail.razor's ad-hoc uploads ──
+
+    private async Task OnFilesSelectedAsync(InputFileChangeEventArgs e)
+    {
+        _attachError = null;
+
+        IReadOnlyList<IBrowserFile> files;
+        try
+        {
+            files = e.GetMultipleFiles(MaxManualFileCount);
+        }
+        catch (InvalidOperationException)
+        {
+            _attachError = $"Select at most {MaxManualFileCount} files at once.";
+            _fileInputKey = Guid.NewGuid();
+            return;
+        }
+
+        foreach (var file in files)
+        {
+            if (file.Size > MaxManualFileBytes)
+            {
+                _attachError = $"{file.Name} is {FormatSize(file.Size)} — over the {FormatSize(MaxManualFileBytes)} per-file limit.";
+                continue;
+            }
+
+            if (_attachments.Count >= MaxManualFileCount)
+            {
+                _attachError = $"Attachment limit ({MaxManualFileCount} files) reached.";
+                break;
+            }
+
+            try
+            {
+                using var ms = new MemoryStream();
+                await using (var stream = file.OpenReadStream(MaxManualFileBytes))
+                    await stream.CopyToAsync(ms);
+
+                _attachments.RemoveAll(a => string.Equals(a.FileName, file.Name, StringComparison.OrdinalIgnoreCase));
+                _attachments.Add(new EmailAttachment { FileName = file.Name, Content = ms.ToArray() });
+            }
+            catch (Exception ex)
+            {
+                _attachError = $"Could not read {file.Name}: {ex.Message}";
+                Logger.LogError(ex, "Reading upload {File} failed", file.Name);
+            }
+        }
+
+        _fileInputKey = Guid.NewGuid();
+        StateHasChanged();
+    }
+
+    private void RemoveAttachment(string fileName)
+    {
+        _attachments.RemoveAll(a => string.Equals(a.FileName, fileName, StringComparison.OrdinalIgnoreCase));
+        _attachError = null;
+    }
+
+    private static string FormatSize(long bytes) =>
+        bytes >= 1024 * 1024 ? $"{bytes / 1024d / 1024d:0.#} MB" : $"{Math.Max(1, bytes / 1024):0} KB";
+
+    // ── Send ──────────────────────────────────────────────────────────────────
+    // One email per SendUnit — Individual-mode contacts each get their own
+    // send, Combined-mode sites get one email with every included contact
+    // in the To line.
+
+    private void ArmSend() => _armed = true;
+    private void CancelSend() => _armed = false;
+
+    private async Task ConfirmSendAsync()
+    {
+        _armed = false;
+        _sending = true;
+        _resultSummary = null;
+        _failures.Clear();
+        StateHasChanged();
+
+        var units = SendUnits;
+        var cc = ParseCcInput();
+        var fromName = string.IsNullOrWhiteSpace(_config.FromName) ? "Scopes" : _config.FromName;
+        var fromAddress = string.IsNullOrWhiteSpace(_config.FromAddress) ? CompanyProfile.WorkshopEmail : _config.FromAddress;
+
+        var sent = 0;
+        for (var i = 0; i < units.Count; i++)
+        {
+            var unit = units[i];
+            _sendProgress = $"Sending {i + 1} of {units.Count}...";
+            StateHasChanged();
+
+            try
+            {
+                var firstName = JoinFirstNames(unit.ToContacts);
+                var subject = ApplyMergeTags(_subject, firstName, unit.Customer.DisplayName, unit.Customer.State);
+                var html = PlainTextToHtml(ApplyMergeTags(_body, firstName, unit.Customer.DisplayName, unit.Customer.State));
+
+                var toEmails = unit.ToContacts.Select(c => c.Email).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                var ccEmails = unit.CcContacts.Select(c => c.Email).Concat(cc)
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+
+                var builder = Gmail.Compose()
+                    .To(toEmails)
+                    .Subject(subject)
+                    .HtmlBody(html)
+                    .From(fromName, fromAddress);
+
+                if (ccEmails.Length > 0) builder.Cc(ccEmails);
+                if (_attachments.Count > 0) builder.AttachRange(_attachments);
+
+                await builder.SendAsync();
+                sent++;
+            }
+            catch (Exception ex)
+            {
+                var label = unit.ToContacts.Count == 1
+                    ? $"{unit.Customer.DisplayName} — {unit.ToContacts[0].Name}"
+                    : $"{unit.Customer.DisplayName} (combined, {unit.ToContacts.Count} to + {unit.CcContacts.Count} cc)";
+                _failures.Add((label, ex.Message));
+            }
+        }
+
+        var contactsReached = units.Sum(u => u.ToContacts.Count + u.CcContacts.Count);
+        _sendProgress = null;
+        _sending = false;
+        _resultSuccess = _failures.Count == 0;
+        _resultSummary = $"Sent {sent} of {units.Count} email{(units.Count == 1 ? "" : "s")}, reaching {contactsReached} contact{(contactsReached == 1 ? "" : "s")}."
+            + (_failures.Count > 0 ? $" {_failures.Count} failed — see below." : "");
+        await Analytics.TrackEventAsync("Bulk customer email sent");
+        StateHasChanged();
+    }
+
+    private string[] ParseCcInput() =>
+        _ccEmail.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    private static string ApplyMergeTags(string text, string firstName, string customerName, string? state) =>
+        (text ?? "")
+            .Replace("{firstName}", firstName)
+            .Replace("{customerName}", customerName)
+            .Replace("{state}", string.IsNullOrWhiteSpace(state) ? "" : state);
+
+    // "Alex" for one recipient, "Alex and Jordan" for two, "Alex, Jordan and Sam"
+    // for three+ — so a combined email's {firstName} greets everyone actually
+    // on it instead of falling back to a generic "there".
+    private static string JoinFirstNames(List<Recipient> contacts)
+    {
+        var names = contacts.Select(c => WaitingQuoteReport.FirstName(c.Name))
+            .Where(n => !string.IsNullOrWhiteSpace(n)).Select(n => n!).ToList();
+
+        return names.Count switch
+        {
+            0 => "there",
+            1 => names[0],
+            2 => $"{names[0]} and {names[1]}",
+            _ => string.Join(", ", names.Take(names.Count - 1)) + $" and {names[^1]}"
+        };
+    }
+
+    // ── Preview & test send ─────────────────────────────────────────────────
+    // Sample data only — never touched against real contacts, so this is safe
+    // to render on every keystroke.
+    private const string SampleFirstName = "Alex";
+    private const string SampleCustomerName = "Sample Customer";
+    private const string SampleState = "NSW";
+
+    private string PreviewSubject => ApplyMergeTags(_subject, SampleFirstName, SampleCustomerName, SampleState);
+
+    private MarkupString PreviewBody =>
+        new(PlainTextToHtml(ApplyMergeTags(_body, SampleFirstName, SampleCustomerName, SampleState)));
+
+    private async Task SendTestAsync()
+    {
+        _testStatus = null;
+
+        var to = _testEmail.Trim();
+        if (string.IsNullOrWhiteSpace(to) || !to.Contains('@'))
+        {
+            _testSuccess = false;
+            _testStatus = "Enter a valid email address.";
+            return;
+        }
+
+        _testSending = true;
+        StateHasChanged();
+
+        try
+        {
+            var fromName = string.IsNullOrWhiteSpace(_config.FromName) ? "Scopes" : _config.FromName;
+            var fromAddress = string.IsNullOrWhiteSpace(_config.FromAddress) ? CompanyProfile.WorkshopEmail : _config.FromAddress;
+            var subject = "[TEST] " + PreviewSubject;
+
+            var builder = Gmail.Compose()
+                .To(to)
+                .Subject(subject)
+                .HtmlBody(PreviewBody.Value)
+                .From(fromName, fromAddress);
+
+            if (_attachments.Count > 0) builder.AttachRange(_attachments);
+
+            await builder.SendAsync();
+            _testSuccess = true;
+            _testStatus = $"Test email sent to {to}.";
+        }
+        catch (Exception ex)
+        {
+            _testSuccess = false;
+            _testStatus = $"Failed: {ex.Message}";
+        }
+        finally
+        {
+            _testSending = false;
+            StateHasChanged();
+        }
+    }
+
+    private static string PlainTextToHtml(string text)
+    {
+        var escaped = System.Net.WebUtility.HtmlEncode(text ?? "");
+        var withBreaks = escaped.Replace("\r\n", "\n").Replace("\n", "<br>");
+        return $"<div style=\"font-family:sans-serif;font-size:14px;\">{withBreaks}</div>";
+    }
+
+}

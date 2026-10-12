@@ -1,0 +1,52 @@
+﻿@using BlazorBootstrap
+
+@rendermode InteractiveServer
+
+<div class="top-row ps-3 navbar navbar-dark">
+    <div class="container-fluid justify-content-start flex-nowrap">
+        @* Plain JS, not @onclick — the toggle lives on <html> (App.razor's __toggleNav). *@
+        <button type="button" class="nav-hide-btn" title="Hide menu" aria-label="Hide menu"
+                onclick="window.__toggleNav()"><i class="bi bi-list"></i></button>
+        <a class="navbar-brand" href="">Workshop Dashboard</a>
+    </div>
+</div>
+
+<AuthorizeView>
+    <Authorized>
+        <div class="px-3 pt-3">
+            <JmsStatusIndicator />
+        </div>
+
+        <nav class="nav nav-pills flex-column p-3 pb-0">
+            <NavLink class="nav-link" href="" Match="NavLinkMatch.All">🏠 Home</NavLink>
+            <NavLink class="nav-link" href="overview">📈 Overview</NavLink>
+        </nav>
+
+        @* Sections and links come from NavCatalog, shared with Home.razor. *@
+        <div class="px-3">
+            <Accordion>
+                @foreach (var group in NavCatalog.VisibleTo(context.User))
+                {
+                    <AccordionItem Title="@($"{group.Icon} {group.Title}")">
+                        <Content>
+                            <nav class="nav nav-pills flex-column">
+                                @foreach (var tool in group.Tools)
+                                {
+                                    <NavLink class="nav-link nav-sub-link" href="@tool.Href">@tool.Title</NavLink>
+                                }
+                            </nav>
+                        </Content>
+                    </AccordionItem>
+                }
+            </Accordion>
+        </div>
+
+        <nav class="nav nav-pills flex-column p-3">
+            <NavLink class="nav-link text-danger" href="logout">🚪 Log Out</NavLink>
+        </nav>
+
+        <div class="sidebar-footer px-3 pb-3 d-flex justify-content-center">
+            <ThemeSwitcher />
+        </div>
+    </Authorized>
+</AuthorizeView>

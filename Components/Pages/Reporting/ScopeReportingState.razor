@@ -1,0 +1,254 @@
+@page "/scope-reporting/state/{State}"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+
+@inherits JmsComponentBase
+
+@using Microsoft.AspNetCore.Components
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Reporting
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@inject ScopeCustomerStore ScopeCustomers
+@inject ScopeJobStore ScopeJobs
+@inject ScopeReportLookup ReportLookup
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    ScopeReportingState — State page of the Scope Reporting drill-down.
+    See ScopeReportingOverview for where the numbers come from and what's
+    still a placeholder (Paid / Outstanding).
+
+    Same stat tiles as the overview, scoped to customers whose State matches
+    the route segment (or with no State set, when State == "Unassigned").
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="d-flex align-items-center gap-3 mb-3">
+    <Button Color="ButtonColor.Secondary" Outline="true" @onclick="GoBack">← Back</Button>
+    <h3 class="mb-0">@State — Scope Reporting</h3>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else if (_rows.Count == 0)
+{
+    <Callout Color="CalloutColor.Info" Heading="No scope customers in this state">
+        Assign a state to a customer on the <a href="/scope-customers">Scope Customer Manager</a> page.
+    </Callout>
+}
+else
+{
+    <div class="d-flex align-items-center gap-2 mb-4">
+        <label class="form-label mb-0">Period</label>
+        <select class="form-select" style="max-width:220px;" value="@_period.Key" @onchange="OnPeriodChanged">
+            @foreach (var p in ScopeReportingPeriod.All())
+            {
+                <option value="@p.Key">@p.Label</option>
+            }
+        </select>
+        <span class="text-muted small">@_period.Start.ToString("d MMM yyyy") – @_period.End.ToString("d MMM yyyy")</span>
+    </div>
+
+    <div class="row row-cols-1 row-cols-md-3 row-cols-xl-6 g-3 mb-4">
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Repairs</p>
+                    <p class="fs-3 mb-0">@_stateStats.JobCount</p>
+                    <p class="text-muted small mb-0">@_stateStats.CompletedCount completed &middot; @_stateStats.OpenCount open</p>
+                    @if (_stateStats.ClosedWithoutInvoiceCount > 0)
+                    {
+                        <p class="text-danger small mb-0">@_stateStats.ClosedWithoutInvoiceCount closed w/o invoice</p>
+                    }
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Invoiced</p>
+                    <p class="fs-3 mb-0">@FormatMoney(_stateStats.InvoicedTotal)</p>
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Paid</p>
+                    <p class="fs-3 mb-0">@FormatMoney(_stateStats.PaidTotal)</p>
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Outstanding</p>
+                    <p class="fs-3 mb-0">@FormatMoney(_stateStats.OutstandingTotal)</p>
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Avg Turnaround</p>
+                    <p class="fs-3 mb-0">@FormatDays(_stateStats.AvgTurnaroundDays)</p>
+                </CardBody>
+            </Card>
+        </div>
+        <div class="col">
+            <Card>
+                <CardBody>
+                    <p class="text-muted small mb-1">Response Time</p>
+                    <p class="fs-3 mb-0">@FormatDays(_stateStats.AvgResponseDays)</p>
+                </CardBody>
+            </Card>
+        </div>
+    </div>
+
+    <h5 class="mb-3">By Customer</h5>
+    <Card>
+        <CardBody>
+            <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                    <thead>
+                        <tr>
+                            <th>Customer</th>
+                            <th>Tags</th>
+                            <th class="text-end">Repairs</th>
+                            <th class="text-end">No Invoice</th>
+                            <th class="text-end">Invoiced</th>
+                            <th class="text-end">Paid</th>
+                            <th class="text-end">Outstanding</th>
+                            <th class="text-end">Avg Turnaround</th>
+                            <th class="text-end">Response Time</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var row in _rows.OrderBy(r => r.Customer.DisplayName, StringComparer.OrdinalIgnoreCase))
+                        {
+                            <tr>
+                                <td>@row.Customer.DisplayName</td>
+                                <td class="small">
+                                    @if (row.Customer.Tags.Count == 0)
+                                    {
+                                        <span class="text-muted">—</span>
+                                    }
+                                    else
+                                    {
+                                        @foreach (var tag in row.Customer.Tags)
+                                        {
+                                            <span class="badge text-bg-secondary me-1">@tag</span>
+                                        }
+                                    }
+                                </td>
+                                <td class="text-end">@row.Stats.JobCount</td>
+                                <td class="text-end @(row.Stats.ClosedWithoutInvoiceCount > 0 ? "text-danger" : "")">@row.Stats.ClosedWithoutInvoiceCount</td>
+                                <td class="text-end">@FormatMoney(row.Stats.InvoicedTotal)</td>
+                                <td class="text-end">@FormatMoney(row.Stats.PaidTotal)</td>
+                                <td class="text-end">@FormatMoney(row.Stats.OutstandingTotal)</td>
+                                <td class="text-end">@FormatDays(row.Stats.AvgTurnaroundDays)</td>
+                                <td class="text-end">@FormatDays(row.Stats.AvgResponseDays)</td>
+                                <td class="text-end">
+                                    <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                            @onclick="@(() => GoToCustomer(row.Customer))">
+                                        View
+                                    </Button>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        </CardBody>
+    </Card>
+}
+
+@code {
+    [Parameter] public string State { get; set; } = "";
+    [SupplyParameterFromQuery(Name = "period")] public string? PeriodKey { get; set; }
+
+    private bool _loading = true;
+    private List<CustomerRow> _rows = new();
+    private ScopeReportStats _stateStats = new();
+    private ScopeReportingPeriod _period;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _period = ScopeReportingPeriod.Resolve(PeriodKey);
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        _loading = true;
+        StateHasChanged();
+
+        var all = await ScopeCustomers.LoadAsync();
+        var customers = all
+            .Where(c => string.Equals(
+                string.IsNullOrWhiteSpace(c.State) ? "Unassigned" : c.State,
+                State, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        if (customers.Count == 0)
+        {
+            _rows = new();
+            _stateStats = new();
+            _loading = false;
+            StateHasChanged();
+            return;
+        }
+
+        var exclusions = await ScopeJobs.LoadAsync();
+        var allIds = customers.SelectMany(c => c.CompanyIds).Distinct().ToList();
+
+        var byCompany = await ReportLookup.GetStatsByCompanyAsync(allIds, exclusions, _period.Start, _period.End);
+
+        _rows = customers
+            .Select(c => new CustomerRow { Customer = c, Stats = ScopeReportStatsParser.Aggregate(byCompany, c.CompanyIds) })
+            .ToList();
+        _stateStats = ScopeReportStatsParser.Aggregate(byCompany, allIds);
+
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private void OnPeriodChanged(ChangeEventArgs e) =>
+        Nav.NavigateTo(Nav.GetUriWithQueryParameter("period", e.Value?.ToString()));
+
+    private void GoBack() =>
+        Nav.NavigateTo($"/scope-reporting?period={Uri.EscapeDataString(_period.Key)}");
+
+    private void GoToCustomer(ScopeCustomer c)
+    {
+        var ids = string.Join(",", c.CompanyIds);
+        Nav.NavigateTo($"/scope-reporting/customer/{Uri.EscapeDataString(c.DisplayName)}/{ids}?period={Uri.EscapeDataString(_period.Key)}");
+    }
+
+    private static string FormatMoney(decimal amount) => $"${amount:N0}";
+
+    private static string FormatDays(double? days) => days.HasValue ? $"{days.Value:0.#}d" : "—";
+
+    private class CustomerRow
+    {
+        public ScopeCustomer Customer { get; set; } = new();
+        public ScopeReportStats Stats { get; set; } = new();
+    }
+}

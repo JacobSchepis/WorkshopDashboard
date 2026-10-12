@@ -1,0 +1,11 @@
+/* Each customer card is one big link (see WaitingQuote.razor) — show it's clickable. The .card
+   itself is rendered by Blazor.Bootstrap's <Card>, a child component, hence ::deep. */
+.quote-card ::deep .card {
+    transition: border-color .15s, box-shadow .15s;
+}
+
+.quote-card:hover ::deep .card,
+.quote-card:focus-visible ::deep .card {
+    border-color: var(--bs-primary);
+    box-shadow: 0 .25rem .75rem rgba(0, 0, 0, .12);
+}

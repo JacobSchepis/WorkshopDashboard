@@ -1,0 +1,1424 @@
+@page "/monday"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+
+@using System.Globalization
+@using System.Text.Json
+@using CsvHelper
+@using CsvHelper.Configuration
+@using HtmlAgilityPack
+@using Microsoft.AspNetCore.Components.Authorization
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Components.Forms
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.External.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Monday
+@using WorkshopDashboard.Services.External
+@using WorkshopDashboard.Services.External.Monday
+@using Microsoft.Extensions.Options
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Analytics
+@using WorkshopDashboard.Services.Stores
+
+@inject IMondayClient Monday
+@inject TrackingService TrackingService
+@inject AuthenticationStateProvider AuthStateProvider
+@inject MondayPurchasingService Purchasing
+@inject AnalyticsService Analytics
+@inject IOptions<MondayOptions> MondayConfig
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    MondayIntegration — the Purchasing board (monday.com) cross-referenced
+    against JMS purchase order data, with three write-actions layered on top.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      Monday               — reads the board itself (items + column values)
+      Purchasing           — everything JMS-side: PO cross-reference, receive,
+                              reassign job, add-to-job, live pricing lookup
+      TrackingService       — connote -> carrier -> live tracking status
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      LoadItems() pulls the board, then kicks off two things in parallel:
+      tracking lookups (per item, from its Connote column) and the JMS PO
+      cross-reference (batch-fetched once for every "PO" column value on
+      screen). Both populate dictionaries keyed by item id / PO id that the
+      card markup reads directly — no per-card JMS calls.
+
+    ── The three write-actions (each its own modal) ────────────────────────
+      1. Receive items   — mirrors JMS's CreateDeliveryDocket flow.
+      2. Reassign job     — a direct vendor_item_order_vuom.job_no UPDATE.
+      3. Add to job       — submits the real AddJobParts form.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="d-flex flex-wrap align-items-center gap-2 mb-3">
+    <h3 class="mb-0 me-auto">🛒 Purchasing</h3>
+
+    <select class="form-select form-select-sm" style="max-width: 190px;" @bind="_selectedGroupId" @bind:after="LoadItems">
+        @foreach (var group in PurchasingGroups)
+        {
+            <option value="@group.Id">@group.Label</option>
+        }
+    </select>
+
+    <input type="search" class="form-control form-control-sm" style="max-width: 240px;"
+           placeholder="🔍 Search..." value="@_searchText" @oninput="OnSearchChanged" />
+
+    <select class="form-select form-select-sm" style="max-width: 190px;" @bind="_sortBy">
+        <option value="urgency">Sort: Urgency</option>
+        <option value="status">Sort: Status</option>
+        <option value="dateRequired">Sort: Date Required</option>
+        <option value="requestedDate">Sort: Requested Date</option>
+        <option value="lastUpdated">Sort: Last Updated</option>
+        <option value="vendor">Sort: Vendor</option>
+        <option value="jobNumber">Sort: Job Number</option>
+        <option value="name">Sort: Name</option>
+    </select>
+
+    <button class="btn btn-outline-secondary btn-sm" @onclick="() => _sortDescending = !_sortDescending" title="Toggle sort direction">
+        @(_sortDescending ? "⬇️" : "⬆️")
+    </button>
+
+    <button class="btn btn-outline-primary btn-sm" @onclick="LoadItems" disabled="@_loadingItems">
+        @(_loadingItems ? "Refreshing..." : "🔄 Refresh")
+    </button>
+</div>
+
+@if (_loadingItems)
+{
+    <p>Loading purchasing board...</p>
+}
+else if (_itemLoadError != null)
+{
+    <div class="alert alert-danger">@_itemLoadError</div>
+}
+else if (_items.Count == 0)
+{
+    <p>No items found on the Purchasing board.</p>
+}
+else
+{
+    var displayItems = GetDisplayItems();
+
+    @if (displayItems.Count == 0)
+    {
+        <p class="text-muted">No items match "@_searchText".</p>
+    }
+
+    <div class="row g-2">
+        @foreach (var item in displayItems)
+        {
+            var (urgencyColor, urgencyIcon) = UrgencyStyle(Val(item, "URGENCY"));
+            var jobNumber = Val(item, "Job Number");
+            var connote = Val(item, "Connote");
+
+            <div class="col-12">
+                <div class="card shadow-sm" style="border-left: 6px solid @urgencyColor">
+                    <div class="card-body">
+                        <div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-2">
+                            <div class="d-flex flex-wrap align-items-center gap-2">
+                                <h6 class="card-title mb-0">@item.Name</h6>
+                                <span class="badge text-dark" style="background-color:@urgencyColor">
+                                    @urgencyIcon @Val(item, "URGENCY")
+                                </span>
+                                <span class="badge @StatusBadgeClass(Val(item, "Status")) text-wrap">@Val(item, "Status")</span>
+                            </div>
+                            <div class="text-muted small">🕒 Updated @Val(item, "Last updated")</div>
+                        </div>
+
+                        <div class="row g-3 border-top pt-2 mb-2">
+                            <div class="col-12 col-md-4">
+                                <div class="text-uppercase text-muted small fw-semibold mb-1">📋 Request</div>
+                                <div class="small">👤 @OrDash(Val(item, "Requester's Name"))</div>
+                                <div class="small">🧑‍💼 @OrDash(Val(item, "ASSIGNED"))</div>
+                                <div class="small">🏷️ @OrDash(Val(item, "Purchase Category"))</div>
+                                <div class="small">
+                                    🔧 Job
+                                    @if (!string.IsNullOrWhiteSpace(jobNumber))
+                                    {
+                                        <a href="@JmsLinks.JobSummary(jobNumber)" target="_blank" rel="noopener noreferrer">#@jobNumber</a>
+                                    }
+                                    else
+                                    {
+                                        <text>—</text>
+                                    }
+                                </div>
+                                <div class="small">📅 Requested @ShortDate(Val(item, "Requested Date"))</div>
+                                <div class="small">⏰ Needed @ShortDate(Val(item, "Date Required"))</div>
+                            </div>
+
+                            <div class="col-12 col-md-4 border-start ps-md-3">
+                                <div class="text-uppercase text-muted small fw-semibold mb-1">🗄️ Purchase Order</div>
+                                <div class="small">📄 PO @OrDash(Val(item, "PO"))</div>
+                                <div class="small">🏭 @OrDash(Val(item, "Vendor/ Supplier"))</div>
+                                <div class="small">🚚 @OrDash(Val(item, "Transfer Type"))</div>
+                                @if (!string.IsNullOrWhiteSpace(connote))
+                                {
+                                    <div class="small">
+                                        🔗 <span class="fw-semibold">@connote</span>
+                                        @RenderTracking(item.Id)
+                                    </div>
+                                }
+
+                                @if (int.TryParse(Val(item, "PO"), out var poId))
+                                {
+                                    if (_jmsOrders.TryGetValue(poId, out var po))
+                                    {
+                                        var jobMismatch = int.TryParse(jobNumber, out var jobNumInt)
+                                            && po.JobNumbers.Count > 0
+                                            && !po.JobNumbers.Contains(jobNumInt);
+
+                                        <div class="small mt-1 pt-1 border-top">
+                                            <span class="fw-semibold">@OrDash(po.OrderStatus)</span>
+                                            · @po.DeliveredQty/@po.OrderQty delivered
+                                            · @FormatCost(po.TotalCost.ToString(CultureInfo.InvariantCulture))
+                                            @if (po.FullyPaid)
+                                            {
+                                                <span class="text-success">✔ Paid</span>
+                                            }
+                                            else
+                                            {
+                                                <span class="text-warning">⏳ Unpaid</span>
+                                            }
+                                            @if (jobMismatch)
+                                            {
+                                                <div class="text-danger">⚠ JMS has this PO under job(s) #@string.Join(", ", po.JobNumbers) — Monday says #@jobNumber</div>
+                                            }
+                                            @if (po.Lines.Count > 0)
+                                            {
+                                                <div class="mt-1">
+                                                    <button type="button" class="btn btn-outline-success btn-sm py-0" @onclick="() => OpenReceive(po)">📥 Receive Items</button>
+                                                </div>
+                                            }
+                                        </div>
+                                    }
+                                    else
+                                    {
+                                        <div class="small text-warning mt-1 pt-1 border-top">⚠️ Not found in JMS</div>
+                                    }
+                                }
+                            </div>
+
+                            <div class="col-12 col-md-4 border-start ps-md-3">
+                                <div class="text-uppercase text-muted small fw-semibold mb-1">💰 Costs</div>
+                                <div class="small">Approx: @FormatCost(Val(item, "Approx Cost"))</div>
+                                <div class="small">Actual: @FormatCost(Val(item, "Actual Cost to Us"))</div>
+                                <div class="small">Invoiced: @FormatCost(Val(item, "Invoiced Amount"))</div>
+                                @if (!string.IsNullOrWhiteSpace(Val(item, "Invoice No.")))
+                                {
+                                    <div class="small">🧾 Invoice #@Val(item, "Invoice No.")</div>
+                                }
+                            </div>
+                        </div>
+
+                        @{
+                            var description = Val(item, "Qty / Part No / Description");
+                            var summary = Val(item, "Summarize updates");
+                            var hasPoLines = int.TryParse(Val(item, "PO"), out var previewPoId)
+                                && _jmsOrders.TryGetValue(previewPoId, out var previewPo)
+                                && previewPo.Lines.Count > 0;
+                        }
+                        @if (!string.IsNullOrWhiteSpace(description) || !string.IsNullOrWhiteSpace(summary) || hasPoLines)
+                        {
+                            @if (!string.IsNullOrWhiteSpace(description) || !string.IsNullOrWhiteSpace(summary))
+                            {
+                                <div class="small text-muted text-truncate">
+                                    @(!string.IsNullOrWhiteSpace(description) ? "📦 " + description : "💬 " + summary)
+                                </div>
+                            }
+                            <button type="button" class="btn btn-link btn-sm p-0" @onclick="() => _detailItem = item">🔍 View details</button>
+                        }
+                    </div>
+                </div>
+            </div>
+        }
+    </div>
+}
+
+@if (_detailItem is not null)
+{
+    <div class="modal d-block" tabindex="-1" style="background-color: rgba(0,0,0,0.5);" @onclick="CloseDetail">
+        <div class="modal-dialog modal-dialog-scrollable modal-lg" @onclick:stopPropagation="true">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">@_detailItem.Name</h5>
+                    <button type="button" class="btn-close" @onclick="CloseDetail"></button>
+                </div>
+                <div class="modal-body">
+                    @{
+                        var detailDescription = Val(_detailItem, "Qty / Part No / Description");
+                        var detailSummary = Val(_detailItem, "Summarize updates");
+                    }
+                    @if (!string.IsNullOrWhiteSpace(detailDescription))
+                    {
+                        <h6>📦 Qty / Part No / Description</h6>
+                        <p style="white-space: pre-wrap;">@detailDescription</p>
+                    }
+                    @if (!string.IsNullOrWhiteSpace(detailSummary))
+                    {
+                        <h6>💬 Summary</h6>
+                        <p style="white-space: pre-wrap;">@detailSummary</p>
+                    }
+
+                    @if (int.TryParse(Val(_detailItem, "PO"), out var detailPoId) && _jmsOrders.TryGetValue(detailPoId, out var detailPo) && detailPo.Lines.Count > 0)
+                    {
+                        <h6>🗄️ JMS PO #@detailPo.VendorItemOrderId Lines</h6>
+                        <table class="table table-sm">
+                            <thead>
+                                <tr>
+                                    <th>Part</th>
+                                    <th>Job</th>
+                                    <th>Qty (delivered/ordered)</th>
+                                    <th>Cost</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var line in detailPo.Lines)
+                                {
+                                    <tr>
+                                        <td>
+                                            <div class="fw-semibold">@OrDash(line.PartCode)</div>
+                                            <div class="small text-muted">@line.PartDescription</div>
+                                        </td>
+                                        <td>
+                                            @if (line.JobNumber is > 0)
+                                            {
+                                                <a href="@JmsLinks.JobSummary(line.JobNumber)" target="_blank" rel="noopener noreferrer">#@line.JobNumber</a>
+                                            }
+                                            else
+                                            {
+                                                <text>—</text>
+                                            }
+                                            <button type="button" class="btn btn-link btn-sm p-0 ms-1" title="Reassign job" @onclick="() => OpenEditJob(line)">✏️</button>
+                                        </td>
+                                        <td>@line.DeliveredQty/@line.OrderQty</td>
+                                        <td>@FormatCost(line.TotalCost.ToString(CultureInfo.InvariantCulture))</td>
+                                        <td>
+                                            @if (line.DeliveredQty > 0)
+                                            {
+                                                <button type="button" class="btn btn-outline-primary btn-sm" @onclick="() => OpenAddPart(line)">➕ Add to Job</button>
+                                            }
+                                        </td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    }
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_receivePo is not null)
+{
+    <div class="modal d-block" tabindex="-1" style="background-color: rgba(0,0,0,0.5);" @onclick="CloseReceive">
+        <div class="modal-dialog modal-dialog-scrollable modal-lg" @onclick:stopPropagation="true">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">📥 Receive — PO #@_receivePo.VendorItemOrderId (@_receivePo.VendorName)</h5>
+                    <button type="button" class="btn-close" @onclick="CloseReceive"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="text-muted small">
+                        Field names for serial-number lines were copied from one real captured submission — test with a throwaway PO first.
+                        Pick a mode per line, fill it in, and leave a line untouched to skip it.
+                    </p>
+
+                    <div class="row g-2 mb-3">
+                        <div class="col-6">
+                            <label class="form-label small mb-0">Docket Number</label>
+                            <input class="form-control form-control-sm" @bind="_receiveDocketNo" />
+                        </div>
+                        <div class="col-6">
+                            <label class="form-label small mb-0">Delivery Date</label>
+                            <input type="date" class="form-control form-control-sm" @bind="_receiveDate" />
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label small mb-0">Notes</label>
+                            <textarea class="form-control form-control-sm" rows="2" @bind="_receiveNotes"></textarea>
+                        </div>
+                    </div>
+
+                    <table class="table table-sm">
+                        <thead>
+                            <tr>
+                                <th>Part</th>
+                                <th>Job</th>
+                                <th>Delivered/Ordered</th>
+                                <th style="min-width:220px;">Receive</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var line in _receivePo.Lines)
+                            {
+                                var state = _receiveLines[line.VendorItemOrderVuomId];
+
+                                <tr>
+                                    <td>
+                                        <div class="fw-semibold">
+                                            @OrDash(line.PartCode)
+                                            @if (line.TrackSerial)
+                                            {
+                                                <span class="badge bg-secondary" title="item_master.track_serial = t">🔤</span>
+                                            }
+                                        </div>
+                                        <div class="small text-muted">@line.PartDescription</div>
+                                    </td>
+                                    <td>@(line.JobNumber is > 0 ? $"#{line.JobNumber}" : "—")</td>
+                                    <td>@line.DeliveredQty/@line.OrderQty</td>
+                                    <td>
+                                        @if (state.Mode == "serial")
+                                        {
+                                            <input type="number" min="0" max="@state.Remaining" class="form-control form-control-sm mb-1" placeholder="Qty (sets # of serials)"
+                                                   value="@state.Quantity"
+                                                   @oninput="e => OnReceiveQuantityChanged(line.VendorItemOrderVuomId, e)" />
+                                            @for (var s = 0; s < state.SerialNumbers.Count; s++)
+                                            {
+                                                var idx = s;
+                                                <input class="form-control form-control-sm mb-1" placeholder="Serial #@(idx + 1)"
+                                                       value="@state.SerialNumbers[idx]"
+                                                       @oninput="e => OnSerialNumberChanged(line.VendorItemOrderVuomId, idx, e)" />
+                                            }
+                                        }
+                                        else
+                                        {
+                                            <input type="number" min="0" max="@state.Remaining" class="form-control form-control-sm" placeholder="Qty"
+                                                   value="@state.Quantity"
+                                                   @oninput="e => OnReceiveQuantityChanged(line.VendorItemOrderVuomId, e)" />
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+
+                    @if (_receiveResultMessage is not null)
+                    {
+                        <div class="alert @(_receiveResultIsError ? "alert-danger" : "alert-success") py-2 mb-0">@_receiveResultMessage</div>
+                    }
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary btn-sm" @onclick="CloseReceive">Close</button>
+                    <button type="button" class="btn btn-success btn-sm" @onclick="SubmitReceiveAsync" disabled="@_receiveSubmitting">
+                        @(_receiveSubmitting ? "Submitting..." : "Confirm & Receive")
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_editJobLine is not null)
+{
+    <div class="modal d-block" tabindex="-1" style="background-color: rgba(0,0,0,0.5);" @onclick="CloseEditJob">
+        <div class="modal-dialog modal-dialog-centered modal-sm" @onclick:stopPropagation="true">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h6 class="modal-title">Reassign Job</h6>
+                    <button type="button" class="btn-close" @onclick="CloseEditJob"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="small text-muted mb-2">
+                        @OrDash(_editJobLine.PartCode) — currently
+                        @(_editJobLine.JobNumber is > 0 ? $"job #{_editJobLine.JobNumber}" : "unassigned").
+                        This runs a direct <code>UPDATE vendor_item_order_vuom</code> — it does not touch job_part or any invoicing tables.
+                    </p>
+                    <label class="form-label small mb-0">New Job Number</label>
+                    <input type="number" class="form-control form-control-sm" @bind="_editJobNewValue" />
+
+                    @if (_editJobResultMessage is not null)
+                    {
+                        <div class="alert @(_editJobResultIsError ? "alert-danger" : "alert-success") py-2 mt-2 mb-0">@_editJobResultMessage</div>
+                    }
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary btn-sm" @onclick="CloseEditJob">Cancel</button>
+                    <button type="button" class="btn btn-primary btn-sm" @onclick="SubmitEditJobAsync" disabled="@_editJobSubmitting">
+                        @(_editJobSubmitting ? "Saving..." : "Save")
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_addPartLine is not null)
+{
+    <div class="modal d-block" tabindex="-1" style="background-color: rgba(0,0,0,0.5);" @onclick="CloseAddPart">
+        <div class="modal-dialog modal-dialog-scrollable" @onclick:stopPropagation="true">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h6 class="modal-title">➕ Add to Job — @OrDash(_addPartLine.PartCode)</h6>
+                    <button type="button" class="btn-close" @onclick="CloseAddPart"></button>
+                </div>
+                <div class="modal-body">
+                    <p class="small text-muted">
+                        Submits the real AddJobParts form — same server-side logic as adding it by hand.
+                        Field values for serialized items are copied from one real captured submission; test carefully.
+                    </p>
+
+                    <label class="form-label small mb-0">Job Number</label>
+                    <input type="number" class="form-control form-control-sm mb-2" @bind="_addPartJobNumber" @bind:after="OnAddPartJobNumberChanged" />
+
+                    <label class="form-label small mb-0">Equipment (optional)</label>
+                    @if (_addPartLoadingEquipment)
+                    {
+                        <p class="small text-muted mb-2">Loading equipment…</p>
+                    }
+                    else if (_addPartEquipmentOptions.Count == 0)
+                    {
+                        <p class="small text-muted mb-2">No active equipment found on this job.</p>
+                    }
+                    else
+                    {
+                        <select class="form-select form-select-sm mb-2" @bind="_addPartEquipmentId">
+                            <option value="">— None —</option>
+                            @foreach (var eq in _addPartEquipmentOptions)
+                            {
+                                <option value="@eq.EquipmentId">@eq.ModelName — @eq.SerialNo</option>
+                            }
+                        </select>
+                    }
+
+                    <label class="form-label small mb-0">Technician</label>
+                    <OwnerSection @ref="_addPartOwnerSection" />
+
+                    <label class="form-label small mb-0 mt-2">Discount (%)</label>
+                    <input type="number" min="0" class="form-control form-control-sm mb-2" @bind="_addPartDiscount" />
+
+                    @if (_addPartLoadingPricing)
+                    {
+                        <p class="small text-muted">Loading pricing…</p>
+                    }
+                    else if (_addPartPricing is null)
+                    {
+                        <p class="small text-danger">Couldn't load live pricing for this item — check master_item_id or try again.</p>
+                    }
+                    else
+                    {
+                        <p class="small text-muted">
+                            List @FormatCost(_addPartPricing.ListPrice?.ToString(CultureInfo.InvariantCulture) ?? "")
+                            · Buy @FormatCost(_addPartPricing.BuyPrice?.ToString(CultureInfo.InvariantCulture) ?? "")
+                            · In stock @(_addPartPricing.StockQty ?? 0)
+                        </p>
+                    }
+
+                    @if (_addPartLine.TrackSerial)
+                    {
+                        <label class="form-label small mb-0">Select Serial Number(s) Received Against This PO</label>
+                        @if (_addPartAvailableUnits.Count == 0)
+                        {
+                            <p class="small text-warning">No received, unconsumed stock found for this line.</p>
+                        }
+                        else
+                        {
+                            @foreach (var unit in _addPartAvailableUnits)
+                            {
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" id="@($"addpart_stock_{unit.StockId}")"
+                                           checked="@_addPartSelectedStockIds.Contains(unit.StockId)"
+                                           @onchange="e => OnStockUnitToggled(unit.StockId, e)" />
+                                    <label class="form-check-label small" for="@($"addpart_stock_{unit.StockId}")">
+                                        @(string.IsNullOrWhiteSpace(unit.SerialNo) ? $"Stock #{unit.StockId}" : unit.SerialNo)
+                                    </label>
+                                </div>
+                            }
+                        }
+                    }
+                    else
+                    {
+                        <label class="form-label small mb-0">Quantity</label>
+                        <input type="number" min="0" max="@_addPartLine.DeliveredQty" class="form-control form-control-sm" @bind="_addPartQuantity" />
+                    }
+
+                    @if (_addPartResultMessage is not null)
+                    {
+                        <div class="alert @(_addPartResultIsError ? "alert-danger" : "alert-success") py-2 mt-2 mb-0">@_addPartResultMessage</div>
+                    }
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary btn-sm" @onclick="CloseAddPart">Cancel</button>
+                    <button type="button" class="btn btn-primary btn-sm" @onclick="SubmitAddPartAsync" disabled="@(_addPartSubmitting || _addPartLoadingPricing)">
+                        @(_addPartSubmitting ? "Submitting..." : "Add Part")
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    // Purchasing board on monday.com — ids come from MondayOptions, looked up once via
+    // the boards query.
+    private string PurchasingBoardId => MondayConfig.Value.PurchasingBoardId;
+
+    // The board has ~2000 items going back years; only these two groups (monday's
+    // sub-tables) matter for a working dashboard — completed/archived/declined orders
+    // are excluded. Group ids looked up once via GetGroupsAsync(PurchasingBoardId).
+    private (string Id, string Label)[] PurchasingGroups =>
+    [
+        (MondayConfig.Value.OpenOrdersGroupId, "Open Orders"),
+        (MondayConfig.Value.FinalisationGroupId, "Order Finalisation"),
+    ];
+
+    private string _selectedGroupId = "";
+
+    // Core board state — populated by LoadItems() and read from markup broadly.
+    // Everything else below lives next to the section that owns it.
+    private List<MondayItem> _items = new();
+    private Dictionary<string, string> _colIdByTitle = new();
+    private MondayItem? _detailItem;
+    private bool _loadingItems = true;
+    private string? _itemLoadError;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        _selectedGroupId = PurchasingGroups[0].Id;
+        await LoadItems();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // OwnerSection only mounts once the Add-to-Job modal opens, so this can't ride
+        // firstRender like UploadDocument.razor does — gated on its own flag instead.
+        if (_addPartNeedsOwnerPrefill && _addPartOwnerSection is not null)
+        {
+            _addPartNeedsOwnerPrefill = false;
+
+            var auth = await AuthStateProvider.GetAuthenticationStateAsync();
+            var user = auth.User.Identity?.Name;
+
+            if (user is not null)
+                await _addPartOwnerSection.PrefillOwnerFromUsernameAsync(user);
+        }
+    }
+
+    private async Task LoadItems()
+    {
+        _loadingItems = true;
+        _itemLoadError = null;
+        StateHasChanged();
+
+        try
+        {
+            var detail = await Monday.GetBoardDetailAsync(PurchasingBoardId, new[] { _selectedGroupId });
+
+            _colIdByTitle.Clear();
+            foreach (var col in detail.Columns)
+                _colIdByTitle[col.Title] = col.Id; // last one wins on duplicate titles (e.g. "Email")
+
+            _items = detail.Items;
+
+            if (_items.Count == 0 && detail.Columns.Count == 0)
+                _itemLoadError = "Couldn't load the Purchasing board — check Monday:ApiToken is set.";
+        }
+        catch (Exception ex)
+        {
+            _itemLoadError = $"Failed to load items: {ex.Message}";
+        }
+        finally
+        {
+            _loadingItems = false;
+            StateHasChanged();
+        }
+
+        await Task.WhenAll(LoadTrackingAsync(), LoadJmsPurchaseOrdersAsync());
+    }
+
+    // ── Column lookup ─────────────────────────────────────────────────────────
+
+    private string Val(MondayItem item, string columnTitle) =>
+        _colIdByTitle.TryGetValue(columnTitle, out var id) && item.ColumnValues.TryGetValue(id, out var v)
+            ? v ?? ""
+            : "";
+
+    // ── Search / sort ─────────────────────────────────────────────────────────
+
+    private string _searchText = "";
+    private string _sortBy = "urgency";
+    private bool _sortDescending = false;
+
+    private void OnSearchChanged(ChangeEventArgs e) => _searchText = e.Value?.ToString() ?? "";
+
+    private List<MondayItem> GetDisplayItems()
+    {
+        IEnumerable<MondayItem> query = _items;
+
+        if (!string.IsNullOrWhiteSpace(_searchText))
+        {
+            var q = _searchText.Trim();
+            query = query.Where(i =>
+                Contains(i.Name, q) ||
+                Contains(Val(i, "Requester's Name"), q) ||
+                Contains(Val(i, "ASSIGNED"), q) ||
+                Contains(Val(i, "Vendor/ Supplier"), q) ||
+                Contains(Val(i, "Job Number"), q) ||
+                Contains(Val(i, "PO"), q) ||
+                Contains(Val(i, "Status"), q) ||
+                Contains(Val(i, "Purchase Category"), q) ||
+                Contains(Val(i, "Qty / Part No / Description"), q) ||
+                Contains(Val(i, "Connote"), q) ||
+                Contains(Val(i, "Invoice No."), q));
+        }
+
+        query = _sortBy switch
+        {
+            "status" => query.OrderBy(i => Val(i, "Status"), StringComparer.OrdinalIgnoreCase),
+            "dateRequired" => query.OrderBy(i => ParseDate(Val(i, "Date Required")) ?? DateTime.MaxValue),
+            "requestedDate" => query.OrderByDescending(i => ParseDate(Val(i, "Requested Date")) ?? DateTime.MinValue),
+            "lastUpdated" => query.OrderByDescending(i => ParseDate(Val(i, "Last updated")) ?? DateTime.MinValue),
+            "vendor" => query.OrderBy(i => Val(i, "Vendor/ Supplier"), StringComparer.OrdinalIgnoreCase),
+            "jobNumber" => query.OrderBy(i => Val(i, "Job Number"), StringComparer.OrdinalIgnoreCase),
+            "name" => query.OrderBy(i => i.Name, StringComparer.OrdinalIgnoreCase),
+            _ => query.OrderBy(i => UrgencyRank(Val(i, "URGENCY"))).ThenBy(i => ParseDate(Val(i, "Date Required")) ?? DateTime.MaxValue),
+        };
+
+        var result = query.ToList();
+        if (_sortDescending) result.Reverse();
+        return result;
+    }
+
+    private static bool Contains(string haystack, string needle) =>
+        haystack.Contains(needle, StringComparison.OrdinalIgnoreCase);
+
+    // ── Tracking ──────────────────────────────────────────────────────────────
+
+    private Dictionary<string, TrackingResult> _tracking = new();
+
+    private async Task LoadTrackingAsync()
+    {
+        _tracking.Clear();
+        if (_items.Count == 0) return;
+
+        await TrackingService.PrimeAllAsync();
+
+        var tasks = _items.Select(async item =>
+        {
+            var (trackingNumber, carrier) = TrackingService.ExtractTracking(Val(item, "Connote"));
+            if (trackingNumber is null || carrier is null) return (item.Id, (TrackingResult?)null);
+
+            var result = await TrackingService.GetTrackingAsync(trackingNumber, carrier);
+            return (item.Id, (TrackingResult?)result);
+        });
+
+        foreach (var (itemId, result) in await Task.WhenAll(tasks))
+        {
+            if (result is not null)
+            {
+                _tracking[itemId] = result;
+                StateHasChanged();
+            }
+        }
+    }
+
+    private RenderFragment RenderTracking(string itemId) => __builder =>
+    {
+        if (!_tracking.TryGetValue(itemId, out var t))
+        {
+            __builder.AddContent(0, " (no tracking match)");
+            return;
+        }
+
+        __builder.OpenElement(0, "span");
+        __builder.AddAttribute(1, "class", "badge bg-secondary ms-1 me-1");
+        __builder.AddContent(2, t.Carrier);
+        __builder.CloseElement();
+
+        if (t.ErrorMessage != null)
+        {
+            __builder.OpenElement(3, "span");
+            __builder.AddAttribute(4, "class", "text-danger");
+            __builder.AddAttribute(5, "title", t.ErrorMessage);
+            __builder.AddContent(6, "⚠ Error");
+            __builder.CloseElement();
+        }
+        else
+        {
+            __builder.OpenElement(3, "span");
+            __builder.AddAttribute(4, "class", t.IsDelivered ? "text-success fw-bold" : "");
+            __builder.AddContent(5, t.IsDelivered ? "✅ " + t.Status : t.Status);
+            __builder.CloseElement();
+        }
+
+        if (t.LastLocation != null || t.LastEventTime.HasValue)
+        {
+            __builder.OpenElement(6, "br");
+            __builder.CloseElement();
+            __builder.OpenElement(7, "small");
+            __builder.AddAttribute(8, "class", "text-muted");
+            var meta = string.Join(" · ", new[] { t.LastLocation, t.LastEventTime?.ToString("dd MMM HH:mm") }.Where(s => s != null));
+            __builder.AddContent(9, meta);
+            __builder.CloseElement();
+        }
+    };
+
+    // ── JMS purchase order cross-reference ──────────────────────────────────
+    // Monday's "PO" column holds a vendor_item_order_id. Batch-fetch every PO
+    // referenced on screen and group the line-level rows client-side (same
+    // shape as the job/history queries in JmsQueries.cs).
+
+    private Dictionary<int, JmsPurchaseOrder> _jmsOrders = new();
+
+    private async Task LoadJmsPurchaseOrdersAsync()
+    {
+        var poIds = _items
+            .Select(i => Val(i, "PO"))
+            .Select(po => int.TryParse(po, out var id) ? id : (int?)null)
+            .Where(id => id.HasValue)
+            .Select(id => id!.Value)
+            .Distinct()
+            .ToList();
+
+        _jmsOrders = await Purchasing.LoadPurchaseOrdersByIdsAsync(poIds);
+    }
+
+    private void CloseDetail() => _detailItem = null;
+
+    // ── Receive items ────────────────────────────────────────────────────────
+    // Mirrors CreateDeliveryDocket's own flow (reverse-engineered from its
+    // view-source): that page loads NotYetReceivedItems for the chosen vendor
+    // to get each line's item_number (== vendor_item_order_vuom_id) paired with a
+    // stock_number id that isn't exposed anywhere else, then POSTs both back per line
+    // alongside a quantity. We already know which vuom ids we want to receive from our
+    // own SQL data — we still have to hit NotYetReceivedItems ourselves to learn
+    // the matching stock_number, since nothing else on JMS exposes it.
+
+    /// <summary>Per-line entry state in the Receive modal. Field names on submit mirror
+    /// a real captured payload exactly (see SubmitReceiveAsync) — two shapes:
+    /// plain (quantity_{id}) and serial (track_serial_{id}/total_sr_{id}/serial_no_{id}_{n}).
+    /// Batch/lot tracking isn't handled — not used anywhere in this system.</summary>
+    private class ReceiveLineState
+    {
+        public string Mode = "plain"; // plain | serial
+        public string Quantity = "";
+        public List<string> SerialNumbers = new();
+
+        /// <summary>OrderQty - DeliveredQty at modal-open time — the cap on how much of
+        /// this line can actually be received right now.</summary>
+        public int Remaining;
+    }
+
+    private JmsPurchaseOrder? _receivePo;
+    private Dictionary<int, ReceiveLineState> _receiveLines = new(); // vendor_item_order_vuom_id -> entry state
+    private string _receiveDocketNo = "";
+    private DateTime _receiveDate = DateTime.Today;
+    private string _receiveNotes = "";
+    private bool _receiveSubmitting;
+    private string? _receiveResultMessage;
+    private bool _receiveResultIsError;
+
+    private void OpenReceive(JmsPurchaseOrder po)
+    {
+        _receivePo = po;
+        _receiveLines = po.Lines.ToDictionary(
+            l => l.VendorItemOrderVuomId,
+            l => new ReceiveLineState
+            {
+                Mode = l.TrackSerial ? "serial" : "plain",
+                Remaining = Math.Max(0, l.OrderQty - l.DeliveredQty)
+            });
+        _receiveDocketNo = po.VendorItemOrderId.ToString();
+        _receiveDate = DateTime.Today;
+        _receiveNotes = "";
+        _receiveResultMessage = null;
+    }
+
+    private void CloseReceive() => _receivePo = null;
+
+    // Absolute backstop on top of the per-line Remaining cap below — only kicks in if
+    // Remaining itself is bad data, so a stray paste or a held-down spinner still can't
+    // render thousands of serial-number boxes and hang the page.
+    private const int MaxSerialCount = 200;
+
+    private void OnReceiveQuantityChanged(int vuomId, ChangeEventArgs e)
+    {
+        var state = _receiveLines[vuomId];
+        var raw = e.Value?.ToString() ?? "";
+        var cap = Math.Min(state.Remaining, MaxSerialCount);
+
+        // Clamp for both plain and serial — can't receive more than what's outstanding.
+        state.Quantity = int.TryParse(raw, out var q) ? Math.Clamp(q, 0, Math.Max(cap, 0)).ToString() : raw;
+
+        if (state.Mode == "serial")
+        {
+            var count = int.TryParse(state.Quantity, out var sq) && sq > 0 ? sq : 0;
+            while (state.SerialNumbers.Count < count) state.SerialNumbers.Add("");
+            while (state.SerialNumbers.Count > count) state.SerialNumbers.RemoveAt(state.SerialNumbers.Count - 1);
+        }
+    }
+
+    private void OnSerialNumberChanged(int vuomId, int index, ChangeEventArgs e)
+    {
+        var serials = _receiveLines[vuomId].SerialNumbers;
+        if (index < serials.Count) serials[index] = e.Value?.ToString() ?? "";
+    }
+
+    private static bool ReceiveLineHasContent(ReceiveLineState s) => s.Mode switch
+    {
+        "serial" => s.SerialNumbers.Count > 0 && s.SerialNumbers.All(x => !string.IsNullOrWhiteSpace(x)),
+        _ => !string.IsNullOrWhiteSpace(s.Quantity) && s.Quantity != "0"
+    };
+
+    private async Task SubmitReceiveAsync()
+    {
+        if (_receivePo is null) return;
+
+        var toReceive = _receiveLines.Where(kv => ReceiveLineHasContent(kv.Value)).ToDictionary(kv => kv.Key, kv => kv.Value);
+
+        if (toReceive.Count == 0)
+        {
+            _receiveResultMessage = "Enter something for at least one line.";
+            _receiveResultIsError = true;
+            return;
+        }
+
+        foreach (var (vuomId, state) in toReceive)
+        {
+            if (state.Mode == "serial")
+            {
+                if (!int.TryParse(state.Quantity, out var qty) || qty <= 0 || state.SerialNumbers.Count != qty || state.SerialNumbers.Any(string.IsNullOrWhiteSpace))
+                {
+                    _receiveResultMessage = $"Line {vuomId}: enter a quantity and fill in every serial number box.";
+                    _receiveResultIsError = true;
+                    return;
+                }
+            }
+            else if (!int.TryParse(state.Quantity, out var plainQty) || plainQty <= 0)
+            {
+                _receiveResultMessage = $"Line {vuomId}: enter a quantity greater than 0.";
+                _receiveResultIsError = true;
+                return;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(_receiveDocketNo))
+        {
+            _receiveResultMessage = "Docket number is required.";
+            _receiveResultIsError = true;
+            return;
+        }
+
+        _receiveSubmitting = true;
+        _receiveResultMessage = null;
+        StateHasChanged();
+
+        try
+        {
+            var pairs = await FetchNotYetReceivedPairsAsync(_receivePo.VendorCompanyId);
+
+            var missing = toReceive.Keys.Where(id => !pairs.ContainsKey(id)).ToList();
+            if (missing.Count > 0)
+            {
+                _receiveResultMessage = $"Line(s) {string.Join(", ", missing)} aren't in JMS's not-yet-received list for this vendor right now (already received, or the id didn't match) — nothing was submitted.";
+                _receiveResultIsError = true;
+                return;
+            }
+
+            var form = new Dictionary<string, string>
+            {
+                ["company_id"] = _receivePo.VendorCompanyId.ToString(),
+                ["delivery_type"] = "delivery",
+                ["vendor_company"] = _receivePo.VendorName,
+                ["docket_no"] = _receiveDocketNo,
+                ["delivery_date"] = _receiveDate.ToString("dd-MM-yyyy"),
+                ["notes"] = _receiveNotes,
+                ["total_item"] = pairs.Count.ToString(),
+                ["create_docket"] = "Create Docket"
+            };
+
+            // Submit every not-yet-received line for this vendor — a real captured
+            // payload showed JMS's own form does this (posts the vendor's full
+            // outstanding list every time, with quantity_{id}="" for lines not being
+            // received this round), not just the lines on the PO you're focused on.
+            var i = 1;
+            foreach (var (vuomId, stockNumber) in pairs)
+            {
+                form[$"item_number_{i}"] = vuomId.ToString();
+                form[$"stock_number_{i}"] = stockNumber.ToString();
+
+                if (toReceive.TryGetValue(vuomId, out var state))
+                {
+                    if (state.Mode == "serial")
+                    {
+                        form[$"track_serial_{vuomId}"] = "true";
+                        form[$"total_sr_{vuomId}"] = state.SerialNumbers.Count.ToString();
+                        // Mirrors a real captured submission exactly (delivery_type_{id} == total_sr_{id}
+                        // in both samples seen) — true meaning unconfirmed, replicated as observed.
+                        form[$"delivery_type_{vuomId}"] = state.SerialNumbers.Count.ToString();
+                        for (var s = 0; s < state.SerialNumbers.Count; s++)
+                            form[$"serial_no_{vuomId}_{s + 1}"] = state.SerialNumbers[s];
+                    }
+                    else
+                    {
+                        form[$"quantity_{vuomId}"] = state.Quantity;
+                    }
+                }
+                else
+                {
+                    form[$"quantity_{vuomId}"] = "";
+                }
+
+                i++;
+            }
+
+            var res = await Purchasing.SubmitReceiveDocketAsync(form);
+
+            if (!res.Success)
+            {
+                _receiveResultMessage = $"JMS returned HTTP {res.StatusCode}: {res.ReasonPhrase}";
+                _receiveResultIsError = true;
+                return;
+            }
+
+            _receiveResultMessage = $"Submitted docket \"{_receiveDocketNo}\" for {toReceive.Count} line(s). Reloading PO data...";
+            _receiveResultIsError = false;
+            await Analytics.TrackEventAsync("Items received — Monday purchasing");
+
+            await LoadJmsPurchaseOrdersAsync();
+
+            if (_jmsOrders.TryGetValue(_receivePo.VendorItemOrderId, out var updated))
+                _receivePo = updated;
+        }
+        catch (Exception ex)
+        {
+            _receiveResultMessage = $"Failed: {ex.Message}";
+            _receiveResultIsError = true;
+        }
+        finally
+        {
+            _receiveSubmitting = false;
+            StateHasChanged();
+        }
+    }
+
+    private Task<Dictionary<int, int>> FetchNotYetReceivedPairsAsync(int vendorCompanyId) =>
+        Purchasing.FetchNotYetReceivedPairsAsync(vendorCompanyId);
+
+    // ── Reassign job ─────────────────────────────────────────────────────────
+    // Deliberately just a scalar UPDATE on vendor_item_order_vuom.job_no — NOT an
+    // attempt to replicate AddJobParts. That page writes to `job_part`, which
+    // also carries equipment_id, unit_cost, discount, invoice/chargeable flags — real
+    // costing/invoicing data. Its own vuom_id field is hardcoded to 0 in every
+    // submission, meaning the server picks which on-order line to consume from a pool
+    // keyed by master_item_id, not by the specific vuom row — that selection logic
+    // isn't visible from the client side. Faking that INSERT blind risks corrupting
+    // job costing, so it's out of scope until someone can confirm the real values
+    // AddJobParts expects (technician/user_id, equipment_id, pricing).
+
+    private JmsPurchaseOrderLine? _editJobLine;
+    private string _editJobNewValue = "";
+    private bool _editJobSubmitting;
+    private string? _editJobResultMessage;
+    private bool _editJobResultIsError;
+
+    private void OpenEditJob(JmsPurchaseOrderLine line)
+    {
+        _editJobLine = line;
+        _editJobNewValue = line.JobNumber is > 0 ? line.JobNumber.ToString()! : "";
+        _editJobResultMessage = null;
+    }
+
+    private void CloseEditJob() => _editJobLine = null;
+
+    private async Task SubmitEditJobAsync()
+    {
+        if (_editJobLine is null) return;
+
+        if (!int.TryParse(_editJobNewValue, out var newJobNo) || newJobNo <= 0)
+        {
+            _editJobResultMessage = "Enter a valid job number.";
+            _editJobResultIsError = true;
+            return;
+        }
+
+        _editJobSubmitting = true;
+        _editJobResultMessage = null;
+        StateHasChanged();
+
+        try
+        {
+            var actualJobNo = await Purchasing.UpdateAndVerifyJobNoAsync(_editJobLine.VendorItemOrderVuomId, newJobNo);
+
+            if (actualJobNo != newJobNo)
+            {
+                _editJobResultMessage = actualJobNo is null
+                    ? "Couldn't confirm the update — the follow-up read failed. Check manually before relying on it."
+                    : $"Update didn't take effect — job_no is still {actualJobNo}.";
+                _editJobResultIsError = true;
+                return;
+            }
+
+            await LoadJmsPurchaseOrdersAsync();
+            CloseEditJob();
+        }
+        catch (Exception ex)
+        {
+            _editJobResultMessage = $"Failed: {ex.Message}";
+            _editJobResultIsError = true;
+        }
+        finally
+        {
+            _editJobSubmitting = false;
+            StateHasChanged();
+        }
+    }
+
+    // ── Add to job ───────────────────────────────────────────────────────────
+    // Submits the real AddJobParts form (same server-side logic a human triggers
+    // clicking "Add Part" — not a raw INSERT into job_part). Two real unknowns baked in
+    // deliberately as documented assumptions rather than silent guesses:
+    //  - vuom_id is always "0" in every real capture seen, even for serialized items —
+    //    the server evidently doesn't use it. For non-serialized lines this means we
+    //    can't guarantee THIS PO's stock gets consumed rather than another outstanding
+    //    order of the same master_item_id — but that ambiguity is inherent to JMS
+    //    itself (a human doing this manually has the exact same lack of control), not
+    //    something this automation introduces.
+    //  - Pricing (list_price/buy_price/landed_price) comes from a live, read-only
+    //    lookup (PartPricingSearch) — same call the real form makes — rather
+    //    than being computed from our own PO data, since that lookup may reflect
+    //    different values (blended/current) than what this specific PO paid.
+
+    private class StockUnit
+    {
+        public int StockId { get; set; }
+        public string SerialNo { get; set; } = "";
+    }
+
+    private class ItemPricingInfo
+    {
+        public decimal? BuyPrice;
+        public decimal? ListPrice;
+        public int? OrderedQty;
+        public int? StockQty;
+        public decimal? LandedPrice;
+    }
+
+    private class EquipmentOption
+    {
+        public int EquipmentId { get; set; }
+        public string ModelName { get; set; } = "";
+        public string SerialNo { get; set; } = "";
+    }
+
+    private JmsPurchaseOrderLine? _addPartLine;
+    private OwnerSection? _addPartOwnerSection;
+    private bool _addPartNeedsOwnerPrefill;
+    private string _addPartJobNumber = "";
+    private string _addPartEquipmentId = "";
+    private List<EquipmentOption> _addPartEquipmentOptions = new();
+    private bool _addPartLoadingEquipment;
+    private string _addPartDiscount = "0";
+    private string _addPartQuantity = "";
+    private List<StockUnit> _addPartAvailableUnits = new();
+    private HashSet<int> _addPartSelectedStockIds = new();
+    private ItemPricingInfo? _addPartPricing;
+    private bool _addPartLoadingPricing;
+    private bool _addPartSubmitting;
+    private string? _addPartResultMessage;
+    private bool _addPartResultIsError;
+
+    private async Task OpenAddPart(JmsPurchaseOrderLine line)
+    {
+        _addPartLine = line;
+        _addPartJobNumber = line.JobNumber is > 0 ? line.JobNumber.ToString()! : "";
+        _addPartEquipmentId = "";
+        _addPartEquipmentOptions.Clear();
+        _addPartDiscount = "0";
+        _addPartQuantity = "";
+        _addPartSelectedStockIds.Clear();
+        _addPartAvailableUnits.Clear();
+        _addPartPricing = null;
+        _addPartResultMessage = null;
+        _addPartLoadingPricing = true;
+        _addPartNeedsOwnerPrefill = true;
+        StateHasChanged();
+
+        if (line.TrackSerial)
+            await LoadAvailableStockUnitsAsync(line.VendorItemOrderVuomId);
+
+        var loadEquipment = line.JobNumber is > 0
+            ? LoadEquipmentOptionsAsync(line.JobNumber.Value)
+            : Task.CompletedTask;
+
+        await Task.WhenAll(LoadItemPricingAsync(line.MasterItemId), loadEquipment);
+
+        _addPartLoadingPricing = false;
+        StateHasChanged();
+    }
+
+    private void CloseAddPart() => _addPartLine = null;
+
+    private void OnStockUnitToggled(int stockId, ChangeEventArgs e)
+    {
+        var isChecked = e.Value is bool b && b;
+        if (isChecked) _addPartSelectedStockIds.Add(stockId);
+        else _addPartSelectedStockIds.Remove(stockId);
+    }
+
+    private async Task LoadAvailableStockUnitsAsync(int vuomId)
+    {
+        var units = await Purchasing.LoadAvailableStockUnitsAsync(vuomId);
+        _addPartAvailableUnits = units
+            .Select(u => new StockUnit { StockId = u.StockId, SerialNo = u.SerialNo })
+            .ToList();
+    }
+
+    private async Task OnAddPartJobNumberChanged()
+    {
+        _addPartEquipmentId = ""; // stale selection from the previous job number
+        if (int.TryParse(_addPartJobNumber, out var jobId) && jobId > 0)
+            await LoadEquipmentOptionsAsync(jobId);
+        else
+            _addPartEquipmentOptions.Clear();
+    }
+
+    private async Task LoadEquipmentOptionsAsync(int jobId)
+    {
+        _addPartLoadingEquipment = true;
+        StateHasChanged();
+
+        try
+        {
+            var options = await Purchasing.LoadEquipmentOptionsAsync(jobId);
+            _addPartEquipmentOptions = options
+                .Select(o => new EquipmentOption { EquipmentId = o.EquipmentId, ModelName = o.ModelName, SerialNo = o.SerialNo })
+                .ToList();
+        }
+        catch
+        {
+            _addPartEquipmentOptions = new();
+        }
+        finally
+        {
+            _addPartLoadingEquipment = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task LoadItemPricingAsync(int masterItemId)
+    {
+        var json = await Purchasing.GetItemPricingJsonAsync(masterItemId);
+        if (json is null) return;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            var info = new ItemPricingInfo();
+
+            if (root.TryGetProperty("ordered", out var ordered) && ordered.ValueKind == JsonValueKind.Object)
+            {
+                if (ordered.TryGetProperty("buy_price", out var bp)) info.BuyPrice = ParseDecimalLoose(bp);
+                if (ordered.TryGetProperty("list_price", out var lp)) info.ListPrice = ParseDecimalLoose(lp);
+                if (ordered.TryGetProperty("ordered_qty", out var oq)) info.OrderedQty = ParseIntLoose(oq);
+            }
+
+            if (root.TryGetProperty("stock", out var stock) && stock.ValueKind == JsonValueKind.Object)
+            {
+                if (stock.TryGetProperty("stock_qty", out var sq)) info.StockQty = ParseIntLoose(sq);
+                if (stock.TryGetProperty("landed_price", out var lpr)) info.LandedPrice = ParseDecimalLoose(lpr);
+            }
+
+            _addPartPricing = info;
+        }
+        catch
+        {
+            _addPartPricing = null;
+        }
+    }
+
+    private static decimal? ParseDecimalLoose(JsonElement el) => el.ValueKind switch
+    {
+        JsonValueKind.Number => el.GetDecimal(),
+        JsonValueKind.String when decimal.TryParse(el.GetString(), NumberStyles.Any, CultureInfo.InvariantCulture, out var d) => d,
+        _ => null
+    };
+
+    private static int? ParseIntLoose(JsonElement el) => el.ValueKind switch
+    {
+        JsonValueKind.Number => el.GetInt32(),
+        JsonValueKind.String when int.TryParse(el.GetString(), out var i) => i,
+        _ => null
+    };
+
+    private async Task SubmitAddPartAsync()
+    {
+        if (_addPartLine is null) return;
+
+        if (!int.TryParse(_addPartJobNumber, out var jobId) || jobId <= 0)
+        {
+            _addPartResultMessage = "Enter a valid job number.";
+            _addPartResultIsError = true;
+            return;
+        }
+
+        if (_addPartOwnerSection is null)
+        {
+            _addPartResultMessage = "Pick a technician above before submitting.";
+            _addPartResultIsError = true;
+            return;
+        }
+
+        var ownerUser = _addPartOwnerSection.GetJmsUser();
+        if (ownerUser.UserId <= 0)
+        {
+            _addPartResultMessage = "Pick a technician above before submitting.";
+            _addPartResultIsError = true;
+            return;
+        }
+
+        if (!int.TryParse(_addPartDiscount, out var discount) || discount < 0)
+        {
+            _addPartResultMessage = "Enter a valid discount (0 or more).";
+            _addPartResultIsError = true;
+            return;
+        }
+
+        int quantity;
+        var selectedUnits = new List<StockUnit>();
+
+        if (_addPartLine.TrackSerial)
+        {
+            selectedUnits = _addPartAvailableUnits.Where(u => _addPartSelectedStockIds.Contains(u.StockId)).ToList();
+            if (selectedUnits.Count == 0)
+            {
+                _addPartResultMessage = "Select at least one serial number.";
+                _addPartResultIsError = true;
+                return;
+            }
+            quantity = selectedUnits.Count;
+        }
+        else
+        {
+            if (!int.TryParse(_addPartQuantity, out quantity) || quantity <= 0)
+            {
+                _addPartResultMessage = "Enter a quantity greater than 0.";
+                _addPartResultIsError = true;
+                return;
+            }
+        }
+
+        _addPartSubmitting = true;
+        _addPartResultMessage = null;
+        StateHasChanged();
+
+        try
+        {
+            var form = new Dictionary<string, string>
+            {
+                ["part_pref"] = "list",
+                ["id"] = jobId.ToString(),
+                ["master_item_id"] = _addPartLine.MasterItemId.ToString(),
+                ["part_name"] = _addPartLine.PartDescription,
+                ["equipment_id_add"] = _addPartEquipmentId,
+                ["technician"] = ownerUser.FullName,
+                ["user_id"] = ownerUser.UserId.ToString(),
+                ["discount"] = discount.ToString(),
+                ["part_quantity"] = quantity.ToString(),
+                ["in_stock"] = (_addPartPricing?.StockQty ?? 0).ToString(),
+                ["on_order"] = (_addPartPricing?.OrderedQty ?? 0).ToString(),
+                ["list_price_actual"] = (_addPartPricing?.ListPrice ?? 0).ToString(CultureInfo.InvariantCulture),
+                ["list_price"] = (_addPartPricing?.ListPrice ?? 0).ToString(CultureInfo.InvariantCulture),
+                ["buy_price_hidden"] = (_addPartPricing?.BuyPrice ?? 0).ToString(CultureInfo.InvariantCulture),
+                ["landed_price_hidden"] = (_addPartPricing?.LandedPrice ?? 0).ToString(CultureInfo.InvariantCulture),
+                ["use_part_pref"] = "t",
+                ["submit"] = "Add Part",
+                ["vuom_id"] = "0"
+            };
+
+            if (_addPartLine.TrackSerial)
+            {
+                var i = 1;
+                foreach (var unit in selectedUnits)
+                {
+                    form[$"serial_checkbox_{i}"] = unit.StockId.ToString();
+                    i++;
+                }
+                form["serial_count"] = (_addPartPricing?.StockQty ?? selectedUnits.Count).ToString();
+            }
+
+            // The real form's action is "AddJobParts?id={job_id}" — the job id lives
+            // in the query string, not just the POST body. Without it, the server appears
+            // to fall back to redirecting to CreateJob instead of processing the part.
+            var res = await Purchasing.SubmitAddPartAsync(jobId, form);
+
+            if (!res.Success)
+            {
+                _addPartResultMessage = $"JMS returned HTTP {res.StatusCode}: {res.ReasonPhrase}";
+                _addPartResultIsError = true;
+                return;
+            }
+
+            _addPartResultMessage = $"Submitted — added {quantity} unit(s) of {_addPartLine.PartCode} to job #{jobId}. Verify on the job page — this endpoint's response can't be trusted to reflect the real outcome.";
+            _addPartResultIsError = false;
+        }
+        catch (Exception ex)
+        {
+            _addPartResultMessage = $"Failed: {ex.Message}";
+            _addPartResultIsError = true;
+        }
+        finally
+        {
+            _addPartSubmitting = false;
+            StateHasChanged();
+        }
+    }
+
+    // ── Formatting helpers ───────────────────────────────────────────────────
+
+    private static string OrDash(string s) => string.IsNullOrWhiteSpace(s) ? "—" : s;
+
+    private static DateTime? ParseDate(string raw) =>
+        DateTime.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.None, out var d) ? d : null;
+
+    private static string ShortDate(string raw) =>
+        ParseDate(raw) is { } d ? d.ToString("dd MMM yyyy") : "—";
+
+    private static string FormatCost(string raw) =>
+        decimal.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var d)
+            ? d.ToString("C2", CultureInfo.GetCultureInfo("en-AU"))
+            : "—";
+
+    // Urgency labels/colors are pulled straight from the board's own status-column
+    // config (monday.com's built-in swatches), so cards match what you'd see in monday itself.
+    private static (string color, string icon) UrgencyStyle(string urgency)
+    {
+        if (urgency.Contains("URGENT", StringComparison.OrdinalIgnoreCase) || urgency.Contains("CRITICAL", StringComparison.OrdinalIgnoreCase))
+            return ("#df2f4a", "🔴");
+        if (urgency.Contains("High", StringComparison.OrdinalIgnoreCase))
+            return ("#fdab3d", "🟠");
+        if (urgency.Contains("Medium", StringComparison.OrdinalIgnoreCase))
+            return ("#00c875", "🟢");
+        if (urgency.Contains("Low", StringComparison.OrdinalIgnoreCase))
+            return ("#007eb5", "🔵");
+        return ("#c4c4c4", "⚪");
+    }
+
+    private static int UrgencyRank(string urgency)
+    {
+        if (urgency.Contains("URGENT", StringComparison.OrdinalIgnoreCase) || urgency.Contains("CRITICAL", StringComparison.OrdinalIgnoreCase)) return 0;
+        if (urgency.Contains("High", StringComparison.OrdinalIgnoreCase)) return 1;
+        if (urgency.Contains("Medium", StringComparison.OrdinalIgnoreCase)) return 2;
+        if (urgency.Contains("Low", StringComparison.OrdinalIgnoreCase)) return 3;
+        return 4;
+    }
+
+    private static string StatusBadgeClass(string status)
+    {
+        if (string.IsNullOrWhiteSpace(status)) return "bg-secondary";
+        var s = status.ToUpperInvariant();
+        if (s.Contains("COMPLETE") || s.Contains("RECEIVED") || s.Contains("INVOICED") || s.Contains("APPROVED")) return "bg-success";
+        if (s.Contains("CANCEL") || s.Contains("DECLINE") || s.Contains("REFUND")) return "bg-dark";
+        if (s.Contains("REQUIRE") || s.Contains("ESCALATED") || s.Contains("CONTACT") || s.Contains("DELAY")) return "bg-danger";
+        return "bg-info text-dark";
+    }
+}

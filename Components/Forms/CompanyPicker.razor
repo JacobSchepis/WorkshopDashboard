@@ -1,0 +1,125 @@
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    CompanyPicker — compact single-company search-and-select. Click the
+    current value (or the "—" placeholder) to open a debounced search box
+    with a hit list; picking a hit saves immediately and closes. Unlike
+    ExclusionSection (a whole Card, built for multi-id lists with
+    persistent remove buttons), this is sized to sit inline in a table cell
+    or a filter bar for a single value.
+
+    ── Parameters ───────────────────────────────────────────────────────────
+      SelectedId/SelectedLabel — the current value (label falls back to
+                                 "(id)" if unset)
+      SearchAsync              — term -> (Id, Label) hits; caller decides
+                                 what "search" means (company name, etc.)
+      OnSelect / OnClear       — fired on pick / on the clear (×) button
+      ShowClear                — hide the × when clearing isn't valid
+      EmptyLabel               — what to show when nothing's selected
+                                 (default "—"; e.g. "+ Add" for an add box)
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="position-relative d-inline-block" style="min-width:120px;">
+    @if (_editing)
+    {
+        <input class="form-control form-control-sm" placeholder="@Placeholder" value="@_query"
+               @oninput="OnInput" @onblur="() => _editing = false" autofocus />
+        @if (_searching)
+        {
+            <div class="text-muted small">Searching...</div>
+        }
+        @if (_hits.Count > 0)
+        {
+            <div class="border rounded bg-body position-absolute w-100 mt-1 p-1" style="z-index:1050; max-height:220px; overflow-y:auto;">
+                @foreach (var hit in _hits)
+                {
+                    <button type="button" class="btn btn-sm btn-outline-secondary d-block w-100 text-start mb-1"
+                            @onmousedown="() => SelectAsync(hit.Id, hit.Label)" @onmousedown:preventDefault>
+                        @hit.Label
+                    </button>
+                }
+            </div>
+        }
+    }
+    else
+    {
+        <span class="cursor-pointer" @onclick="() => _editing = true">
+            @(SelectedId is int id ? (SelectedLabel ?? $"({id})") : EmptyLabel)
+        </span>
+        @if (ShowClear && SelectedId is not null)
+        {
+            <button type="button" class="btn btn-sm btn-link p-0 ms-1 text-danger" title="Clear" @onclick="ClearAsync">×</button>
+        }
+    }
+</div>
+
+@code {
+    [Parameter] public int? SelectedId { get; set; }
+    [Parameter] public string? SelectedLabel { get; set; }
+    [Parameter] public string Placeholder { get; set; } = "Search company...";
+    [Parameter] public bool ShowClear { get; set; } = true;
+    [Parameter] public string EmptyLabel { get; set; } = "—";
+    [Parameter] public Func<string, Task<List<(int Id, string Label)>>> SearchAsync { get; set; } = default!;
+    [Parameter] public EventCallback<(int Id, string Label)> OnSelect { get; set; }
+    [Parameter] public EventCallback OnClear { get; set; }
+
+    private bool _editing;
+    private string _query = "";
+    private bool _searching;
+    private List<(int Id, string Label)> _hits = new();
+    private CancellationTokenSource? _searchCts;
+
+    // Deliberately synchronous (not async) — the debounce+search runs detached in
+    // SearchAfterDelayAsync rather than being awaited here. Awaiting it inline used to block
+    // Blazor Server's per-circuit event queue from processing the *next* keystroke until this
+    // one's 250ms delay + network search finished; that queued keystroke's eventual render
+    // then landed late, showing this handler's now-stale _query and visibly deleting whatever
+    // had been typed since. Returning immediately keeps every keystroke processed in near
+    // real time, so _query is always current by the time any render actually happens.
+    private void OnInput(ChangeEventArgs e)
+    {
+        _query = e.Value?.ToString() ?? "";
+        _hits.Clear();
+
+        _searchCts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _searchCts = cts;
+
+        if (_query.Trim().Length < 2)
+        {
+            _searching = false;
+            return;
+        }
+
+        _searching = true;
+        _ = SearchAfterDelayAsync(_query.Trim(), cts);
+    }
+
+    private async Task SearchAfterDelayAsync(string term, CancellationTokenSource cts)
+    {
+        try
+        {
+            await Task.Delay(250, cts.Token);
+            var results = await SearchAsync(term);
+            if (cts.Token.IsCancellationRequested) return;
+
+            _hits = results;
+            _searching = false;
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (TaskCanceledException)
+        {
+            // superseded by a newer keystroke — ignore
+        }
+    }
+
+    private async Task SelectAsync(int id, string label)
+    {
+        _editing = false;
+        _query = "";
+        _hits.Clear();
+        await OnSelect.InvokeAsync((id, label));
+    }
+
+    private async Task ClearAsync() => await OnClear.InvokeAsync();
+}

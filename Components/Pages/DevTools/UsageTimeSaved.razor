@@ -1,0 +1,127 @@
+@page "/usage-analytics/time-saved"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+
+@inherits DevOnlyComponentBase
+
+@using BlazorBootstrap
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Data
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Analytics
+@using WorkshopDashboard.Services.Stores
+
+@inject AnalyticsWriter Writer
+@inject ActionTimeSavingStore TimeSavings
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    UsageTimeSaved — how many minutes each tracked action saves over doing
+    it by hand (ActionTimeSavingStore), which UsageAnalytics.razor's Actions
+    and Users tabs total up. Lists every action ever recorded. "Per item"
+    multiplies by the event's Quantity — jobs created, report pages, packs
+    queued — for actions that record one. Saved as each box changes.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Time Saved</h1>
+    <p class="text-muted">
+        How long each action would take to do by hand. <a href="usage-analytics">Back to Usage Analytics</a>
+    </p>
+</div>
+
+@if (_rows == null)
+{
+    <Spinner Color="SpinnerColor.Primary" />
+}
+else if (_rows.Count == 0)
+{
+    <Callout Color="CalloutColor.Info">No actions recorded yet.</Callout>
+}
+else
+{
+    <table class="table table-sm align-middle" style="max-width: 1000px;">
+        <thead>
+            <tr>
+                <th>Action</th>
+                <th class="text-end">Uses <span class="fw-normal text-muted small">(all time)</span></th>
+                <th style="width: 130px;">Minutes saved</th>
+                <th style="width: 150px;">For each</th>
+                <th class="text-end">Saved so far</th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var row in _rows)
+            {
+                _savings.TryGetValue(row.Name, out var saving);
+                <tr>
+                    <td>
+                        @row.Name
+                        @if (row.Items != null)
+                        {
+                            <div class="small text-muted">Records a count — @row.Items items so far</div>
+                        }
+                    </td>
+                    <td class="text-end">@row.Uses</td>
+                    <td>
+                        <input type="number" min="0" step="0.5" class="form-control form-control-sm" placeholder="Not set"
+                               value="@(saving?.Minutes.ToString("0.##"))"
+                               @onchange="e => SetMinutesAsync(row.Name, e.Value?.ToString())" />
+                    </td>
+                    <td>
+                        <select class="form-select form-select-sm" disabled="@(saving == null)"
+                                value="@((saving?.PerItem ?? false) ? "item" : "use")"
+                                @onchange="e => SetPerItemAsync(row.Name, e)">
+                            <option value="use">use</option>
+                            <option value="item">item</option>
+                        </select>
+                    </td>
+                    <td class="text-end">@(row.MinutesSaved is { } m ? UsageSummaries.FormatMinutes(m) : "—")</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+    <p class="small text-muted">
+        Blank or 0 means not counted. "Item" is for actions that record how many things they did at once
+        (jobs created, report pages, shipments booked) — the minutes are then multiplied by that number.
+    </p>
+}
+
+@code {
+    private List<AnalyticsEvent> _events = [];
+    private Dictionary<string, ActionTimeSaving> _savings = new();
+    private List<ActionRow>? _rows;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        if (!IsDevAuthorized) return;
+        _events = await Writer.ReadAllAsync();
+        await ReloadAsync();
+    }
+
+    private async Task ReloadAsync()
+    {
+        _savings = await TimeSavings.LoadAsync();
+        // Actions configured but not seen yet still get a row, so a setting never goes missing.
+        var seen = UsageSummaries.Actions(_events, _savings);
+        var unseen = _savings.Keys.Where(k => !seen.Any(r => r.Name.Equals(k, StringComparison.OrdinalIgnoreCase)))
+            .Select(k => new ActionRow(k, 0, null, 0, 0, DateTime.MinValue, []));
+        _rows = seen.Concat(unseen).OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private async Task SetMinutesAsync(string name, string? text)
+    {
+        var minutes = double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var m) ? m : 0;
+        await TimeSavings.SetAsync(name, minutes, _savings.GetValueOrDefault(name)?.PerItem ?? false);
+        await ReloadAsync();
+    }
+
+    private async Task SetPerItemAsync(string name, ChangeEventArgs e)
+    {
+        var perItem = e.Value?.ToString() == "item";
+        if (_savings.GetValueOrDefault(name) is not { } saving) return;
+        await TimeSavings.SetAsync(name, saving.Minutes, perItem);
+        await ReloadAsync();
+    }
+}

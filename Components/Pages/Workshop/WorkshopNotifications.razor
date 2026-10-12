@@ -1,0 +1,235 @@
+@page "/workshop-notifications"
+@layout WorkshopDashboard.Components.Layout.KioskLayout
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+@attribute [Microsoft.AspNetCore.Authorization.AllowAnonymous]
+
+@inherits WorkshopDashboard.Components.Helpers.KioskPairingComponentBase
+
+@using BlazorBootstrap
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using WorkshopDashboard.Abstract
+
+@inject ScopeJobStore ScopeJobs
+@inject LoanEquipmentOverlayStore LoanOverlays
+@inject TrackingService TrackingService
+@inject HighlightedJobsStore HighlightedJobs
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    WorkshopNotifications — second wall-mounted TV, paired with WorkshopStatus.
+
+    Three columns, all live and reloaded every 30s alongside the clock:
+      - Rule alerts (top half of the first column): RuleCheckService.RunAsync
+        runs every RuleCheckDefinition (see that file to add one).
+      - On hold (bottom half of the first column): HeldShipmentLookup — every
+        tracked shipment, in or out, that the courier reports as held or as an
+        exception.
+      - Stale jobs: the Stale Scope Jobs list (no status change in over a
+        month, excluded scope models hidden), oldest first.
+      - Highlighted jobs (third column): the Overview page's pinned jobs, with
+        the newest [Tracking] note on each (JobNotesService).
+    (Team notices/tasks and the full incoming-shipments table used to be here
+    too; they were dropped as nobody read them on the TV.)
+
+    Pairing is shared logic with WorkshopStatus — see
+    KioskPairingComponentBase. Kiosk pages must fit one screen with no way
+    for anyone to scroll — KioskLayout.razor's auto-scroll script handles
+    any overflow instead.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<PageTitle>Workshop Notifications</PageTitle>
+
+@if (Initializing)
+{
+    <div class="d-flex align-items-center justify-content-center" style="min-height:80vh;">
+        <Spinner Color="SpinnerColor.Primary" />
+    </div>
+}
+else if (!IsPaired)
+{
+    <div class="d-flex flex-column align-items-center justify-content-center text-center" style="min-height:80vh;">
+        <p class="text-muted mb-2">To show live data, have a staff member pair this screen</p>
+        <div class="pairing-code mb-3">@(PairingCode ?? "——————")</div>
+        <p class="text-muted mb-0">Go to <strong>/pair-device</strong> on your computer and enter this code</p>
+    </div>
+}
+else
+{
+<div class="kiosk-page d-flex flex-column h-100">
+<div class="kiosk-header mb-4 flex-shrink-0">
+    <h1 class="mb-0">Needs attention</h1>
+    <p class="text-muted mb-0">@_now.ToString("dddd d MMMM") &middot; @_now.ToString("HH:mm")</p>
+</div>
+
+@* Three columns filling the rest of the screen. Each list scrolls itself (.kiosk-scroll,
+   see KioskLayout.razor) when it's too long, rather than pushing the page off the screen. *@
+<div class="kiosk-columns row row-cols-3 gx-3 gy-0 flex-grow-1">
+    @* Split in two — rule alerts on top, on hold underneath (there usually isn't
+       much of either). Each half scrolls itself. *@
+    <div class="col h-100 d-flex flex-column gap-3">
+        <Card Class="kiosk-half d-flex flex-column overflow-hidden">
+            <CardHeader>Rule alerts</CardHeader>
+            <CardBody Class="kiosk-scroll overflow-auto flex-grow-1">
+                @if (_ruleAlerts.Count == 0)
+                {
+                    <p class="text-muted mb-0">Nothing tripped right now.</p>
+                }
+                @foreach (var alert in _ruleAlerts)
+                {
+                    <div class="d-flex align-items-center gap-2 py-2">
+                        <i class="bi @alert.Icon @(alert.Severe ? "text-danger" : "text-warning")"></i>
+                        <span class="flex-grow-1">@alert.Label</span>
+                        <span class="fw-semibold @(alert.Severe ? "text-danger" : "text-warning")">@alert.Count</span>
+                    </div>
+                }
+            </CardBody>
+        </Card>
+
+        <Card Class="kiosk-half d-flex flex-column overflow-hidden">
+            <CardHeader>On hold <span class="text-muted">&middot; courier holds and exceptions</span></CardHeader>
+            <CardBody Class="kiosk-scroll overflow-auto flex-grow-1">
+                @if (_heldShipments.Count == 0)
+                {
+                    <p class="text-muted mb-0">Nothing on hold right now.</p>
+                }
+                @foreach (var s in _heldShipments)
+                {
+                    <div class="py-2 border-bottom">
+                        <div class="d-flex align-items-baseline gap-3">
+                            <span class="fw-semibold">@s.JobId</span>
+                            <span class="text-muted">@s.Carrier</span>
+                        </div>
+                        <div class="text-warning">@s.Status</div>
+                    </div>
+                }
+            </CardBody>
+        </Card>
+    </div>
+
+    <div class="col h-100">
+        <Card Class="h-100 d-flex flex-column overflow-hidden">
+            <CardHeader>Stale jobs <span class="text-muted">&middot; no change in over a month</span></CardHeader>
+            <CardBody Class="kiosk-scroll overflow-auto flex-grow-1">
+                @if (_staleJobs.Count == 0)
+                {
+                    <p class="text-muted mb-0">Nothing stale right now.</p>
+                }
+                @foreach (var job in _staleJobs)
+                {
+                    <div class="d-flex align-items-baseline gap-3 py-2 border-bottom">
+                        <span class="fw-semibold">@job.JobId</span>
+                        <span class="flex-grow-1 text-muted text-truncate">@job.Status</span>
+                        <span class="text-stale-danger text-nowrap">@DaysSince(job.LastStatusChange)d</span>
+                    </div>
+                }
+            </CardBody>
+        </Card>
+    </div>
+
+    <div class="col h-100">
+        <Card Class="h-100 d-flex flex-column overflow-hidden">
+            <CardHeader>⭐ Highlighted jobs</CardHeader>
+            <CardBody Class="kiosk-scroll overflow-auto flex-grow-1">
+                @if (_highlightedJobs.Count == 0)
+                {
+                    <p class="text-muted mb-0">No highlighted jobs — pin some on the Overview page.</p>
+                }
+                @foreach (var job in _highlightedJobs)
+                {
+                    <div class="py-2 border-bottom">
+                        <div class="d-flex align-items-baseline gap-3">
+                            <span class="fw-semibold">@job.JobId</span>
+                            <span class="text-muted text-truncate">@job.JobStatus</span>
+                        </div>
+                        @if (!string.IsNullOrWhiteSpace(job.Owner))
+                        {
+                            <div class="text-muted text-truncate">@job.Owner</div>
+                        }
+                        @if (_latestNotes.TryGetValue(job.JobId, out var note))
+                        {
+                            <div class="text-info">📝 @note.Text <span class="text-muted">&middot; @note.CreatedAt.ToString("d MMM")</span></div>
+                        }
+                    </div>
+                }
+            </CardBody>
+        </Card>
+    </div>
+</div>
+</div>
+}
+
+@code {
+    private DateTime _now = DateTime.Now;
+    private System.Threading.Timer? _clockTimer;
+
+    private List<RuleAlert> _ruleAlerts = new();
+    private List<StaleJobRecord> _staleJobs = new();
+    private List<HeldShipment> _heldShipments = new();
+    private List<HighlightedJobRowInfo> _highlightedJobs = new();
+    private Dictionary<int, JobNote> _latestNotes = new();
+
+    protected override void OnInitialized()
+    {
+        _clockTimer = new System.Threading.Timer(_ => InvokeAsync(async () =>
+        {
+            _now = DateTime.Now;
+            if (IsPaired) await ReloadBoardAsync();
+            StateHasChanged();
+        }), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+    }
+
+    protected override async Task OnPairedAsync() => await ReloadBoardAsync();
+
+    private async Task ReloadBoardAsync()
+    {
+        var jms = await GetJmsAsync();
+        if (jms is null)
+        {
+            _ruleAlerts = new();
+            _staleJobs = new();
+            _heldShipments = new();
+            _highlightedJobs = new();
+            _latestNotes = new();
+            return;
+        }
+
+        var exclusions = await ScopeJobs.LoadAsync();
+        var alerts = RuleCheckService.RunAsync(jms, exclusions, LoanOverlays);
+        var stale = WorkshopQueueLookup.GetStaleJobsFilteredAsync(jms, exclusions);
+        var held = HeldShipmentLookup.RunAsync(jms, TrackingService, exclusions);
+        var highlighted = LoadHighlightedAsync(jms);
+        await Task.WhenAll(alerts, stale, held, highlighted);
+
+        _ruleAlerts = alerts.Result;
+        _staleJobs = stale.Result.OrderBy(j => j.LastStatusChange).ToList();
+        _heldShipments = held.Result;
+    }
+
+    // The Overview page's pinned jobs, by job number, each with its newest
+    // [Tracking] note (JobNotesService) if it has one.
+    private async Task LoadHighlightedAsync(IJmsReader jms)
+    {
+        var ids = (await HighlightedJobs.LoadAsync()).ToList();
+        var details = DashboardLookup.GetHighlightedJobDetailsAsync(jms, ids);
+        var notes = JobNotesService.GetLatestNotesAsync(jms, ids);
+        await Task.WhenAll(details, notes);
+
+        _highlightedJobs = details.Result.OrderBy(j => j.JobId).ToList();
+        _latestNotes = notes.Result;
+    }
+
+    private static int DaysSince(DateTime date) => Math.Max(0, (int)(DateTime.Today - date.Date).TotalDays);
+
+    public override void Dispose()
+    {
+        _clockTimer?.Dispose();
+        base.Dispose();
+    }
+}

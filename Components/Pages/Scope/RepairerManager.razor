@@ -1,0 +1,654 @@
+@page "/repairer-manager"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+
+@inherits JmsComponentBase
+@inject RepairerStore Repairers
+@inject ScopeJobStore ScopeJobs
+@inject RepairerAssignmentLookup JobLookup
+@inject ScopeLookupService ScopeLookup
+
+@using CsvHelper
+@using CsvHelper.Configuration
+@using System.Globalization
+@using Microsoft.AspNetCore.Components
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Components.Forms
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using static WorkshopDashboard.Services.Admin.ScopeLabelFormatter
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    RepairerManager — CRUD for the Repairer list (RepairerStore /
+    the database) plus two tabs of scope jobs matching neither a
+    repairer's ModelIds nor its JobIds: Open (current work) and Closed
+    (historical, loaded a few months at a time so old data can be backfilled
+    gradually instead of all at once).
+
+    A job counts as assigned when EITHER the model id of its active equipment
+    is in some repairer's ModelIds (the common case) OR the job's own id is
+    in some repairer's JobIds (the override path — e.g. Falcon, whose work
+    never gets an individual job_equipment row). That comparison happens here
+    in C#, not SQL — RepairerStore is a local JSON file the JMS database
+    knows nothing about.
+
+    Performance note: assigning a repairer only ever mutates RepairerStore
+    (fast local JSON) — it never re-queries JMS. _openJobsRaw/_closedJobsRaw
+    hold the full, unfiltered job list for each tab (loaded once, or when the
+    Closed tab's month range changes); "unassigned" is recomputed from those
+    cached lists plus the current _repairers on every render via
+    ComputeUnassigned. That's what makes the bulk "assign this model" action
+    below instant instead of round-tripping to JMS again.
+
+    Unassigned jobs within a tab are split two ways:
+      • Assign by Model — jobs that resolved to exactly ONE equipment model,
+        grouped so one Assign click covers every job sharing that model
+        (present and future) instead of clicking through each job
+        individually.
+      • Needs Job-Level Assignment — jobs with more than one distinct model
+        (a model-based rule would be ambiguous), assigned one at a time by
+        job number.
+
+    Jobs with NO equipment attached at all aren't listed as unassigned or
+    shown here — they're treated as Falcon's by default (that's exactly
+    the "dozens of small items" case the class doc on Repairer.cs describes)
+    without ever writing anything to RepairerStore. If one of those jobs
+    should actually go to a different repairer, add it to that repairer's
+    Job Number Overrides above explicitly.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Repairer Manager</h1>
+    <p class="text-muted">
+        Defines which repairer handles which jobs, for the equipment/repair-timeline
+        reporting pages. Most repairers are matched by the model id of the job's attached
+        equipment; a few (whose work doesn't get individual equipment rows on the job) are
+        matched by job number instead.
+    </p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else
+{
+    <Card Class="mb-4">
+        <CardHeader>@(_editingOriginalName is null ? "Add Repairer" : $"Edit \"{_editingOriginalName}\"")</CardHeader>
+        <CardBody>
+            @if (!string.IsNullOrEmpty(_formError))
+            {
+                <Callout Color="CalloutColor.Danger" Class="mb-3">@_formError</Callout>
+            }
+
+            <div class="mb-3" style="max-width: 480px;">
+                <label class="form-label">Repairer name</label>
+                <input class="form-control" placeholder="e.g. Falcon" @bind-value="_formName" />
+            </div>
+
+            <div class="row g-4 mb-3">
+                <div class="col-md-6">
+                    <ExclusionSection Title="Equipment Models"
+                                       Placeholder="Search model name..."
+                                       Ids="_formModelIds.OrderBy(id => id).ToList()"
+                                       Labels="_modelLabels"
+                                       SearchAsync="SearchModelsAsync"
+                                       OnAdd="AddFormModelId"
+                                       OnRemove="RemoveFormModelId" />
+                </div>
+                <div class="col-md-6">
+                    <ExclusionSection Title="Job Number Overrides"
+                                       Placeholder="Job ID"
+                                       Ids="_formJobIds.OrderBy(id => id).ToList()"
+                                       OnAdd="AddFormJobId"
+                                       OnRemove="RemoveFormJobId" />
+                </div>
+            </div>
+
+            <div class="d-flex gap-2">
+                <Button Color="ButtonColor.Primary" Disabled="_saving" @onclick="SaveAsync">
+                    @(_saving ? "Saving..." : _editingOriginalName is null ? "Add Repairer" : "Save Changes")
+                </Button>
+                @if (_editingOriginalName is not null)
+                {
+                    <Button Color="ButtonColor.Secondary" Outline="true" Disabled="_saving" @onclick="CancelEdit">
+                        Cancel
+                    </Button>
+                }
+            </div>
+        </CardBody>
+    </Card>
+
+    <Card Class="mb-4">
+        <CardHeader>Repairers (@_repairers.Count)</CardHeader>
+        <CardBody>
+            @if (_repairers.Count == 0)
+            {
+                <p class="text-muted small mb-0">No repairers yet — add one above.</p>
+            }
+            else
+            {
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Models</th>
+                                <th>Job Overrides</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var r in _repairers.OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase))
+                            {
+                                <tr>
+                                    <td>@r.Name</td>
+                                    <td class="small">
+                                        @if (r.ModelIds.Count == 0)
+                                        {
+                                            <span class="text-muted">—</span>
+                                        }
+                                        else
+                                        {
+                                            @string.Join(", ", r.ModelIds.Select(FormatModelLabel))
+                                        }
+                                    </td>
+                                    <td class="small">
+                                        @(r.JobIds.Count == 0 ? "—" : string.Join(", ", r.JobIds))
+                                    </td>
+                                    <td class="text-end" style="white-space: nowrap;">
+                                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="me-2" @onclick="() => StartEdit(r)">
+                                            Edit
+                                        </Button>
+                                        @if (_pendingDeleteName == r.Name)
+                                        {
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" @onclick="() => DeleteAsync(r.Name)">
+                                                Confirm?
+                                            </Button>
+                                        }
+                                        else
+                                        {
+                                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" @onclick="() => RequestDelete(r.Name)">
+                                                Delete
+                                            </Button>
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </CardBody>
+    </Card>
+
+    var loading = _tab == "open" ? _openLoading : _closedLoading;
+    var raw = _tab == "open" ? _openJobsRaw : (_closedJobsRaw ?? new List<UnassignedJob>());
+    var unassigned = ComputeUnassigned(raw);
+    var groups = ComputeModelGroups(unassigned);
+    var overrides = unassigned.Where(j => j.ModelIds.Count > 1).OrderBy(j => j.Created).ToList();
+    var falconDefaultCount = CountDefaultedToFalcon(raw);
+
+    <Card>
+        <CardHeader>
+            <Tabs NavStyle="NavStyle.Pills">
+                <Tab Title="Open" Active="@(_tab == "open")" OnClick="@(() => SwitchTab("open"))"><Content></Content></Tab>
+                <Tab Title="Closed" Active="@(_tab == "closed")" OnClick="@(() => SwitchTab("closed"))"><Content></Content></Tab>
+            </Tabs>
+        </CardHeader>
+        <CardBody>
+            @if (_tab == "closed")
+            {
+                <div class="d-flex align-items-center gap-2 mb-3">
+                    <label class="form-label mb-0">Closed in the last</label>
+                    <input type="number" class="form-control" style="width:90px;" min="1"
+                           value="@_closedMonthsBack" @onchange="OnMonthsBackChanged" />
+                    <label class="form-label mb-0">month(s)</label>
+                    <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                            Disabled="_closedLoading" @onclick="ReloadClosedJobsAsync">
+                        @(_closedLoading ? "Loading..." : "Reload")
+                    </Button>
+                    <span class="text-muted small">
+                        Backfill historical repairer data a few months at a time — widen the range once
+                        you've assigned what's here.
+                    </span>
+                </div>
+            }
+
+            @if (loading)
+            {
+                <div class="d-flex align-items-center gap-2">
+                    <Spinner Color="SpinnerColor.Primary" />
+                    <span>Loading jobs...</span>
+                </div>
+            }
+            else if (unassigned.Count == 0)
+            {
+                <p class="text-muted small mb-0">
+                    @(_tab == "open" ? "Every open scope job matches a repairer." : "Every closed scope job in this range matches a repairer.")
+                    @if (falconDefaultCount > 0)
+                    {
+                        @($" ({falconDefaultCount} more with no equipment attached default to Falcon.)")
+                    }
+                </p>
+            }
+            else
+            {
+                <p class="text-muted small">
+                    @unassigned.Count unassigned job@(unassigned.Count == 1 ? "" : "s") —
+                    @groups.Count distinct model@(groups.Count == 1 ? "" : "s"),
+                    @overrides.Count needing a job-level override.
+                    @if (falconDefaultCount > 0)
+                    {
+                        @($" Plus {falconDefaultCount} with no equipment, defaulting to Falcon.")
+                    }
+                </p>
+
+                @if (groups.Count > 0)
+                {
+                    <h6>Assign by Model</h6>
+                    <div class="table-responsive mb-4">
+                        <table class="table table-sm align-middle">
+                            <thead>
+                                <tr>
+                                    <th>Model</th>
+                                    <th class="text-end">Jobs</th>
+                                    <th>Repairer</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var g in groups)
+                                {
+                                    <tr>
+                                        <td class="small">@FormatModelLabel(g.ModelId)</td>
+                                        <td class="text-end">@g.JobCount</td>
+                                        <td>
+                                            <select class="form-select form-select-sm" style="width:160px;"
+                                                    value="@_modelGroupSelections.GetValueOrDefault(g.ModelId)"
+                                                    @onchange="@(e => _modelGroupSelections[g.ModelId] = e.Value?.ToString())">
+                                                <option value="">— Repairer —</option>
+                                                @foreach (var r in _repairers.OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase))
+                                                {
+                                                    <option value="@r.Name">@r.Name</option>
+                                                }
+                                            </select>
+                                        </td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+
+                @if (overrides.Count > 0)
+                {
+                    <h6>Needs Job-Level Assignment</h6>
+                    <div class="table-responsive">
+                        <table class="table table-sm align-middle">
+                            <thead>
+                                <tr>
+                                    <th>Job</th>
+                                    <th>Owner</th>
+                                    <th>Status</th>
+                                    <th>@(_tab == "open" ? "Created" : "Completed")</th>
+                                    <th>Equipment</th>
+                                    <th>Repairer</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var job in overrides)
+                                {
+                                    <tr>
+                                        <td>
+                                            <a href="@JmsLinks.JobSummary(job.JobId)"
+                                               target="_blank" rel="noopener noreferrer">@job.JobId</a>
+                                        </td>
+                                        <td class="small">@job.Owner</td>
+                                        <td class="small">@job.Status</td>
+                                        <td class="small">@job.Created.ToString("dd MMM yyyy")</td>
+                                        <td class="small">
+                                            @string.Join(", ", job.ModelIds.Select(FormatModelLabel))
+                                        </td>
+                                        <td>
+                                            <select class="form-select form-select-sm" style="width:160px;"
+                                                    value="@job.SelectedRepairer" @onchange="@(e => job.SelectedRepairer = e.Value?.ToString())">
+                                                <option value="">— Repairer —</option>
+                                                @foreach (var r in _repairers.OrderBy(r => r.Name, StringComparer.OrdinalIgnoreCase))
+                                                {
+                                                    <option value="@r.Name">@r.Name</option>
+                                                }
+                                            </select>
+                                        </td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+
+                var pendingCount = groups.Count(g => !string.IsNullOrEmpty(_modelGroupSelections.GetValueOrDefault(g.ModelId)))
+                    + overrides.Count(j => !string.IsNullOrEmpty(j.SelectedRepairer));
+
+                <div class="d-flex align-items-center gap-2 mt-3">
+                    <Button Color="ButtonColor.Primary" Disabled="@(pendingCount == 0 || _applying)"
+                            @onclick="() => ApplyAssignmentsAsync(groups, overrides)">
+                        @(_applying ? "Applying..." : $"Apply Assignments ({pendingCount})")
+                    </Button>
+                    @if (pendingCount == 0)
+                    {
+                        <span class="text-muted small">Pick a repairer on the rows above, then apply them all at once.</span>
+                    }
+                </div>
+            }
+        </CardBody>
+    </Card>
+}
+
+@code {
+    private bool _loading = true;
+    private List<Repairer> _repairers = new();
+    private Dictionary<int, string> _modelLabels = new();
+
+    private string _tab = "open";
+    private bool _openLoading = true;
+    private bool _closedLoading;
+    private List<UnassignedJob> _openJobsRaw = new();
+    private List<UnassignedJob>? _closedJobsRaw;
+    private int _closedMonthsBack = 3;
+
+    private readonly Dictionary<int, string?> _modelGroupSelections = new();
+    private bool _applying;
+
+    private string? _editingOriginalName;
+    private string _formName = "";
+    private List<int> _formModelIds = new();
+    private List<int> _formJobIds = new();
+    private string? _formError;
+    private bool _saving;
+
+    private string? _pendingDeleteName;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        await ReloadRepairersAsync();
+        await ReloadOpenJobsAsync();
+    }
+
+    // ── Data loading ─────────────────────────────────────────────────────────
+
+    private async Task ReloadRepairersAsync()
+    {
+        _repairers = await Repairers.LoadAsync();
+        await RefreshModelLabelsAsync();
+
+        _loading = false;
+        StateHasChanged();
+    }
+
+    private async Task ReloadOpenJobsAsync()
+    {
+        _openLoading = true;
+        StateHasChanged();
+
+        var exclusions = await ScopeJobs.LoadAsync();
+        var rows = await JobLookup.GetOpenJobsAsync(exclusions);
+        _openJobsRaw = rows.Select(ToUnassignedJob).ToList();
+        await RefreshModelLabelsAsync();
+
+        _openLoading = false;
+        StateHasChanged();
+    }
+
+    private async Task ReloadClosedJobsAsync()
+    {
+        _closedLoading = true;
+        StateHasChanged();
+
+        var exclusions = await ScopeJobs.LoadAsync();
+        var rows = await JobLookup.GetClosedJobsAsync(exclusions, _closedMonthsBack);
+        _closedJobsRaw = rows.Select(ToUnassignedJob).ToList();
+        await RefreshModelLabelsAsync();
+
+        _closedLoading = false;
+        StateHasChanged();
+    }
+
+    private async Task SwitchTab(string tab)
+    {
+        _tab = tab;
+        if (tab == "closed" && _closedJobsRaw is null)
+            await ReloadClosedJobsAsync();
+    }
+
+    private async Task OnMonthsBackChanged(ChangeEventArgs e)
+    {
+        if (int.TryParse(e.Value?.ToString(), out var months) && months > 0)
+        {
+            _closedMonthsBack = months;
+            await ReloadClosedJobsAsync();
+        }
+    }
+
+    // ── Unassigned job computation ──────────────────────────────────────────
+
+    private static UnassignedJob ToUnassignedJob(RepairerJobRow r) => new()
+    {
+        JobId = r.JobId,
+        Owner = r.Owner,
+        Status = r.Status,
+        Created = r.Created,
+        Fault = r.Fault,
+        ModelIds = r.ModelIds
+    };
+
+    /// <summary>Filters a raw job list down to jobs matching no repairer, given the CURRENT
+    /// _repairers — recomputed on every render rather than cached, so an assign action (which
+    /// only mutates _repairers, never re-queries JMS) is reflected immediately. Jobs with no
+    /// equipment attached are excluded here too — they default to Falcon implicitly and
+    /// never need an explicit assignment unless someone overrides them by job number.</summary>
+    private List<UnassignedJob> ComputeUnassigned(List<UnassignedJob> raw)
+    {
+        var assignedModelIds = _repairers.SelectMany(r => r.ModelIds).ToHashSet();
+        var assignedJobIds = _repairers.SelectMany(r => r.JobIds).ToHashSet();
+        return raw
+            .Where(j => j.ModelIds.Count > 0)
+            .Where(j => !j.ModelIds.Any(assignedModelIds.Contains) && !assignedJobIds.Contains(j.JobId))
+            .OrderBy(j => j.Created)
+            .ToList();
+    }
+
+    /// <summary>Jobs with no equipment attached that also aren't already covered by an explicit
+    /// job-number override elsewhere — these are the ones implicitly defaulting to Falcon.</summary>
+    private int CountDefaultedToFalcon(List<UnassignedJob> raw)
+    {
+        var assignedJobIds = _repairers.SelectMany(r => r.JobIds).ToHashSet();
+        return raw.Count(j => j.ModelIds.Count == 0 && !assignedJobIds.Contains(j.JobId));
+    }
+
+    private static List<ModelGroup> ComputeModelGroups(List<UnassignedJob> unassigned) =>
+        unassigned.Where(j => j.ModelIds.Count == 1)
+            .GroupBy(j => j.ModelIds[0])
+            .Select(g => new ModelGroup { ModelId = g.Key, JobCount = g.Count() })
+            .OrderByDescending(g => g.JobCount)
+            .ToList();
+
+    // ── Model labels ─────────────────────────────────────────────────────────
+
+    private async Task RefreshModelLabelsAsync()
+    {
+        var modelIds = _repairers.SelectMany(r => r.ModelIds)
+            .Concat(_openJobsRaw.SelectMany(j => j.ModelIds))
+            .Concat((_closedJobsRaw ?? new()).SelectMany(j => j.ModelIds))
+            .Distinct().ToList();
+        _modelLabels = await LoadModelLabelsAsync(modelIds);
+    }
+
+    private async Task<Dictionary<int, string>> LoadModelLabelsAsync(IReadOnlyCollection<int> modelIds)
+    {
+        var rows = await ScopeLookup.GetModelLabelsAsync(modelIds);
+        return rows.ToDictionary(r => r.ModelId, r => ScopeLabelFormatter.FormatModelLabel(r.ModelId, r.Label));
+    }
+
+    private async Task<List<(int Id, string Label)>> SearchModelsAsync(string term)
+    {
+        var rows = await ScopeLookup.SearchModelsAsync(term);
+        return rows.Select(r => (r.ModelId, ScopeLabelFormatter.FormatModelLabel(r.ModelId, r.Label))).ToList();
+    }
+
+    // ── Apply assignments ────────────────────────────────────────────────────
+
+    /// <summary>Commits every pending selection at once — the model dropdowns and the
+    /// job-override dropdowns are just local UI state (_modelGroupSelections / each job's
+    /// SelectedRepairer) until this runs. One reload at the end, not one per row.</summary>
+    private async Task ApplyAssignmentsAsync(List<ModelGroup> groups, List<UnassignedJob> overrides)
+    {
+        var modelAssignments = groups
+            .Select(g => (g.ModelId, Repairer: _modelGroupSelections.GetValueOrDefault(g.ModelId)))
+            .Where(x => !string.IsNullOrEmpty(x.Repairer))
+            .ToList();
+        var jobAssignments = overrides
+            .Where(j => !string.IsNullOrEmpty(j.SelectedRepairer))
+            .Select(j => (j.JobId, Repairer: j.SelectedRepairer!))
+            .ToList();
+
+        if (modelAssignments.Count == 0 && jobAssignments.Count == 0) return;
+
+        _applying = true;
+        StateHasChanged();
+
+        try
+        {
+            foreach (var (modelId, repairer) in modelAssignments)
+                await Repairers.AddModelAsync(repairer!, modelId);
+
+            foreach (var (jobId, repairer) in jobAssignments)
+                await Repairers.AddJobAsync(repairer, jobId);
+
+            _modelGroupSelections.Clear();
+            await ReloadRepairersAsync();
+        }
+        finally
+        {
+            _applying = false;
+            StateHasChanged();
+        }
+    }
+
+    // ── Repairer add/edit/delete ─────────────────────────────────────────────
+
+    private void StartEdit(Repairer r)
+    {
+        _editingOriginalName = r.Name;
+        _formName = r.Name;
+        _formModelIds = new List<int>(r.ModelIds);
+        _formJobIds = new List<int>(r.JobIds);
+        _formError = null;
+    }
+
+    private void CancelEdit()
+    {
+        _editingOriginalName = null;
+        _formName = "";
+        _formModelIds = new();
+        _formJobIds = new();
+        _formError = null;
+    }
+
+    private void AddFormModelId(int id)
+    {
+        if (!_formModelIds.Contains(id)) _formModelIds.Add(id);
+    }
+
+    private void RemoveFormModelId(int id) => _formModelIds.Remove(id);
+
+    private void AddFormJobId(int id)
+    {
+        if (!_formJobIds.Contains(id)) _formJobIds.Add(id);
+    }
+
+    private void RemoveFormJobId(int id) => _formJobIds.Remove(id);
+
+    private async Task SaveAsync()
+    {
+        _formError = null;
+
+        var name = _formName.Trim();
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            _formError = "Enter a repairer name.";
+            return;
+        }
+
+        var repairer = new Repairer
+        {
+            Name = name,
+            ModelIds = _formModelIds.OrderBy(id => id).ToList(),
+            JobIds = _formJobIds.OrderBy(id => id).ToList()
+        };
+
+        _saving = true;
+        StateHasChanged();
+
+        try
+        {
+            if (_editingOriginalName is null)
+                await Repairers.AddAsync(repairer);
+            else
+                await Repairers.UpdateAsync(_editingOriginalName, repairer);
+
+            CancelEdit();
+            await ReloadRepairersAsync();
+        }
+        catch (InvalidOperationException ex)
+        {
+            _formError = ex.Message;
+        }
+        finally
+        {
+            _saving = false;
+            StateHasChanged();
+        }
+    }
+
+    private void RequestDelete(string name) => _pendingDeleteName = name;
+
+    private async Task DeleteAsync(string name)
+    {
+        _pendingDeleteName = null;
+        await Repairers.RemoveAsync(name);
+        if (_editingOriginalName == name) CancelEdit();
+        await ReloadRepairersAsync();
+    }
+
+    private string FormatModelLabel(int id) =>
+        _modelLabels.TryGetValue(id, out var label) && !string.IsNullOrWhiteSpace(label) ? label : $"({id})";
+
+
+    private class UnassignedJob
+    {
+        public int JobId { get; set; }
+        public string Owner { get; set; } = "";
+        public string Status { get; set; } = "";
+        public DateTime Created { get; set; }
+        public string Fault { get; set; } = "";
+        public List<int> ModelIds { get; set; } = new();
+        public string? SelectedRepairer { get; set; }
+    }
+
+    private class ModelGroup
+    {
+        public int ModelId { get; set; }
+        public int JobCount { get; set; }
+    }
+
+}

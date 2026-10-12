@@ -1,0 +1,92 @@
+@page "/pair-device"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+
+@inherits WorkshopDashboard.Components.Helpers.JmsComponentBase
+
+@using BlazorBootstrap
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+
+@inject DevicePairingStore PairingStore
+@inject Microsoft.AspNetCore.Components.Authorization.AuthenticationStateProvider AuthStateProvider
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    PairDevice — approves a 6-digit code shown on an unattended workshop
+    monitor, so that anonymous kiosk page can show its dashboard. The
+    device reads JMS through the shared service account, not the approver.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      PairingStore — DevicePairingStore: TryApprove(code, username)
+                     matches the code against a pending pairing request
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      Approve() validates the typed code and hands it to PairingStore with
+      the caller's username — the device polling for that code picks up
+      the approval on its next check.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Pair a device</h1>
+    <p class="text-muted">Enter the code shown on the workshop monitor to approve it. Only pair devices you're comfortable showing workshop data on.</p>
+</div>
+
+<div class="row">
+    <div class="col-lg-4">
+        <EditForm Model="@this" OnSubmit="Approve">
+            <div class="mb-3">
+                <label class="form-label">Device code</label>
+                <input class="form-control form-control-lg text-center" style="letter-spacing:.3em;font-size:1.5rem;"
+                       maxlength="6" inputmode="numeric" placeholder="000000"
+                       value="@_code" @oninput="e => _code = e.Value?.ToString() ?? string.Empty" />
+            </div>
+
+            @if (!string.IsNullOrEmpty(_error))
+            {
+                <Callout Color="CalloutColor.Danger" Class="mb-3">@_error</Callout>
+            }
+            @if (_success)
+            {
+                <Callout Color="CalloutColor.Success" Class="mb-3">Device paired.</Callout>
+            }
+
+            <Button Color="ButtonColor.Primary" Type="ButtonType.Submit">Pair device</Button>
+        </EditForm>
+    </div>
+</div>
+
+@code {
+    private string _code = string.Empty;
+    private string? _error;
+    private bool _success;
+
+    private async Task Approve()
+    {
+        _error = null;
+        _success = false;
+
+        var code = (_code ?? string.Empty).Trim();
+        if (code.Length != 6 || !code.All(char.IsDigit))
+        {
+            _error = "Enter the 6-digit code shown on the device.";
+            return;
+        }
+
+        var auth = await AuthStateProvider.GetAuthenticationStateAsync();
+        var username = auth.User.Identity?.Name ?? "unknown";
+
+        if (PairingStore.TryApprove(code, username))
+        {
+            _success = true;
+            _code = string.Empty;
+        }
+        else
+        {
+            _error = "That code wasn't found or has expired — check the device screen for a current one.";
+        }
+    }
+}

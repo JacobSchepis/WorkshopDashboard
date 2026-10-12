@@ -1,0 +1,577 @@
+@page "/quote-apex"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+
+@using WorkshopDashboard.Services.Quoting.Apex
+@using static WorkshopDashboard.Services.Quoting.Apex.ApexPricingConfig
+@using WorkshopDashboard.Services.Quoting.Shipping
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Quoting
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Analytics
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+@using WorkshopDashboard.Components.Pages.Quoting.Cards
+
+@inject IConfiguration Configuration
+@inject IJsonCompletionClient OpenAi
+@inject CompanyGroupStore CompanyGroups
+@inject QuoteNoticeStore Notices
+@inject JobLookupService JobLookup
+@inject JobEquipmentLookup EquipmentLookup
+@inject QuoteSubmissionService QuoteSubmission
+@inject AnalyticsService Analytics
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    QuoteApex — repairer quote extraction + pricing for Apex. One of six near-identical per-repairer quoting pages (Apex/Bayside/
+    Cobalt/Dorado/Ember/Falcon) sharing the same upload→extract→submit shape;
+    see QuoteDorado for the fullest write-up of that shared flow.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      (extractor built inline in RunQuery, from src/Services/Quoting/Apex)
+      ShippingSelector — the company's freight zone; freight goes into the repair line
+      Notices          — QuoteNoticeStore: repairer-scope notices
+      JobLookup        — job -> owner company id (drives ApexPricingConfig
+                         lookup / unknown-company pricing-group picker)
+      EquipmentLookup  — equipment options for the equipment selector
+      QuoteSubmission  — posts the priced line items back to JMS
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      HandleFileSelected -> RunQuery extracts the PDF and looks up the job's
+      owner company against ApexPricingConfig — a company not yet configured
+      falls back to SelectPricingGroup (Group 1/2, saved for next time)
+      instead of blocking the quote. SubmitServices posts the calculated
+      total (with volume/group discounts already applied) as one service.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="container py-4" style="max-width: 860px;">
+    <div class="page-header">
+        <h1>Apex Quote Extractor</h1>
+        <p class="text-muted">Upload an Apex PDF work order quote to extract and create services.</p>
+    </div>
+
+    <QuoteUploadCard HasFile="_pdfBytes != null" HasResult="_result != null" Loading="_loading"
+                      Submitting="_submitting" SubmitSuccess="_submitSuccess" Error="@_error"
+                      CanSubmit="@(!_submitting && !string.IsNullOrEmpty(_selectedEquipmentId) && _selectedShippingGroupId != null && _calc != null)"
+                      OnFileSelected="HandleFileSelected" OnExtract="RunQuery" OnSubmit="SubmitServices" />
+
+    @if (_result != null)
+    {
+        @* ── Summary bar ── *@
+        <QuoteSummaryBar JobNumber="@_result.JobNumber" JobNumberChanged="v => _result.JobNumber = v"
+                          RetryLoading="_jobLookupLoading" OnRetry="RetryJobLookup">
+            <ExtraFields>
+                <div>
+                    <div class="text-muted small">Total</div>
+                    <div class="fw-semibold text-success">@(_calc != null ? EditedTotal.ToString("C0") : _result.TotalPrice.ToString("C"))</div>
+                </div>
+            </ExtraFields>
+        </QuoteSummaryBar>
+
+        @* ── Pricing ── *@
+        @if (_calc != null)
+        {
+            <Card Class="mb-3">
+                <CardHeader>Calculated Pricing</CardHeader>
+                <CardBody>
+                    <table class="table table-sm mb-0">
+                        <tbody>
+                            <tr>
+                                <td>Base Charge</td>
+                                <td class="text-end">@_calc.BaseCharge.ToString("C")</td>
+                            </tr>
+                            @if (_calc.Discount1 != 0)
+                            {
+                                <tr class="text-danger">
+                                    <td>Volume Discount (D16)</td>
+                                    <td class="text-end">@_calc.Discount1.ToString("C")</td>
+                                </tr>
+                            }
+                            @if (_calc.Discount2 != 0)
+                            {
+                                <tr class="text-danger">
+                                    <td>Volume Discount (D17)</td>
+                                    <td class="text-end">@_calc.Discount2.ToString("C")</td>
+                                </tr>
+                            }
+                            @if (_calc.Discount3 != 0)
+                            {
+                                <tr class="text-danger">
+                                    <td>Volume Discount (D18)</td>
+                                    <td class="text-end">@_calc.Discount3.ToString("C")</td>
+                                </tr>
+                            }
+                            @if (_calc.GroupDiscount != 0)
+                            {
+                                <tr class="text-danger">
+                                    <td>Group 2 Discount (10%)</td>
+                                    <td class="text-end">@_calc.GroupDiscount.ToString("C")</td>
+                                </tr>
+                            }
+                            <tr class="fw-semibold table-light">
+                                <td>Total</td>
+                                <td class="text-end">@_calc.Total.ToString("C")</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </CardBody>
+            </Card>
+        }
+        else
+        {
+            <Card Class="mb-3 border-warning">
+                <CardHeader Class="bg-warning bg-opacity-25">Unknown Pricing — Company ID @_companyId</CardHeader>
+                <CardBody>
+                    <p class="text-muted small mb-3">This company isn't in the pricing config yet. Select a pricing group to continue. The selection will be saved for next time.</p>
+                    <div class="d-flex gap-2">
+                        <div class="card @(_selectedPricingGroup == 1 ? "border-primary" : "") flex-fill" style="cursor:pointer" @onclick="() => SelectPricingGroup(1)">
+                            <div class="card-body p-3">
+                                <div class="d-flex justify-content-between">
+                                    <span class="fw-semibold">Group 1 — Standard</span>
+                                    @if (_selectedPricingGroup == 1)
+                                    {
+                                        <i class="bi bi-check-circle-fill text-primary"></i>
+                                    }
+                                </div>
+                                <div class="small text-muted mt-1">Standard pricing formula</div>
+                            </div>
+                        </div>
+                        <div class="card @(_selectedPricingGroup == 2 ? "border-primary" : "") flex-fill" style="cursor:pointer" @onclick="() => SelectPricingGroup(2)">
+                            <div class="card-body p-3">
+                                <div class="d-flex justify-content-between">
+                                    <span class="fw-semibold">Group 2 — Discounted</span>
+                                    @if (_selectedPricingGroup == 2)
+                                    {
+                                        <i class="bi bi-check-circle-fill text-primary"></i>
+                                    }
+                                </div>
+                                <div class="small text-muted mt-1">Standard pricing + 10% off base charge</div>
+                            </div>
+                        </div>
+                    </div>
+                    @if (_pricingGroupSaveSuccess)
+                    {
+                        <Callout Color="CalloutColor.Success" Class="mb-0 mt-3">Pricing group saved for company @_companyId.</Callout>
+                    }
+                </CardBody>
+            </Card>
+        }
+
+        @* ── Equipment selector ── *@
+        <EquipmentSelectorCard Equipment="_jobEquipment" Loading="_equipmentLoading" @bind-SelectedEquipmentId="_selectedEquipmentId" />
+
+        @* ── Service 1 preview: Technical Observations ── *@
+        <Card Class="mb-3">
+            <CardHeader>Service 1 — Technical Observations</CardHeader>
+            <CardBody>
+                @for (int i = 0; i < _result.TechnicalObservations.Count; i++)
+                {
+                    var idx = i;
+                    <div class="d-flex gap-2 mb-2">
+                        <textarea class="form-control form-control-sm"
+                                  rows="2"
+                                  style="font-size:0.85rem; resize:vertical;"
+                                  value="@_result.TechnicalObservations[idx]"
+                                  @oninput="e => _result.TechnicalObservations[idx] = e.Value?.ToString() ?? string.Empty">
+                                                </textarea>
+                        <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" Class="align-self-start"
+                                @onclick="() => _result.TechnicalObservations.RemoveAt(idx)">
+                            ✕
+                        </Button>
+                    </div>
+                }
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="mt-1"
+                        @onclick="() => _result.TechnicalObservations.Add(string.Empty)">
+                    + Add
+                </Button>
+            </CardBody>
+        </Card>
+
+        @* ── Service 2 preview: Repairs Required ── *@
+        <Card Class="mb-3">
+            <CardHeader>Service 2 — Repairs Required</CardHeader>
+            <CardBody>
+                @for (int i = 0; i < _result.RepairsRequired.Count; i++)
+                {
+                    var idx = i;
+                    <div class="d-flex gap-2 mb-2">
+                        <textarea class="form-control form-control-sm"
+                                  rows="2"
+                                  style="font-size:0.85rem; resize:vertical;"
+                                  value="@_result.RepairsRequired[idx]"
+                                  @oninput="e => _result.RepairsRequired[idx] = e.Value?.ToString() ?? string.Empty">
+                                                </textarea>
+                        <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" Class="align-self-start"
+                                @onclick="() => _result.RepairsRequired.RemoveAt(idx)">
+                            ✕
+                        </Button>
+                    </div>
+                }
+                <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true" Class="mb-3"
+                        @onclick="() => _result.RepairsRequired.Add(string.Empty)">
+                    + Add
+                </Button>
+                @if (_calc != null)
+                {
+                    <table class="table table-sm mb-0">
+                        <tbody>
+                            <tr>
+                                <td>Sub Total</td>
+                                <td class="text-end" style="width:160px">
+                                    <div class="input-group input-group-sm justify-content-end">
+                                        <span class="input-group-text">$</span>
+                                        <input type="number" class="form-control text-end" style="width:90px"
+                                               step="10" value="@_editSubTotal"
+                                               @oninput="e => { if (decimal.TryParse(e.Value?.ToString(), out var v)) _editSubTotal = v; }" />
+                                    </div>
+                                </td>
+                            </tr>
+                            @if (_editLabourRemoved != 0)
+                            {
+                                <tr class="text-danger">
+                                    <td>Labour Component Removed</td>
+                                    <td class="text-end">
+                                        <div class="input-group input-group-sm justify-content-end">
+                                            <span class="input-group-text">-$</span>
+                                            <input type="number" class="form-control text-end" style="width:90px"
+                                                   step="10" value="@Math.Abs(_editLabourRemoved)"
+                                                   @oninput="e => { if (decimal.TryParse(e.Value?.ToString(), out var v)) _editLabourRemoved = -v; }" />
+                                        </div>
+                                    </td>
+                                </tr>
+                            }
+                            @if (_editDiscount != 0)
+                            {
+                                <tr class="text-danger">
+                                    <td>Discount</td>
+                                    <td class="text-end">
+                                        <div class="input-group input-group-sm justify-content-end">
+                                            <span class="input-group-text">-$</span>
+                                            <input type="number" class="form-control text-end" style="width:90px"
+                                                   step="10" value="@Math.Abs(_editDiscount)"
+                                                   @oninput="e => { if (decimal.TryParse(e.Value?.ToString(), out var v)) _editDiscount = -v; }" />
+                                        </div>
+                                    </td>
+                                </tr>
+                            }
+                            <tr>
+                                <td>Freight @(_selectedShippingGroupId == null ? "(pick a shipping group below)" : "")</td>
+                                <td class="text-end">@Freight.ToString("C0")</td>
+                            </tr>
+                            <tr class="fw-semibold table-light">
+                                <td>Total Cost</td>
+                                <td class="text-end">@EditedTotal.ToString("C0")</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                }
+            </CardBody>
+        </Card>
+
+        @* ── Service 3: Work Order Notes (fixed template) ── *@
+        <Card Class="mb-3">
+            <CardHeader>Service 3 — Work Order Notes</CardHeader>
+            <CardBody>
+                <p class="small mb-0 text-muted">Standard Apex work order notes with estimated completion: <span class="fw-semibold text-dark">@_result.EstimatedCompletionDays working days</span></p>
+            </CardBody>
+        </Card>
+
+        @* ── Notices ── *@
+        <QuoteNoticesCard Notices="_applicableNotices" SelectedIds="_selectedNoticeIds" />
+
+        @* ── Shipping group selector ── *@
+        <ShippingSelectorCard SelectedShippingGroupId="_selectedShippingGroupId"
+                               OnSelect="SelectShippingGroup"
+                               SaveSuccess="_shippingGroupSaveSuccess"
+                               CompanyId="_companyId" />
+    }
+</div>
+
+@code {
+    private byte[]? _pdfBytes;
+    private ApexQuoteExtraction? _result;
+    private int _companyId;
+    private bool _loading = false;
+    private bool _submitting = false;
+    private bool _submitSuccess = false;
+    private string? _error;
+
+    private List<JobEquipmentInfo> _jobEquipment = new();
+    private string? _selectedEquipmentId;
+    private bool _equipmentLoading = false;
+    private bool _jobLookupLoading = false;
+
+    private ApexPricingResult? _calc;
+    private decimal _editSubTotal;
+    private decimal _editLabourRemoved;
+    private decimal _editDiscount;
+    private int? _selectedPricingGroup;
+    private bool _pricingGroupSaveSuccess = false;
+    private int? _selectedShippingGroupId;
+    private bool _shippingGroupSaveSuccess = false;
+
+    private List<QuoteNotice> _applicableNotices = new();
+    private HashSet<Guid> _selectedNoticeIds = new();
+
+    private const string CompanyPricingGroupsScope = "apex_company_pricing_groups";
+
+    private const string CompanyShippingGroupsScope = "apex_company_shipping_groups";
+
+    private static decimal R10(decimal v) => Math.Round(v, MidpointRounding.AwayFromZero);
+
+    // Freight is part of the repair line, not a line of its own.
+    private decimal Freight => ShippingConfig.FreightFor(_selectedShippingGroupId);
+    private decimal EditedTotal => _editSubTotal + _editLabourRemoved + _editDiscount + Freight;
+
+    private void ApplyCalc(ApexPricingResult calc)
+    {
+        _calc = calc;
+        _editSubTotal = R10(calc.BaseCharge);
+        _editLabourRemoved = R10(calc.GroupDiscount); // negative value, group 2 only
+        var volumeDiscount = calc.Discount1 + calc.Discount2 + calc.Discount3;
+        var total = R10(calc.Total);
+        // Derive volume discount from what's left after labour removal
+        _editDiscount = total - _editSubTotal - _editLabourRemoved;
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+    }
+
+    private async Task LoadJobEquipmentAsync(int jobId)
+    {
+        _equipmentLoading = true;
+        try
+        {
+            _jobEquipment = await EquipmentLookup.LoadAsync(jobId);
+
+            if (_jobEquipment.Count == 1)
+                _selectedEquipmentId = _jobEquipment[0].EquipmentId;
+        }
+        catch (Exception ex)
+        {
+            _error = "Failed to load job equipment: " + ex.Message;
+        }
+        finally
+        {
+            _equipmentLoading = false;
+        }
+    }
+
+    private async Task LoadApplicableNoticesAsync()
+    {
+        _applicableNotices = await Notices.GetApplicableAsync(QuoteNoticeTarget.Apex);
+        _selectedNoticeIds = _applicableNotices.Select(n => n.Id).ToHashSet();
+    }
+
+    private void SelectPricingGroup(int group)
+    {
+        _selectedPricingGroup = group;
+        _pricingGroupSaveSuccess = false;
+        try
+        {
+            CompanyGroups.Save(CompanyPricingGroupsScope, _companyId, group);
+            _pricingGroupSaveSuccess = true;
+        }
+        catch (Exception ex) { _error = "Failed to save pricing group: " + ex.Message; }
+
+        if (_result != null)
+            ApplyCalc(ApexPricingConfig.Calculate(_result.TotalPrice, group));
+    }
+
+    private void SelectShippingGroup(int shippingGroupId)
+    {
+        _selectedShippingGroupId = shippingGroupId;
+        _shippingGroupSaveSuccess = false;
+
+        try
+        {
+            CompanyGroups.Save(CompanyShippingGroupsScope, _companyId, shippingGroupId);
+            _shippingGroupSaveSuccess = true;
+        }
+        catch (Exception ex)
+        {
+            _error = "Failed to save shipping group: " + ex.Message;
+        }
+    }
+
+    private async Task HandleFileSelected(InputFileChangeEventArgs e)
+    {
+        _result = null;
+        _error = null;
+        _submitSuccess = false;
+
+        var bytes = await QuotePdfUpload.ReadPdfAsync(e, msg => _error = msg);
+        if (bytes != null)
+            _pdfBytes = bytes;
+        StateHasChanged();
+    }
+
+    private async Task RunQuery()
+    {
+        if (_pdfBytes == null) return;
+
+        _loading = true;
+        _error = null;
+        _result = null;
+        _calc = null;
+        _editSubTotal = 0;
+        _editLabourRemoved = 0;
+        _editDiscount = 0;
+        _selectedPricingGroup = null;
+        _pricingGroupSaveSuccess = false;
+        _submitSuccess = false;
+        _selectedShippingGroupId = null;
+        _shippingGroupSaveSuccess = false;
+        StateHasChanged();
+
+        try
+        {
+            var client = new ApexQuoteExtractor(OpenAi);
+            _result = await client.ExtractAsync(_pdfBytes);
+
+            await LoadApplicableNoticesAsync();
+            await RunJobLookupAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = "Extraction failed: " + ex.Message;
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private async Task RetryJobLookup()
+    {
+        if (_result == null) return;
+
+        _jobLookupLoading = true;
+        _error = null;
+        _calc = null;
+        _editSubTotal = 0;
+        _editLabourRemoved = 0;
+        _editDiscount = 0;
+        _selectedPricingGroup = null;
+        _pricingGroupSaveSuccess = false;
+        _selectedEquipmentId = null;
+        _jobEquipment = new();
+        _selectedShippingGroupId = null;
+        _shippingGroupSaveSuccess = false;
+        StateHasChanged();
+
+        try
+        {
+            await RunJobLookupAsync();
+        }
+        catch (Exception ex)
+        {
+            _error = "Job lookup failed: " + ex.Message;
+        }
+        finally
+        {
+            _jobLookupLoading = false;
+        }
+    }
+
+    private async Task RunJobLookupAsync()
+    {
+        if (_result == null) return;
+
+        int jobId;
+        if (!int.TryParse(_result.JobNumber, out jobId))
+        {
+            _error = "Could not extract a valid job number from the quote.";
+            return;
+        }
+
+        var companyId = await JobLookup.GetOwnerCompanyIdAsync(jobId);
+        if (companyId is null)
+            throw new Exception("Could not retrieve company ID for job " + jobId);
+        _companyId = companyId.Value;
+
+        await LoadJobEquipmentAsync(jobId);
+
+        // Try hardcoded config first, then saved JSON overrides
+        var knownGroup = ApexPricingConfig.CompanyGroups.ContainsKey(_companyId)
+            ? ApexPricingConfig.GetGroupForCompany(_companyId)
+            : (int?)null;
+
+        if (knownGroup.HasValue)
+        {
+            _selectedPricingGroup = knownGroup.Value;
+            ApplyCalc(ApexPricingConfig.Calculate(_result.TotalPrice, knownGroup.Value));
+        }
+        else
+        {
+            var pricingOverrides = CompanyGroups.LoadSaved(CompanyPricingGroupsScope);
+            if (pricingOverrides.TryGetValue(_companyId, out var savedGroup))
+            {
+                _selectedPricingGroup = savedGroup;
+                ApplyCalc(ApexPricingConfig.Calculate(_result.TotalPrice, savedGroup));
+            }
+        }
+
+        var shippingOverrides = CompanyGroups.LoadSaved(CompanyShippingGroupsScope);
+        if (shippingOverrides.TryGetValue(_companyId, out var savedShippingGroupId)
+            && ShippingConfig.Groups.ContainsKey(savedShippingGroupId))
+        {
+            _selectedShippingGroupId = savedShippingGroupId;
+        }
+    }
+
+    private async Task SubmitServices()
+    {
+        if (_result == null || string.IsNullOrEmpty(_selectedEquipmentId)) return;
+        if (_selectedShippingGroupId == null) return;
+
+        _submitting = true;
+        _error = null;
+        _submitSuccess = false;
+        StateHasChanged();
+
+        try
+        {
+            int jobId;
+            if (!int.TryParse(_result.JobNumber, out jobId))
+            {
+                _error = "Could not extract a valid job number from the quote.";
+                return;
+            }
+
+            var lineItems = new List<(string, decimal)>
+            {
+                (ApexServiceDescriptions.GetTechnicalObservationsDescription(_result.TechnicalObservations), 0m),
+                (ApexServiceDescriptions.GetRepairsDescription(_result.RepairsRequired, _editSubTotal, _editLabourRemoved, _editDiscount, EditedTotal, Freight), EditedTotal),
+                (ApexServiceDescriptions.GetWorkOrderNotesDescription(_result.EstimatedCompletionDays), 0m),
+            };
+
+            var selectedNotices = _applicableNotices.Where(n => _selectedNoticeIds.Contains(n.Id));
+
+            await QuoteSubmission.SubmitAsync(
+                jobId, _selectedEquipmentId,
+                lineItems, selectedNotices);
+
+            _submitSuccess = true;
+            await Analytics.TrackEventAsync("Quote services created — Apex");
+        }
+        catch (Exception ex)
+        {
+            _error = "Submission failed: " + ex.Message;
+        }
+        finally
+        {
+            _submitting = false;
+        }
+    }
+
+}

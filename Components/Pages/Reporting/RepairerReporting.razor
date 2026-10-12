@@ -1,0 +1,314 @@
+@page "/repairer-reporting"
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+
+@inherits JmsComponentBase
+@inject RepairerStore Repairers
+@inject ScopeJobStore ScopeJobs
+@inject RepairerAssignmentLookup JobLookup
+@inject ScopeLookupService ScopeLookup
+
+@using Microsoft.AspNetCore.Components
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Admin
+@using static WorkshopDashboard.Services.Admin.ScopeLabelFormatter
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    RepairerReporting — read-only view of RepairerManager.razor's assignment
+    data: how many jobs (open + EVERY closed job, job_status_id = 2) each
+    repairer handles, and their average turnaround (creation_date ->
+    completed_date, closed jobs only). This is the "equipment/repair-timeline
+    reporting" the doc comments on Repairer.cs / RepairerStore.cs /
+    RepairerManager.razor referred to.
+
+    Unlike RepairerManager's Closed tab (a trailing N-month window, widened
+    gradually so backfilling assignments stays manageable), this report pulls
+    every closed job unconditionally via JmsQueries.AllClosedScopeJobsWithModelsQuery
+    — a report that silently dropped anything older than a few months would
+    misstate every repairer's real job count and turnaround average.
+
+    Job -> repairer resolution reuses RepairerResolver, the same job-number
+    override / model-id / no-equipment-defaults-to-Falcon rules
+    RepairerManager.ComputeUnassigned applies — a job that resolves to null
+    here is exactly one that would show up needing job-level assignment
+    there, so this page's "Unassigned" bucket links back to it.
+
+    A job only counts as an actual repair here if it was ever set to Waiting
+    Workshop Assignment (status 29) — JmsQueries.BuildScopeJobsWithModelsQuery's
+    sent_to_repairer column. A job that reached the workshop (status 16/34,
+    the pre-existing ScopeJobClause gate) but never got that far usually just
+    means the equipment was repaired in-house instead of sent to an outside
+    repairer, so those are dropped from this report entirely — EXCEPT for
+    Dorado and Apex, whose models are sometimes
+    sent out and sometimes fixed in-house. For those two, a model match
+    without status 29 is recategorized into its own in-house bucket
+    (in-house-rigid / in-house-flex) rather than being dropped, so that
+    volume is still visible instead of silently disappearing.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Repairer Reporting</h1>
+    <p class="text-muted">
+        Job volume and turnaround per repairer, based on the assignments in
+        <a href="/repairer-manager">Repairer Manager</a>.
+    </p>
+</div>
+
+@if (_loading)
+{
+    <div class="d-flex align-items-center gap-2">
+        <Spinner Color="SpinnerColor.Primary" />
+        <span>Loading...</span>
+    </div>
+}
+else
+{
+    <p class="text-muted small mb-4">
+        Includes every open job and every closed job (job_status_id = 2) that was ever
+        set to Waiting Workshop Assignment. Dorado / Apex jobs
+        that skipped that status were repaired in-house and appear under
+        "in-house-rigid" / "in-house-flex" instead.
+    </p>
+
+    <Card class="mb-4">
+        <CardHeader>By Repairer</CardHeader>
+        <CardBody>
+            @if (_summaries.Count == 0)
+            {
+                <p class="text-muted small mb-0">No jobs found.</p>
+            }
+            else
+            {
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead>
+                            <tr>
+                                <th>Repairer</th>
+                                <th class="text-end">Open</th>
+                                <th class="text-end">Closed</th>
+                                <th class="text-end">Total</th>
+                                <th class="text-end">Avg Turnaround</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var s in _summaries)
+                            {
+                                <tr class="@(s.Name == _selectedRepairer ? "table-active" : "")">
+                                    <td>
+                                        @s.Name
+                                        @if (s.Name == RepairerResolver.NoEquipmentDefault)
+                                        {
+                                            <span class="text-muted small"> (includes no-equipment default)</span>
+                                        }
+                                        else if (InHouseBucketByRepairer.ContainsValue(s.Name))
+                                        {
+                                            <span class="text-muted small"> (repaired in-house instead of sent externally)</span>
+                                        }
+                                    </td>
+                                    <td class="text-end">@s.OpenCount</td>
+                                    <td class="text-end">@s.ClosedCount</td>
+                                    <td class="text-end">@(s.OpenCount + s.ClosedCount)</td>
+                                    <td class="text-end">@FormatDays(s.AvgTurnaroundDays)</td>
+                                    <td class="text-end">
+                                        <Button Size="ButtonSize.Small" Color="ButtonColor.Secondary" Outline="true"
+                                                @onclick="@(() => ToggleSelected(s.Name))">
+                                            @(s.Name == _selectedRepairer ? "Hide" : "View Jobs")
+                                        </Button>
+                                    </td>
+                                </tr>
+                            }
+                            @if (_unassignedCount > 0)
+                            {
+                                <tr>
+                                    <td><span class="text-muted">Unassigned</span></td>
+                                    <td class="text-end" colspan="3">@_unassignedCount job@(_unassignedCount == 1 ? "" : "s") need a job-level assignment</td>
+                                    <td class="text-end"></td>
+                                    <td class="text-end">
+                                        <a class="btn btn-sm btn-outline-secondary" href="/repairer-manager">Assign</a>
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </CardBody>
+    </Card>
+
+    @if (_selectedRepairer is not null)
+    {
+        var jobs = _resolvedJobs.Where(j => j.Repairer == _selectedRepairer).OrderByDescending(j => j.Created).ToList();
+        <Card>
+            <CardHeader>@_selectedRepairer — @jobs.Count job@(jobs.Count == 1 ? "" : "s")</CardHeader>
+            <CardBody>
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead>
+                            <tr>
+                                <th>Job</th>
+                                <th>Owner</th>
+                                <th>Status</th>
+                                <th>Created</th>
+                                <th>Completed</th>
+                                <th class="text-end">Turnaround</th>
+                                <th>Equipment</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var job in jobs)
+                            {
+                                <tr>
+                                    <td>
+                                        <a href="@JmsLinks.JobSummary(job.JobId)"
+                                           target="_blank" rel="noopener noreferrer">@job.JobId</a>
+                                    </td>
+                                    <td class="small">@job.Owner</td>
+                                    <td class="small">@job.Status</td>
+                                    <td class="small">@job.Created.ToString("dd MMM yyyy")</td>
+                                    <td class="small">@(job.Completed?.ToString("dd MMM yyyy") ?? "—")</td>
+                                    <td class="text-end small">@FormatDays(job.TurnaroundDays)</td>
+                                    <td class="small">
+                                        @(job.ModelIds.Count == 0 ? "—" : string.Join(", ", job.ModelIds.Select(FormatModelLabel)))
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            </CardBody>
+        </Card>
+    }
+}
+
+@code {
+    private static readonly Dictionary<string, string> InHouseBucketByRepairer = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Dorado"] = "in-house-rigid",
+        ["Apex"] = "in-house-flex"
+    };
+
+    private bool _loading = true;
+
+    private List<Repairer> _repairers = new();
+    private Dictionary<int, string> _modelLabels = new();
+    private List<ResolvedJob> _resolvedJobs = new();
+    private List<RepairerSummary> _summaries = new();
+    private int _unassignedCount;
+    private string? _selectedRepairer;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+
+        _repairers = await Repairers.LoadAsync();
+
+        var exclusions = await ScopeJobs.LoadAsync();
+        var open = await JobLookup.GetOpenJobsAsync(exclusions);
+        var closed = await JobLookup.GetAllClosedJobsAsync(exclusions);
+
+        await RefreshModelLabelsAsync(open.Concat(closed));
+        Recompute(open, closed);
+
+        _loading = false;
+    }
+
+    private void Recompute(List<RepairerJobRow> open, List<RepairerJobRow> closed)
+    {
+        _resolvedJobs = open.Select(r => ToResolvedJob(r, isOpen: true))
+            .Concat(closed.Select(r => ToResolvedJob(r, isOpen: false)))
+            .Where(j => j is not null)
+            .Select(j => j!)
+            .ToList();
+
+        _unassignedCount = _resolvedJobs.Count(j => j.Repairer is null);
+
+        _summaries = _resolvedJobs
+            .Where(j => j.Repairer is not null)
+            .GroupBy(j => j.Repairer!)
+            .Select(g => new RepairerSummary
+            {
+                Name = g.Key,
+                OpenCount = g.Count(j => j.IsOpen),
+                ClosedCount = g.Count(j => !j.IsOpen),
+                AvgTurnaroundDays = AverageOrNull(g.Where(j => j.TurnaroundDays.HasValue).Select(j => j.TurnaroundDays!.Value))
+            })
+            .OrderByDescending(s => s.OpenCount + s.ClosedCount)
+            .ToList();
+    }
+
+    /// <summary>Returns null for a job that never reached Waiting Workshop Assignment and
+    /// isn't one of the in-house-capable repairers — those never really entered the repair
+    /// pipeline this report tracks, so they're dropped rather than shown as "Unassigned."</summary>
+    private ResolvedJob? ToResolvedJob(RepairerJobRow r, bool isOpen)
+    {
+        var repairer = RepairerResolver.Resolve(_repairers, r.ModelIds, r.JobId);
+
+        if (!r.SentToRepairer)
+        {
+            if (repairer is not null && InHouseBucketByRepairer.TryGetValue(repairer, out var bucket))
+                repairer = bucket;
+            else
+                return null;
+        }
+
+        return new ResolvedJob
+        {
+            JobId = r.JobId,
+            Owner = r.Owner,
+            Status = r.Status,
+            Created = r.Created,
+            Completed = r.Completed,
+            ModelIds = r.ModelIds,
+            IsOpen = isOpen,
+            Repairer = repairer
+        };
+    }
+
+    private static double? AverageOrNull(IEnumerable<int> values)
+    {
+        var list = values.ToList();
+        return list.Count == 0 ? null : list.Average();
+    }
+
+    private void ToggleSelected(string name) =>
+        _selectedRepairer = _selectedRepairer == name ? null : name;
+
+    private async Task RefreshModelLabelsAsync(IEnumerable<RepairerJobRow> jobs)
+    {
+        var modelIds = jobs.SelectMany(j => j.ModelIds).Distinct().ToList();
+        var rows = await ScopeLookup.GetModelLabelsAsync(modelIds);
+        _modelLabels = rows.ToDictionary(r => r.ModelId, r => ScopeLabelFormatter.FormatModelLabel(r.ModelId, r.Label));
+    }
+
+    private string FormatModelLabel(int id) =>
+        _modelLabels.TryGetValue(id, out var label) && !string.IsNullOrWhiteSpace(label) ? label : $"({id})";
+
+    private static string FormatDays(double? days) => days.HasValue ? $"{days.Value:0.#}d" : "—";
+
+    private class ResolvedJob
+    {
+        public int JobId { get; set; }
+        public string Owner { get; set; } = "";
+        public string Status { get; set; } = "";
+        public DateTime Created { get; set; }
+        public DateTime? Completed { get; set; }
+        public List<int> ModelIds { get; set; } = new();
+        public bool IsOpen { get; set; }
+        public string? Repairer { get; set; }
+        public int? TurnaroundDays => Completed.HasValue ? (Completed.Value.Date - Created.Date).Days : null;
+    }
+
+    private class RepairerSummary
+    {
+        public string Name { get; set; } = "";
+        public int OpenCount { get; set; }
+        public int ClosedCount { get; set; }
+        public double? AvgTurnaroundDays { get; set; }
+    }
+}

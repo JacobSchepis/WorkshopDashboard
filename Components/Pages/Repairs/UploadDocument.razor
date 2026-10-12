@@ -1,0 +1,543 @@
+@page "/upload-document"
+@rendermode InteractiveServer
+
+@inherits JmsComponentBase
+
+@using System.Security.Claims
+@using Microsoft.AspNetCore.Components.Authorization
+@using WorkshopDashboard.Components.Helpers
+@using WorkshopDashboard.Components.Forms
+
+@using WorkshopDashboard.Models
+@using WorkshopDashboard.Services.Shipping
+@using WorkshopDashboard.Services.External.Shipping
+@using WorkshopDashboard.Services.Workshop
+@using WorkshopDashboard.Services.External.Jms
+@using WorkshopDashboard.Services.Jobs
+@using WorkshopDashboard.Services.Admin
+@using WorkshopDashboard.Services.Stores
+@using BlazorBootstrap
+
+@inject AuthenticationStateProvider AuthStateProvider
+@inject JobLookupService JobLookup
+@inject DocumentUploadService DocumentUpload
+@inject ILogger<UploadDocument> Logger
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    UploadDocument — attaches a file to a job (mirrors JMS's "Add Resources"
+    form) and can optionally chain one or more status changes onto the same
+    job right after.
+
+    ── Services ─────────────────────────────────────────────────────────────
+      JobLookup      — JobLookupService: GetJobInfoCsvAsync, the job-info
+                       panel shown as the id is typed (owner/equipment/notes/
+                       status history) — parsed by hand (ParseJobInfoCsv/
+                       ParseCsvRecords) rather than CsvHelper, specifically
+                       to survive newlines embedded in quoted job-notes
+                       fields, which a naive line-split used to corrupt
+      DocumentUpload — DocumentUploadService: UploadResourceAsync (the real
+                       multipart POST) and ChangeJobStatusAsync per queued
+                       status row
+
+    ── Flow ─────────────────────────────────────────────────────────────────
+      OnJobIdChanged loads the job-info panel as the id is typed. Upload
+      validates the Owner/Title/Description/File sections, builds the same
+      multipart fields JMS's own form posts, uploads the file, then applies
+      every queued status row in order.
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<div class="page-header">
+    <h1>Upload Document</h1>
+</div>
+
+@if (!string.IsNullOrWhiteSpace(_status))
+{
+    <Callout Color="CalloutColor.Info" Class="mb-3">@_status</Callout>
+}
+
+<div style="display:flex; flex-direction:column; gap:12px; max-width:520px;">
+
+    @* Single Job ID input *@
+    <div>
+        <label class="form-label">Job ID</label>
+        <InputText class="form-control"
+                   @bind-Value="_jobId"
+                   @bind-Value:after="OnJobIdChanged"
+                   placeholder="Enter job ID..." />
+    </div>
+
+    @* Job info panel *@
+    @if (_jobInfo is not null)
+    {
+        <Card>
+            <CardBody>
+                <h6 class="fw-semibold mb-2">Job #@_jobInfo.Id</h6>
+
+                <div style="display:grid; grid-template-columns:auto 1fr; gap:6px 14px; align-items:start;" class="small">
+
+                    <span class="text-muted">Owner</span>
+                    <span>@_jobInfo.OwnerName</span>
+
+                    @if (_jobInfo.Equipment.Count > 0)
+                    {
+                        <span class="text-muted">Equipment</span>
+                        <div class="d-flex flex-column">
+                            @foreach (var eq in _jobInfo.Equipment)
+                            {
+                                <span>@eq</span>
+                            }
+                        </div>
+                    }
+
+                    @if (!string.IsNullOrWhiteSpace(_jobInfo.Notes))
+                    {
+                        <span class="text-muted">Notes</span>
+                        <span>@_jobInfo.Notes</span>
+                    }
+
+                </div>
+
+                @if (_jobInfo.StatusHistory.Count > 0)
+                {
+                    <div class="mt-3">
+                        <strong class="small">Status History</strong>
+                        <div class="mt-2 d-flex flex-column gap-1">
+                            @foreach (var entry in _jobInfo.StatusHistory)
+                            {
+                                <div class="small d-flex gap-2 align-items-baseline">
+                                    <span class="text-muted text-nowrap" style="min-width:90px;">@entry.Date.ToString("dd MMM yyyy")</span>
+                                    <span class="fw-medium">@entry.Status</span>
+                                    @if (!string.IsNullOrWhiteSpace(entry.Notes))
+                                    {
+                                        <span class="text-muted">— @entry.Notes</span>
+                                    }
+                                </div>
+                            }
+                        </div>
+                    </div>
+                }
+            </CardBody>
+        </Card>
+    }
+    else if (_jobInfoLoading)
+    {
+        <div class="d-flex align-items-center gap-2">
+            <Spinner Color="SpinnerColor.Secondary" Size="SpinnerSize.Small" />
+            <span class="text-muted small">Loading job info...</span>
+        </div>
+    }
+    else if (_jobInfoError is not null)
+    {
+        <Callout Color="CalloutColor.Danger">@_jobInfoError</Callout>
+    }
+
+    <OwnerSection @ref="_ownerSection" />
+
+    <TextSection @ref="_titleSection" Heading="Title" />
+    <TextSection @ref="_descriptionSection" Heading="Description" />
+
+    <FileSection @ref="_fileSection" />
+
+    <label class="form-label">Add a status</label>
+    <InputSelect TValue="JobStatus?"
+                 class="form-select"
+                 @bind-Value="_statusToAdd"
+                 @bind-Value:after="AfterStatusChanged">
+        <option value="">-- Select Status --</option>
+        @foreach (var s in _allowedStatuses)
+        {
+            <option value="@s" disabled="@_statusRows.Any(r => r.Status == s)">@s</option>
+        }
+    </InputSelect>
+
+    @if (_statusRows.Count > 0)
+    {
+        <div class="d-flex flex-column gap-3 mt-2">
+            @foreach (var row in _statusRows)
+            {
+                <Card @key="row">
+                    <CardBody>
+                        <div class="d-flex justify-content-between align-items-center gap-2">
+                            <strong>@row.Status</strong>
+
+                            <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true"
+                                    @onclick="() => _statusRows.Remove(row)">
+                                Remove
+                            </Button>
+                        </div>
+
+                        <div class="mt-2">
+                            <InputText class="form-control"
+                                       @bind-Value="row.Note"
+                                       placeholder="Optional note for this status..." />
+                        </div>
+                    </CardBody>
+                </Card>
+            }
+        </div>
+    }
+
+    <SubmitSection OnSubmit="Upload" />
+</div>
+
+@code {
+    private OwnerSection? _ownerSection;
+    private TextSection? _titleSection;
+    private TextSection? _descriptionSection;
+    private FileSection? _fileSection;
+
+    private string _jobId = "";
+
+    private JobInfo? _jobInfo;
+    private bool _jobInfoLoading;
+    private string? _jobInfoError;
+
+    private sealed class JobInfo
+    {
+        public string Id { get; set; } = "";
+        public string OwnerName { get; set; } = "";
+        public List<string> Equipment { get; set; } = new();
+        public string? Notes { get; set; }
+        public List<StatusEntry> StatusHistory { get; set; } = new();
+    }
+
+    private sealed class StatusEntry
+    {
+        public string Status { get; set; } = "";
+        public DateTime Date { get; set; }
+        public string? Notes { get; set; }
+    }
+
+    private sealed class StatusNoteRow
+    {
+        public JobStatus Status { get; set; }
+        public string Note { get; set; } = "";
+    }
+
+    private JobStatus? _statusToAdd;
+    private readonly List<StatusNoteRow> _statusRows = new();
+
+    // optional: subset
+    private static readonly JobStatus[] _allowedStatuses =
+    {
+        JobStatus.UnitArrivedAtWorkshop,
+        JobStatus.WaitingAssessment,
+        JobStatus.QueuedForAssessment,
+        JobStatus.WaitingQualityControlCheck,
+        JobStatus.WaitingInvoicing,
+        JobStatus.WaitingOutwardShipping,
+        JobStatus.WaitingWorkshopProcessing
+    };
+
+
+
+    private bool hasError = false;
+
+    private string? _status;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+
+
+        _titleSection?.SetText("Proof of arrival");
+        _descriptionSection?.SetText("Document uploaded via Workshop Dashboard");
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+
+        var auth = await AuthStateProvider.GetAuthenticationStateAsync();
+        var user = auth.User.Identity?.Name;
+
+        if (user is null) return;
+
+        _ownerSection?.PrefillOwnerFromUsernameAsync(user);
+    }
+
+
+    private async Task OnJobIdChanged()
+    {
+        _jobInfo = null;
+        _jobInfoError = null;
+
+        if (string.IsNullOrWhiteSpace(_jobId))
+            return;
+
+        _jobInfoLoading = true;
+        StateHasChanged();
+
+        try
+        {
+            var id = _jobId.Trim();
+
+            // The id is concatenated into the SQL below, so only accept
+            // digits — protects against typos erroring the query (and
+            // injection via this input).
+            if (!long.TryParse(id, out var jobIdNum))
+            {
+                _jobInfoError = "Job ID must be a number.";
+                return;
+            }
+
+            var csvContent = await JobLookup.GetJobInfoCsvAsync(jobIdNum);
+
+            if (csvContent is null)
+            {
+                _jobInfoError = "No response from server.";
+                return;
+            }
+
+            _jobInfo = ParseJobInfoCsv(id, csvContent);
+
+            if (_jobInfo is null)
+                _jobInfoError = $"Job {id} not found.";
+        }
+        catch (Exception ex)
+        {
+            Logger.LogWarning(ex, "Loading job info failed");
+            _jobInfoError = "Failed to load job info. Check the ID and try again.";
+        }
+        finally
+        {
+            _jobInfoLoading = false;
+            StateHasChanged();
+        }
+    }
+
+    // Columns: job_id | company_name | job_notes | generic_name | serial_no | job_status_id | creation_date | status_notes
+    private static JobInfo? ParseJobInfoCsv(string id, string csvContent)
+    {
+        var records = ParseCsvRecords(csvContent);
+
+        int startRow = records.Count > 0 &&
+                       records[0].Length > 0 &&
+                       records[0][0].Contains("job_id", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+
+        JobInfo? info = null;
+        var equipmentSeen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var statusSeen = new HashSet<string>();
+
+        foreach (var cols in records.Skip(startRow))
+        {
+            if (cols.Length < 6) continue;
+
+            info ??= new JobInfo
+                {
+                    Id = id,
+                    OwnerName = cols[1],
+                    Notes = string.IsNullOrWhiteSpace(cols[2]) ? null : cols[2],
+                };
+
+            var genericName = cols[3];
+            var serialNo = cols[4];
+            if (!string.IsNullOrWhiteSpace(genericName))
+            {
+                var label = string.IsNullOrWhiteSpace(serialNo)
+                    ? genericName
+                    : $"{genericName} (S/N: {serialNo})";
+
+                if (equipmentSeen.Add(label))
+                    info.Equipment.Add(label);
+            }
+
+            var statusIdStr = cols[5];
+            var dateStr = cols.Length > 6 ? cols[6] : "";
+            var statusNotes = cols.Length > 7 ? cols[7] : "";
+            var dedupKey = $"{statusIdStr}|{dateStr}";
+
+            if (!string.IsNullOrWhiteSpace(statusIdStr) &&
+                statusSeen.Add(dedupKey) &&
+                int.TryParse(statusIdStr, out var statusId) &&
+                DateTime.TryParse(dateStr, out var date))
+            {
+                info.StatusHistory.Add(new StatusEntry
+                    {
+                        Status = ((JobStatus)statusId).ToString(),
+                        Date = date,
+                        Notes = string.IsNullOrWhiteSpace(statusNotes) ? null : statusNotes
+                    });
+            }
+        }
+
+        return info;
+    }
+
+    /// <summary>
+    /// Parse an entire CSV payload into records. Unlike splitting on '\n'
+    /// first, this treats newlines INSIDE quoted fields as field content —
+    /// which is what was breaking jobs whose notes contain line breaks
+    /// (the split sliced the quoted field in half, every fragment failed the
+    /// column-count check, and the job looked like it didn't exist).
+    /// Handles "" escapes, \r\n line endings, and skips blank lines.
+    /// </summary>
+    private static List<string[]> ParseCsvRecords(string content)
+    {
+        var records = new List<string[]>();
+        var fields = new List<string>();
+        var current = new System.Text.StringBuilder();
+        bool inQuotes = false;
+
+        void EndField()
+        {
+            fields.Add(current.ToString());
+            current.Clear();
+        }
+
+        void EndRecord()
+        {
+            EndField();
+            // Skip truly blank lines (a single empty field).
+            if (fields.Count > 1 || fields[0].Length > 0)
+                records.Add(fields.ToArray());
+            fields.Clear();
+        }
+
+        for (int i = 0; i < content.Length; i++)
+        {
+            char c = content[i];
+
+            if (inQuotes)
+            {
+                if (c == '"')
+                {
+                    if (i + 1 < content.Length && content[i + 1] == '"')
+                    {
+                        current.Append('"');   // escaped quote
+                        i++;
+                    }
+                    else
+                    {
+                        inQuotes = false;       // closing quote
+                    }
+                }
+                else
+                {
+                    current.Append(c);          // includes , \r \n — all literal here
+                }
+            }
+            else
+            {
+                switch (c)
+                {
+                    case '"': inQuotes = true; break;
+                    case ',': EndField(); break;
+                    case '\r': break;           // swallow the \r of \r\n
+                    case '\n': EndRecord(); break;
+                    default: current.Append(c); break;
+                }
+            }
+        }
+
+        // Flush a final record with no trailing newline.
+        if (current.Length > 0 || fields.Count > 0)
+            EndRecord();
+
+        return records;
+    }
+
+    private void AfterStatusChanged()
+    {
+        if (!_statusToAdd.HasValue)
+            return;
+
+        var s = _statusToAdd.Value;
+
+        // prevent duplicates; remove if you want multiples of same status
+        if (_statusRows.Any(r => r.Status == s))
+        {
+            _statusToAdd = null;
+            return;
+        }
+
+        _statusRows.Add(new StatusNoteRow { Status = s });
+
+        _statusToAdd = null; // reset dropdown
+    }
+
+
+    private async Task Upload()
+    {
+        ResetErrors();
+        if (!ValidateData()) return;
+
+        var id = _jobId.Trim();
+        var user = _ownerSection!.GetJmsUser();
+
+        try
+        {
+            var mp = new MultipartFormDataContent();
+
+            mp.Add(new StringContent(""), "tag");
+            mp.Add(new StringContent(user.FullName), "author_name");
+            mp.Add(new StringContent(_titleSection!.Text), "title");
+            mp.Add(new StringContent(_descriptionSection!.Text), "or_description");
+            mp.Add(new StringContent(DateTime.Now.ToString("dd-MM-yyyy")), "published_date");
+            mp.Add(new StringContent(user.FullName), "owner");
+            mp.Add(new StringContent(user.UserId.ToString()), "user_id");
+            mp.Add(new StringContent(""), "notes");
+            mp.Add(new StringContent(id), "id");
+            mp.Add(new StringContent("Add Resources"), "add_resource");
+
+            var file = _fileSection!.GetFile()!;
+
+            var stream = file.OpenReadStream(maxAllowedSize: 15 * 1024 * 1024);
+            var fileContent = new StreamContent(stream);
+            fileContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(file.ContentType);
+
+            mp.Add(fileContent, "resource", file.Name);
+
+            var res = await DocumentUpload.UploadResourceAsync(int.Parse(id), mp);
+
+            _status = res.Success
+                ? $"Uploaded OK (HTTP {res.StatusCode})."
+                : $"Upload failed: {res.StatusCode} {res.ReasonPhrase}";
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "Uploading a document to job {JobId} failed", id);
+            _status = $"Error uploading document for job {id}. Please try again.";
+            return;
+        }
+
+        var jobId = int.Parse(id);
+        foreach (var statusRow in _statusRows)
+            await DocumentUpload.ChangeJobStatusAsync(jobId, statusRow.Status, statusRow.Note);
+    }
+
+    private void ResetErrors()
+    {
+        hasError = false;
+        _status = null;
+        _ownerSection?.SetError(false);
+        _titleSection?.SetError(false);
+        _descriptionSection?.SetError(false);
+        _fileSection?.SetError(false);
+    }
+
+    private bool ValidateData()
+    {
+        if (_ownerSection is null || _titleSection is null || _descriptionSection is null || _fileSection is null)
+        {
+            _status = "Form is not fully initialized.";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(_jobId)) { hasError = true; }
+        if (_ownerSection.User == default) { _ownerSection.SetError(true); hasError = true; }
+        if (String.IsNullOrEmpty(_titleSection.Text)) { _titleSection.SetError(true); hasError = true; }
+        if (String.IsNullOrEmpty(_descriptionSection.Text)) { _descriptionSection.SetError(true); hasError = true; }
+        if (_fileSection.GetFile() == null) { _fileSection.SetError(true); hasError = true; }
+
+        if (hasError)
+        {
+            _status = "Please fix the errors above and try again.";
+            return false;
+        }
+
+        return true;
+    }
+}

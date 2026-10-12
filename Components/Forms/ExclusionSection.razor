@@ -1,0 +1,198 @@
+@using BlazorBootstrap
+
+@*
+    ═══════════════════════════════════════════════════════════════════════
+    ExclusionSection — a Card-wrapped multi-id list editor: add by raw
+    numeric id, or by live-search when the caller needs picking by name
+    (companies/models). Used throughout Scope Job/Customer Manager for
+    every "list of excluded/included ids" section.
+
+    ── Parameters ───────────────────────────────────────────────────────────
+      Title/Placeholder  — card header + add-box placeholder
+      Ids                — the ids to render (caller owns ordering)
+      Labels             — optional id -> display label; unlabeled ids show
+                           the bare id
+      SearchAsync        — when set, the add box becomes live search-and-
+                           pick instead of a plain numeric input
+      OnAdd / OnRemove   — fired with the id; caller owns persistence and
+                           is expected to update Ids afterward
+    ═══════════════════════════════════════════════════════════════════════
+*@
+
+<Card>
+    <CardHeader>@Title</CardHeader>
+    <CardBody>
+        @if (SearchAsync is not null)
+        {
+            <div class="mb-3">
+                <input class="form-control" placeholder="@Placeholder" value="@_query" @oninput="OnSearchInput" />
+                @if (_searching)
+                {
+                    <div class="text-muted small mt-1">Searching...</div>
+                }
+                @if (_hits.Count > 0)
+                {
+                    <div class="border rounded mt-1 p-2" style="max-height:220px; overflow-y:auto;">
+                        @foreach (var hit in _hits)
+                        {
+                            <button type="button" class="btn btn-sm btn-outline-secondary d-block w-100 text-start mb-1"
+                                    @onclick="() => SelectAsync(hit.Id)">
+                                @hit.Label
+                            </button>
+                        }
+                    </div>
+                }
+            </div>
+        }
+        else
+        {
+            <div class="input-group mb-3">
+                <input class="form-control" type="number" placeholder="@Placeholder"
+                       value="@_input" @oninput="OnInput" />
+                <Button Color="ButtonColor.Primary" Outline="true" Disabled="_adding" @onclick="AddAsync">
+                    @(_adding ? "..." : "Add")
+                </Button>
+            </div>
+        }
+
+        @if (!string.IsNullOrEmpty(_error))
+        {
+            <Callout Color="CalloutColor.Danger" Class="mb-2">@_error</Callout>
+        }
+
+        @if (Ids.Count == 0)
+        {
+            <p class="text-muted small mb-0">None excluded.</p>
+        }
+        else
+        {
+            <ul class="list-group">
+                @foreach (var id in Ids)
+                {
+                    <li class="list-group-item d-flex justify-content-between align-items-center">
+                        <span>@(Labels.TryGetValue(id, out var label) && !string.IsNullOrWhiteSpace(label) ? label : id.ToString())</span>
+                        <Button Size="ButtonSize.Small" Color="ButtonColor.Danger" Outline="true" Disabled="@(_removing == id)"
+                                @onclick="() => RemoveAsync(id)">
+                            @(_removing == id ? "..." : "Remove")
+                        </Button>
+                    </li>
+                }
+            </ul>
+        }
+    </CardBody>
+</Card>
+
+@code {
+    [Parameter] public string Title { get; set; } = "";
+    [Parameter] public string Placeholder { get; set; } = "";
+    [Parameter] public List<int> Ids { get; set; } = new();
+
+    /// <summary>Optional id -> full display label (e.g. "Acme Corp (1234)"), already formatted by the
+    /// caller. Ids with no entry just show the bare id.</summary>
+    [Parameter] public Dictionary<int, string> Labels { get; set; } = new();
+
+    /// <summary>When set, the add box becomes a live search-and-pick list instead of a plain id input —
+    /// used for companies/models where staff know the name, not the id. Clicking a hit adds it
+    /// immediately. Leave null (default) for a plain numeric id entry, e.g. job ids.</summary>
+    [Parameter] public Func<string, Task<List<(int Id, string Label)>>>? SearchAsync { get; set; }
+
+    [Parameter] public EventCallback<int> OnAdd { get; set; }
+    [Parameter] public EventCallback<int> OnRemove { get; set; }
+
+    private string _input = "";
+    private string _query = "";
+    private string? _error;
+    private bool _adding;
+    private bool _searching;
+    private int? _removing;
+    private List<(int Id, string Label)> _hits = new();
+    private CancellationTokenSource? _searchCts;
+
+    private void OnInput(ChangeEventArgs e) => _input = e.Value?.ToString() ?? "";
+
+    private async Task AddAsync()
+    {
+        _error = null;
+
+        if (!int.TryParse(_input, out var id))
+        {
+            _error = "Enter a whole number.";
+            return;
+        }
+
+        _adding = true;
+        try
+        {
+            await OnAdd.InvokeAsync(id);
+            _input = "";
+        }
+        finally
+        {
+            _adding = false;
+        }
+    }
+
+    // Deliberately synchronous (not async) — the debounce+search runs detached in
+    // SearchAfterDelayAsync rather than being awaited here. Awaiting it inline used to block
+    // Blazor Server's per-circuit event queue from processing the *next* keystroke until this
+    // one's 250ms delay + network search finished; that queued keystroke's eventual render
+    // then landed late, showing this handler's now-stale _query and visibly deleting whatever
+    // had been typed since. Returning immediately keeps every keystroke processed in near
+    // real time, so _query is always current by the time any render actually happens.
+    private void OnSearchInput(ChangeEventArgs e)
+    {
+        _query = e.Value?.ToString() ?? "";
+        _hits.Clear();
+
+        _searchCts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _searchCts = cts;
+
+        if (_query.Trim().Length < 2)
+        {
+            _searching = false;
+            return;
+        }
+
+        _searching = true;
+        _ = SearchAfterDelayAsync(_query.Trim(), cts);
+    }
+
+    private async Task SearchAfterDelayAsync(string term, CancellationTokenSource cts)
+    {
+        try
+        {
+            await Task.Delay(250, cts.Token);
+            var results = await SearchAsync!(term);
+            if (cts.Token.IsCancellationRequested) return;
+
+            _hits = results;
+            _searching = false;
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (TaskCanceledException)
+        {
+            // superseded by a newer keystroke — ignore
+        }
+    }
+
+    private async Task SelectAsync(int id)
+    {
+        _hits.Clear();
+        _query = "";
+        await OnAdd.InvokeAsync(id);
+    }
+
+    private async Task RemoveAsync(int id)
+    {
+        _removing = id;
+        try
+        {
+            await OnRemove.InvokeAsync(id);
+        }
+        finally
+        {
+            _removing = null;
+        }
+    }
+}
