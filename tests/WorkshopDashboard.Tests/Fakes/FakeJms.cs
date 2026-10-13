@@ -112,9 +112,10 @@ public sealed class FakeJms : IAsyncDisposable
         _passwords[ServiceAccountUsername] = ServiceAccountPassword;
     }
 
-    /// <summary>Starts a fake on a free port. Options.RequestTimeoutSeconds is 1 so timeout
-    /// tests don't wait the real 15s.</summary>
-    public static async Task<FakeJms> StartAsync()
+    /// <summary>Starts a fake on a free port. The client's request timeout is generous by
+    /// default, so a cold or busy CI machine can't fail an ordinary test; tests about timeouts
+    /// pass a short one so they don't wait it out.</summary>
+    public static async Task<FakeJms> StartAsync(int requestTimeoutSeconds = 10)
     {
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
@@ -122,7 +123,7 @@ public sealed class FakeJms : IAsyncDisposable
         var app = builder.Build();
 
         // Routes only need the page names, so they're mapped before the port is known.
-        var fake = new FakeJms(app, CreateOptions("http://127.0.0.1/"));
+        var fake = new FakeJms(app, CreateOptions("http://127.0.0.1/", requestTimeoutSeconds));
         fake.MapRoutes();
         await app.StartAsync();
 
@@ -131,12 +132,12 @@ public sealed class FakeJms : IAsyncDisposable
         return fake;
     }
 
-    public static JmsOptions CreateOptions(string baseUrl) => new()
+    public static JmsOptions CreateOptions(string baseUrl, int requestTimeoutSeconds = 10) => new()
     {
         BaseUrl = baseUrl,
         LoginLatitude = "0",
         LoginLongitude = "0",
-        RequestTimeoutSeconds = 1,
+        RequestTimeoutSeconds = requestTimeoutSeconds,
         ServiceAccount = new JmsServiceAccount { Username = ServiceAccountUsername, Password = ServiceAccountPassword },
         Endpoints = new JmsEndpoints
         {

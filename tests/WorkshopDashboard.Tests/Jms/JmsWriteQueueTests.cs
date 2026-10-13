@@ -166,7 +166,7 @@ public class JmsWriteQueueTests
     [Fact]
     public async Task WriteThatTimesOut_ButLandedInJms_IsNotSentAgain()
     {
-        await using var h = await JmsHarness.StartAsync();
+        await using var h = await JmsHarness.StartAsync(requestTimeoutSeconds: 1);
         await h.LoginAsync();
 
         // JMS saves the note but only replies after the client has given up (1s timeout).
@@ -211,7 +211,7 @@ public class JmsWriteQueueTests
     [Fact]
     public async Task StatusChange_AlreadyApplied_IsNotSentAgain()
     {
-        await using var h = await JmsHarness.StartAsync();
+        await using var h = await JmsHarness.StartAsync(requestTimeoutSeconds: 1);
         await h.LoginAsync();
 
         // JMS applies the status change but replies after the client has given up.

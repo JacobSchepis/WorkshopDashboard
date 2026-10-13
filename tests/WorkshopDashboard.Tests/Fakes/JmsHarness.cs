@@ -41,7 +41,8 @@ public sealed class JmsHarness : IAsyncDisposable
         jms.SetPassword(User, Password);
     }
 
-    public static async Task<JmsHarness> StartAsync() => new(await FakeJms.StartAsync());
+    public static async Task<JmsHarness> StartAsync(int requestTimeoutSeconds = 10) =>
+        new(await FakeJms.StartAsync(requestTimeoutSeconds));
 
     /// <summary>Logs the test user into the app (and so into JMS), as the login page would.</summary>
     public async Task LoginAsync()
