@@ -16,7 +16,12 @@ with a **demo mode** that runs the whole thing with no outside services or secre
 
 ## Try it
 
-Needs the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
+**Live demo:** <https://workshop-dashboard-demo-hyeafweeccecfac5.australiaeast-01.azurewebsites.net>
+(log in as **demo / demo**). It runs on Azure's free tier, so the first visit after a quiet
+spell can take half a minute to wake up, and every visitor shares the same demo data until
+the app restarts.
+
+Or run it locally. It needs the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 
 ```bash
 dotnet run
@@ -25,7 +30,7 @@ dotnet run
 Open <http://localhost:5252> and log in as **demo / demo**.
 
 Demo mode is on by default. It replaces the job management system with an in-process fake
-over a seeded database (420 jobs across 25 customers, with quotes, shipments, inspections and invoices,
+over a seeded database (about 430 jobs across 25 customers, with quotes, shipments, inspections and invoices,
 generated with [Bogus](https://github.com/bchavez/Bogus)) and stands in for every other
 integration — OpenAI, the courier tracking APIs, Gmail, Google Sheets and monday.com. Every
 page, query, pricing rule and write path above those seams is the same code the real
