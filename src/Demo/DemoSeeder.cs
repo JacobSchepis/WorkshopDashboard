@@ -31,7 +31,8 @@ public sealed class DemoSeeder
     public const int FirstJobId = 140001;
 
     private readonly Faker _f;
-    private readonly DateTime _today = DateTime.Today;
+    private readonly DateTime _now;
+    private readonly DateTime _today;
     private SqliteConnection _db = null!;
     private SqliteTransaction _tx = null!;
 
@@ -43,9 +44,11 @@ public sealed class DemoSeeder
     private int _serviceId = 900001, _historyId = 1, _quoteId = 50001, _invoiceId = 70001,
         _inspectionId = 30001, _resourceId = 1, _labourId = 1, _jobEquipmentId = 1;
 
-    public DemoSeeder(int seed)
+    public DemoSeeder(int seed, DateTime now)
     {
         _f = new Faker("en_AU") { Random = new Randomizer(seed) };
+        _now = now;
+        _today = now.Date;
     }
 
     public void Seed(SqliteConnection db)
@@ -284,17 +287,31 @@ public sealed class DemoSeeder
             var ageDays = (int)Math.Round(Math.Pow(_f.Random.Double(), 1.6) * 520);
             var created = _today.AddDays(-ageDays).AddHours(_f.Random.Int(8, 16)).AddMinutes(_f.Random.Int(0, 59));
             // A job made "today" can't be booked in later than now, or it would have no history yet.
-            if (created > DateTime.Now) created = DateTime.Now.AddMinutes(-_f.Random.Int(5, 120));
+            // Drawn either way, so the time of day doesn't shift every random number after it.
+            var earlier = _now.AddMinutes(-_f.Random.Int(5, 120));
+            if (created > _now) created = earlier;
             SeedJob(jobId++, created);
         }
+
+        // Which jobs the walk above leaves sitting in each queue depends on the date, so a few
+        // are always parked in the queues the main pages list, or a page could open empty.
+        foreach (var queue in AlwaysOccupiedQueues)
+            for (var i = 0; i < 3; i++)
+                SeedJob(jobId++, _now.AddDays(-_f.Random.Int(0, 10)).AddHours(-_f.Random.Int(1, 8)), stopAt: queue);
     }
 
-    private void SeedJob(int jobId, DateTime created)
+    // Waiting Quote Confirmation, Waiting Workshop Processing, Waiting Workshop Assignment,
+    // Workshop Finalisation Complete.
+    private static readonly int[] AlwaysOccupiedQueues = [10, 30, 29, 31];
+
+    private void SeedJob(int jobId, DateTime created, int? stopAt = null)
     {
         var (customerId, _) = _f.PickRandom(_customers);
         var unit = _f.PickRandom(_equipmentByCompany[customerId]);
         var contact = _f.PickRandom(_contactsByCompany[customerId]);
-        var route = _f.Random.WeightedRandom([Route.Repaired, Route.InHouse, Route.Declined], [0.62f, 0.23f, 0.15f]);
+        var route = stopAt is null
+            ? _f.Random.WeightedRandom([Route.Repaired, Route.InHouse, Route.Declined], [0.62f, 0.23f, 0.15f])
+            : Route.Repaired; // the one route through every queue
 
         var steps = route switch
         {
@@ -305,7 +322,9 @@ public sealed class DemoSeeder
 
         // Some older jobs stalled part-way (parts on back-order, a customer gone quiet) — they're
         // what the stale-job pages and "overdue" badges find.
-        if (created < _today.AddDays(-30) && _f.Random.Bool(0.05f))
+        if (stopAt is { } queue)
+            steps = steps[..(Array.IndexOf(steps, queue) + 1)];
+        else if (created < _today.AddDays(-30) && _f.Random.Bool(0.05f))
         {
             steps = steps.Take(_f.Random.Int(3, steps.Length - 2)).ToArray();
             if (_f.Random.Bool(0.3f)) steps = [.. steps, 44];
@@ -317,8 +336,16 @@ public sealed class DemoSeeder
         foreach (var status in steps)
         {
             if (history.Count > 0) at = at.AddDays(StepDays(status)).AddHours(_f.Random.Int(0, 6));
-            if (at > DateTime.Now) break;
+            if (at > _now && stopAt is null) break;
             history.Add((status, at));
+        }
+
+        // A parked job walks its whole route, then moves back in time so it reached its queue recently.
+        if (stopAt is not null && history[^1].At > _now)
+        {
+            var shift = history[^1].At - _now.AddHours(-_f.Random.Int(1, 48));
+            created -= shift;
+            history = history.Select(h => (h.Status, h.At - shift)).ToList();
         }
 
         var current = history[^1];
@@ -326,8 +353,8 @@ public sealed class DemoSeeder
         var staff = _f.PickRandom(_staffIds);
         // Most open jobs were worked on recently; a few have gone quiet (the stale-job pages).
         DateTime? lastWorked = completed ?? (_f.Random.Bool(0.12f) ? null
-            : current.At.AddDays(_f.Random.Int(0, Math.Max(0, (int)(DateTime.Now - current.At).TotalDays))));
-        if (lastWorked > DateTime.Now) lastWorked = DateTime.Now.AddHours(-_f.Random.Int(1, 48));
+            : current.At.AddDays(_f.Random.Int(0, Math.Max(0, (int)(_now - current.At).TotalDays))));
+        if (lastWorked > _now) lastWorked = _now.AddHours(-_f.Random.Int(1, 48));
 
         Insert("job", new()
         {

@@ -23,14 +23,17 @@ public sealed class DemoJmsDatabase : IDisposable
     private readonly SqliteConnection _connection;
     private readonly SemaphoreSlim _lock = new(1, 1);
 
-    public DemoJmsDatabase(int seed = DemoSeeder.DefaultSeed)
+    /// <param name="clock">What "now" is, for both the seeded data and NOW() in queries; the real
+    /// clock unless a test wants to seed at a particular time.</param>
+    public DemoJmsDatabase(int seed = DemoSeeder.DefaultSeed, Func<DateTime>? clock = null)
     {
+        clock ??= () => DateTime.Now;
         _connection = new SqliteConnection("Data Source=:memory:");
         _connection.Open();
-        MySqlToSqlite.RegisterFunctions(_connection, () => DateTime.Now);
+        MySqlToSqlite.RegisterFunctions(_connection, clock);
 
         Execute(LoadSchema());
-        new DemoSeeder(seed).Seed(_connection);
+        new DemoSeeder(seed, clock()).Seed(_connection);
     }
 
     public void Dispose() => _connection.Dispose();

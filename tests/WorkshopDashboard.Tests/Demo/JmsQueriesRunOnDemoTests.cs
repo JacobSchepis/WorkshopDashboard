@@ -41,28 +41,50 @@ public class JmsQueriesRunOnDemoTests : IClassFixture<JmsQueriesRunOnDemoTests.D
     }
 
     // The main pages should have something to show, not just run.
+    private static readonly string[] MainPageQueries =
+    [
+        nameof(JmsQueries.StaleJobsQuery), nameof(JmsQueries.WaitingWorkshopAssignmentQuery),
+        nameof(JmsQueries.WorkshopFinalisationCompleteQuery), nameof(JmsQueries.WaitingWorkshopProcessingQuery),
+        nameof(JmsQueries.WaitingQuoteConfirmationQuery), nameof(JmsQueries.DashboardCountsQuery),
+        nameof(JmsQueries.WorkshopDashboardCountsQuery), nameof(JmsQueries.OpenScopeJobsWithModelsQuery),
+        nameof(JmsQueries.AllClosedScopeJobsWithModelsQuery), nameof(JmsQueries.BuildQuoteJobsQuery),
+        nameof(JmsQueries.BuildScopeReportStatsQuery), nameof(JmsQueries.LoanEquipmentQuery),
+        nameof(JmsQueries.CompanySearchQuery),
+    ];
+
+    public static IEnumerable<object[]> MainPageQueryNames() => MainPageQueries.Select(q => new object[] { q });
+
     [Theory]
-    [InlineData(nameof(JmsQueries.StaleJobsQuery))]
-    [InlineData(nameof(JmsQueries.WaitingWorkshopAssignmentQuery))]
-    [InlineData(nameof(JmsQueries.WorkshopFinalisationCompleteQuery))]
-    [InlineData(nameof(JmsQueries.WaitingWorkshopProcessingQuery))]
-    [InlineData(nameof(JmsQueries.WaitingQuoteConfirmationQuery))]
-    [InlineData(nameof(JmsQueries.DashboardCountsQuery))]
-    [InlineData(nameof(JmsQueries.WorkshopDashboardCountsQuery))]
-    [InlineData(nameof(JmsQueries.OpenScopeJobsWithModelsQuery))]
-    [InlineData(nameof(JmsQueries.AllClosedScopeJobsWithModelsQuery))]
-    [InlineData(nameof(JmsQueries.BuildQuoteJobsQuery))]
-    [InlineData(nameof(JmsQueries.BuildScopeReportStatsQuery))]
-    [InlineData(nameof(JmsQueries.LoanEquipmentQuery))]
-    [InlineData(nameof(JmsQueries.CompanySearchQuery))]
-    public async Task MainPageQueries_FindDemoData(string methodName)
+    [MemberData(nameof(MainPageQueryNames))]
+    public async Task MainPageQueries_FindDemoData(string methodName) =>
+        Assert.True(await RowsAsync(_db, methodName) > 0, $"{methodName} returned no rows on the demo data.");
+
+    // The seeded data is laid out relative to "now", so the demo (and CI, which runs in UTC)
+    // must have something on every main page whatever the date and time of day.
+    [Theory]
+    [InlineData("2026-10-13 00:04")]
+    [InlineData("2026-10-13 07:59")]
+    [InlineData("2026-10-13 23:59")]
+    [InlineData("2027-01-01 00:00")]
+    [InlineData("2027-03-15 12:00")]
+    [InlineData("2027-06-30 16:30")]
+    public async Task MainPageQueries_FindDemoData_AtAnyTime(string now)
+    {
+        var clock = DateTime.Parse(now, System.Globalization.CultureInfo.InvariantCulture);
+        using var db = new DemoJmsDatabase(clock: () => clock);
+
+        var empty = new List<string>();
+        foreach (var query in MainPageQueries)
+            if (await RowsAsync(db, query) == 0) empty.Add(query);
+
+        Assert.True(empty.Count == 0, $"No demo rows at {now} for: {string.Join(", ", empty)}");
+    }
+
+    private static async Task<int> RowsAsync(DemoJmsDatabase db, string methodName)
     {
         var method = typeof(JmsQueries).GetMethod(methodName)!;
         var sql = (string)method.Invoke(null, method.GetParameters().Select(p => ArgumentFor(p, new ScopeJobExclusions())).ToArray())!;
-
-        var rows = (await _db.QueryCsvAsync(sql)).Trim().Split('\n').Length - 1;
-
-        Assert.True(rows > 0, $"{methodName} returned no rows on the demo data.");
+        return (await db.QueryCsvAsync(sql)).Trim().Split('\n').Length - 1;
     }
 
     // The demo reads MySQL's backslash escapes the way JMS does, so hostile search text has
