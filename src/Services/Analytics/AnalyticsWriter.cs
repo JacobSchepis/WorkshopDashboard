@@ -1,4 +1,5 @@
 using System.Text.Json;
+using WorkshopDashboard.Data;
 using WorkshopDashboard.Models;
 
 namespace WorkshopDashboard.Services.Analytics;
@@ -13,9 +14,9 @@ public class AnalyticsWriter
     private readonly string _dir;
     private readonly SemaphoreSlim _lock = new(1, 1);
 
-    public AnalyticsWriter(IWebHostEnvironment env)
+    public AnalyticsWriter(AppDataDirectory appData)
     {
-        _dir = Path.Combine(env.ContentRootPath, "App_Data", "analytics");
+        _dir = Path.Combine(appData.Path, "analytics");
     }
 
     public async Task AppendAsync(AnalyticsEvent evt)

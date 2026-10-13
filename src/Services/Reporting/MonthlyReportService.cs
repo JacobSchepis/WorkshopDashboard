@@ -50,7 +50,7 @@ public class MonthlyReportService
 
     public MonthlyReportService(
         IDbContextFactory<WorkshopDbContext> db, MonthlyReportBuilder builder, SettingsStore settings, JmsStatus status,
-        AnalyticsWriter analytics, IWebHostEnvironment env, ILogger<MonthlyReportService> logger)
+        AnalyticsWriter analytics, AppDataDirectory appData, ILogger<MonthlyReportService> logger)
     {
         _db = db;
         _builder = builder;
@@ -59,7 +59,7 @@ public class MonthlyReportService
         _analytics = analytics;
         _logger = logger;
         _status.Changed += () => { if (_status.IsUp == true) Notify(); };
-        _dataDir = Path.Combine(env.ContentRootPath, "App_Data");
+        _dataDir = appData.Path;
     }
 
     /// <summary>Raised whenever a run changes, so the status page can refresh.</summary>

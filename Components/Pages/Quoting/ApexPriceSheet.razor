@@ -6,7 +6,7 @@
 @using WorkshopDashboard.Services.Stores
 
 @inject ApexPriceSheetStore PriceSheet
-@inject IWebHostEnvironment Env
+@inject AppDataDirectory AppData
 
 @*
     ═══════════════════════════════════════════════════════════════════════
@@ -182,7 +182,7 @@
     private string? _error;
     private string? _message;
 
-    private string ServerFilePath => Path.Combine(Env.ContentRootPath, "App_Data", ApexPriceSheetStore.DefaultFileName);
+    private string ServerFilePath => Path.Combine(AppData.Path, ApexPriceSheetStore.DefaultFileName);
 
     protected override async Task OnInitializedAsync()
     {

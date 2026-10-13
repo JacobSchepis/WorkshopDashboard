@@ -1,7 +1,5 @@
 using Microsoft.Extensions.Logging.Abstractions;
-using Microsoft.AspNetCore.Hosting;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.FileProviders;
 using UglyToad.PdfPig;
 using WorkshopDashboard.Data;
 using WorkshopDashboard.Services.Analytics;
@@ -22,13 +20,14 @@ public sealed class MonthlyReportTests : IAsyncLifetime
     private MonthlyReportBuilder _builder = null!;
     private MonthlyReportService _reports = null!;
     private readonly string _contentRoot = Path.Combine(Path.GetTempPath(), "monthly-report-tests", Guid.NewGuid().ToString("N"));
+    private AppDataDirectory AppData => new(Path.Combine(_contentRoot, "App_Data"));
 
     public async Task InitializeAsync()
     {
         _h = await JmsHarness.StartAsync();
         _builder = new MonthlyReportBuilder(_h.Reads) { PollInterval = TimeSpan.FromMilliseconds(50), MaxBackgroundWait = TimeSpan.FromSeconds(2) };
         _reports = new MonthlyReportService(_h.Db, _builder, new SettingsStore(_h.Db), _h.Status,
-            new AnalyticsWriter(new TestEnvironment(_contentRoot)), new TestEnvironment(_contentRoot),
+            new AnalyticsWriter(AppData), AppData,
             NullLogger<MonthlyReportService>.Instance);
     }
 
@@ -502,17 +501,5 @@ public sealed class MonthlyReportTests : IAsyncLifetime
     {
         using var db = _h.Db.CreateDbContext();
         await db.MonthlyReportRuns.ExecuteUpdateAsync(s => s.SetProperty(r => r.NextAttemptAtUtc, DateTime.UtcNow.AddSeconds(-1)));
-    }
-
-    private sealed class TestEnvironment : IWebHostEnvironment
-    {
-        public TestEnvironment(string contentRoot) => ContentRootPath = contentRoot;
-
-        public string ContentRootPath { get; set; }
-        public string WebRootPath { get; set; } = "";
-        public string EnvironmentName { get; set; } = "Testing";
-        public string ApplicationName { get; set; } = "WorkshopDashboard.Tests";
-        public IFileProvider WebRootFileProvider { get; set; } = new NullFileProvider();
-        public IFileProvider ContentRootFileProvider { get; set; } = new NullFileProvider();
     }
 }

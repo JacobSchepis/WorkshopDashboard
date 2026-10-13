@@ -24,3 +24,27 @@ jobs:
 
       - name: Test
         run: dotnet test WorkshopDashboard.sln --no-build -c Release --logger "console;verbosity=normal"
+
+  # Publishes the live demo to Azure App Service once main's tests pass. Skipped until the
+  # repository has an AZURE_WEBAPP_NAME variable and an AZURE_WEBAPP_PUBLISH_PROFILE secret.
+  deploy:
+    needs: build-and-test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.AZURE_WEBAPP_NAME != ''
+    runs-on: ubuntu-latest
+    concurrency: deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish
+        # Linux only: leaves out every other platform's native libraries (about half the size).
+        run: dotnet publish WorkshopDashboard.csproj -c Release -r linux-x64 --self-contained false -o publish
+
+      - uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: publish

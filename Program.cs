@@ -120,8 +120,11 @@ builder.Services.AddBlazorBootstrap();
 
 // The app's own data lives in one SQLite file, App_Data/workshop.db (App_Data is
 // gitignored, one database per environment; demo mode keeps its own, workshop-demo.db). Stores are singletons that open a short-lived
-// context per call through this factory. See WorkshopDbContext.
-var dataDir = Path.Combine(builder.Environment.ContentRootPath, "App_Data");
+// context per call through this factory. See WorkshopDbContext. The DataDirectory setting
+// moves App_Data elsewhere (see AppDataDirectory).
+var appData = AppDataDirectory.From(builder.Configuration, builder.Environment.ContentRootPath);
+builder.Services.AddSingleton(appData);
+var dataDir = appData.Path;
 Directory.CreateDirectory(dataDir);
 builder.Services.AddDbContextFactory<WorkshopDbContext>(options =>
     options.UseSqlite($"Data Source={Path.Combine(dataDir, demoMode ? "workshop-demo.db" : "workshop.db")}"));
