@@ -8,7 +8,7 @@ own JMS session for everything.
 The first version gave every page the logged-in user's JMS session, keyed by their
 `PHPSESSID` cookie. That caused three problems:
 
-- **Kiosks and background jobs had no user.** The wall TVs and the overnight report worker
+- **Kiosks and background jobs had no user.** The wall TVs and the monthly report worker
   needed JMS data with nobody logged in.
 - **Session expiry logged people out.** When JMS expired a session, every page that user had
   open failed, and they had to log in again.

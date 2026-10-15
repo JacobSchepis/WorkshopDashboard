@@ -191,7 +191,7 @@ flowchart LR
     client -- "HttpMessageHandler" --> transport{JmsTransport}
     transport -- live --> net[Network → JMS]
     transport -- demo --> fake[DemoJms<br/>answers JMS's endpoints in-process]
-    fake --> tr[MySqlToSqlite<br/>rewrites INTERVAL, GROUP_CONCAT;<br/>adds CONCAT, NOW, DATEDIFF]
+    fake --> tr[MySqlToSqlite<br/>rewrites INTERVAL, GROUP_CONCAT;<br/>adds CONCAT, NOW, CURDATE, DATEDIFF]
     tr --> sqlite[(In-memory SQLite<br/>JMS schema + Bogus seed)]
     services --> fakes[DemoJsonCompletionClient · DemoCarrierTracker<br/>DemoMailOutbox · DemoMonday · DemoCustomerCredit]
 ```

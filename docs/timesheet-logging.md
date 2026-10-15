@@ -21,8 +21,12 @@ grows past a literal 8 hours, reflecting real output instead of just clock time.
   `TechnicianUserId`/`TechnicianName` constants in `TimesheetLoggingService`), regardless of
   who's actually logged into WorkshopDashboard. This app's automation is credited to that one
   person's output specifically.
-- **Two modes:**
-  - `LogForJobAsync` / `LogForJobsAsync` — against one or more real JMS jobs.
+- **Three modes:**
+  - `LogForJobAsync` / `LogForJobsAsync` — against one or more real JMS jobs, the same
+    hours and notes on each.
+  - `LogVariableForJobsAsync` — one entry per job, each with its own hours and notes (e.g. a
+    quote email where each job's time depends on what was included for it). Most call sites
+    below use this one.
   - `LogAdminTaskAsync` — against a fixed "admin job" (configured via
     `TimesheetSettingsStore`) for work not tied to any specific job.
 - **All free text goes into JMS's internal notes field** (`description_internal`) only. The

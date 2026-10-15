@@ -96,7 +96,7 @@ docs/                 architecture, LLM pipeline, ADRs
 dotnet test
 ```
 
-About 430 tests: pricing and extraction handling for each repairer, the repair suggester's
+About 450 tests: pricing and extraction handling for each repairer, the repair suggester's
 validation, the JMS session/cache/outbox behaviour against a fake JMS over real HTTP, and a
 test that runs **every** JMS query against the demo database so a query the translator
 can't handle fails CI rather than a demo page.
